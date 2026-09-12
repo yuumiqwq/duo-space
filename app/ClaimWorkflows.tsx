@@ -3,11 +3,12 @@
 import { useEffect, useRef, useState } from "react";
 import { Archive, ArrowLeft, Check, ClipboardCheck, Paperclip, RotateCcw, Send, X } from "lucide-react";
 import { TaskDescription } from "./TaskDescription";
+import { UnclaimedTaskDetail } from "./UnclaimedTaskDetail";
 import { WorkflowSettings } from "./WorkflowSettings";
 import { attachmentDisplayText } from "./task-description-attachments";
 import { TaskNoticeDot } from "./TaskNoticeDot";
 import { silentWorkflowEvent, workflowEventLabels, type TaskNotice } from "./collaboration-notifications";
-import type { ClaimWorkflow, CollaborationSnapshot, WorkflowCommand, WorkflowFile } from "./collaboration-types";
+import type { ClaimWorkflow, CollaborationCommand, CollaborationSnapshot, RoomTask, WorkflowCommand, WorkflowFile } from "./collaboration-types";
 import { clipboardFiles } from './cloud-drive-actions';
 import { insertAttachmentPlaceholders, pastedAttachmentName } from './task-attachment-labels';
 import { readTaskResponse, taskErrorMessage } from './task-request';
@@ -15,9 +16,10 @@ import { WorkflowAttachments } from './WorkflowAttachments';
 
 export const workflowStatus: Record<ClaimWorkflow["status"], string> = { creating: "进行中", working: "进行中", submitted: "待审批", rejected: "进行中", approving: "进行中", done: "已完成", deleted: "已删除" };
 const eventLabels = workflowEventLabels;
-export function ClaimWorkflows({ snapshot, initialId, busy, error, perform, onClose, retryUncertain, notices = [], onRead }: { notices?: TaskNotice[]; onRead?: (ids: string[]) => void; snapshot: CollaborationSnapshot; initialId: string | null; busy: boolean; error: string; perform: (command: WorkflowCommand) => Promise<boolean>; onClose: () => void; retryUncertain?: () => void }) {
+export function ClaimWorkflows({ snapshot, initialId, task, busy, error, perform, onClose, retryUncertain, notices = [], onRead }: { notices?: TaskNotice[]; onRead?: (ids: string[]) => void; snapshot: CollaborationSnapshot; task?: RoomTask; initialId: string | null; busy: boolean; error: string; perform: (command: WorkflowCommand | CollaborationCommand) => Promise<boolean>; onClose: () => void; retryUncertain?: () => void }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const [selected, setSelected] = useState(initialId);
+  const [taskSelected, setTaskSelected] = useState(!!task);
   const [archived, setArchived] = useState(false);
   const retryRequest = useRef(retryUncertain);
   useEffect(() => { retryRequest.current = retryUncertain; }, [retryUncertain]);
@@ -28,12 +30,14 @@ export function ClaimWorkflows({ snapshot, initialId, busy, error, perform, onCl
     return () => window.clearInterval(timer);
   }, [uncertain, busy]);
   useEffect(() => { const element = dialog.current, previous = document.activeElement; element?.showModal(); return () => { element?.close(); if (previous instanceof HTMLElement && previous.isConnected) previous.focus(); }; }, []);
-  const workflow = snapshot.workflows.find(item => item.id === selected);
+  const workflow = snapshot.workflows.find(item => item.id === selected || (taskSelected && task && (item.id === task.workflowId || (item.source.ownerId === task.ownerId && item.source.taskId === task.id) || (item.claimantId === task.ownerId && item.targetId === task.id))));
+  const unclaimed = taskSelected && !workflow ? task : undefined;
+  const back = () => { setSelected(null); setTaskSelected(false); };
   const name = (id: string) => snapshot.members.find(member => member.id === id)?.name || "成员";
   return <dialog ref={dialog} className="coop-workflows" aria-label="认领工作流程" onCancel={event => { event.preventDefault(); if (!busy) onClose(); }} onKeyDown={event => event.stopPropagation()}>
     <header><h3><ClipboardCheck size={20} />{archived ? "已归档" : "工作流程"}</h3><button className="coop-icon" type="button" aria-label="关闭工作流程" disabled={busy} onClick={onClose}><X size={20} /></button></header>
     {retryUncertain && <span className="workflow-sync-spinner" role="status" aria-label="正在确认操作结果" />}
-    {workflow ? <WorkflowDetail key={workflow.id} notices={notices} onRead={onRead} workflow={workflow} identityId={snapshot.identityId} name={name} busy={busy || !!retryUncertain} error={error} perform={perform} back={() => setSelected(null)} /> : <WorkflowList notices={notices} onRead={onRead} workflows={snapshot.workflows} archived={archived} setArchived={setArchived} select={setSelected} name={name} />}
+    {workflow ? <WorkflowDetail key={workflow.id} notices={notices} onRead={onRead} workflow={workflow} identityId={snapshot.identityId} name={name} busy={busy || !!retryUncertain} error={error} perform={perform} back={back} /> : unclaimed ? <UnclaimedTaskDetail key={`${unclaimed.ownerId || "buffer"}:${unclaimed.id}`} task={unclaimed} identityId={snapshot.identityId} name={name} busy={busy || uncertain} error={error} perform={perform} back={back} /> : <WorkflowList notices={notices} onRead={onRead} workflows={snapshot.workflows} archived={archived} setArchived={setArchived} select={setSelected} name={name} />}
   </dialog>;
 }
 export function WorkflowList({ workflows, archived, setArchived, select, name, notices = [] }: { notices?: TaskNotice[]; onRead?: (ids: string[]) => void; workflows: ClaimWorkflow[]; archived: boolean; setArchived: (value: boolean) => void; select: (id: string) => void; name: (id: string) => string }) {

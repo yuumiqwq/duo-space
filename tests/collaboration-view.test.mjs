@@ -52,7 +52,7 @@ test('relative dates prioritize four days before Monday-based this/next-week lab
   const { collaborationDateLabel: label } = await import('../app/collaboration-view.ts');
   const now = new Date('2026-09-11T12:00:00+0800');
   const task = day => ({ dueDate: `${day}T00:00:00+0800`, startDate: null, isAllDay: true });
-  for (const [date, expected] of [['2026-09-11','今天'],['2026-09-12','明天'],['2026-09-13','后天'],['2026-09-14','大后天'],['2026-09-10','这周四'],['2026-09-15','下周二'],['2026-09-20','下周日'],['2026-09-21','9/21'],['2026-09-06','9/6']]) assert.equal(label(task(date), now),expected);
+  for (const [date, expected] of [['2026-09-11','今天'],['2026-09-12','明天'],['2026-09-13','后天'],['2026-09-14','大后天'],['2026-09-10','已过期'],['2026-09-15','下周二'],['2026-09-20','下周日'],['2026-09-21','9/21'],['2026-09-06','已过期']]) assert.equal(label(task(date), now),expected);
 });
 
 test('relative dates use Shanghai midnight, preserve time, and handle year boundaries and start-only tasks', async () => {
@@ -61,4 +61,21 @@ test('relative dates use Shanghai midnight, preserve time, and handle year bound
   assert.equal(label({ dueDate: '2026-09-11T16:05:00Z', startDate: null, isAllDay: false },new Date('2026-09-11T16:00:00Z')),'今天 00:05');
   assert.equal(label({ dueDate: '2027-01-04T00:00:00+0800', startDate: null, isAllDay: true },new Date('2026-12-31T12:00:00+0800')),'下周一');
   assert.equal(label({ dueDate: 'bad', startDate: null, isAllDay: true }),'');
+});
+
+
+test('expired task labels use the deadline or start fallback and Shanghai all-day boundary', async () => {
+  const { collaborationDateLabel: label } = await import('../app/collaboration-view.ts');
+  const now = new Date('2026-09-13T12:00:00+08:00');
+  const task = { dueDate: '2026-09-13T11:59:59+08:00', startDate: null, isAllDay: false };
+  assert.equal(label(task, now), '已过期');
+  assert.equal(label({ ...task, dueDate: '2026-09-13T12:00:00+08:00' }, now), '今天 12:00');
+  assert.equal(label({ ...task, dueDate: '2026-09-13T13:00:00+08:00', startDate: '2026-09-12T12:00:00+08:00' }, now), '今天 13:00');
+  assert.equal(label({ ...task, dueDate: null, startDate: task.dueDate }, now), '已过期');
+  assert.equal(label({ ...task, dueDate: 'invalid', startDate: task.dueDate }, now), '已过期');
+  assert.equal(label({ ...task, dueDate: null }, now), '');
+  const allDay = { ...task, dueDate: '2026-09-12T16:00:00Z', isAllDay: true };
+  assert.equal(label(allDay, new Date('2026-09-13T15:59:59.999Z')), '今天');
+  assert.equal(label(allDay, new Date('2026-09-13T16:00:00Z')), '已过期');
+  assert.equal(label({ ...allDay, dueDate: '2025-12-31' }, new Date('2026-01-01T00:00:00+08:00')), '已过期');
 });

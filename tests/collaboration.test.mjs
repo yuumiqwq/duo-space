@@ -1265,3 +1265,32 @@ test('submit and review reconcile external owner completion according to the req
     assert.equal(f.accounts.bob.get(w.targetId).status || 0, action === 'approve' ? 2 : 0);
   }
 });
+
+
+test('public and personal edits before claiming never enter workflow history', async () => {
+  for (const publicTask of [true, false]) {
+    const f = await fixture();
+    let task = publicTask ? await f.create('认领前的任务') : await personal(f);
+    const latest = async () => {
+      const snapshot = await f.store.snapshot('alice');
+      assert.deepEqual(snapshot.workflows, []);
+      return (publicTask ? snapshot.buffer : snapshot.members.find(member => member.id === 'alice').tasks).find(item => item.id === task.id);
+    };
+    for (const fields of [{ title: '认领前修改标题' }, { content: '认领前修改说明', priority: 5 }]) {
+      const operation = await f.store.execute('bob', { id: randomUUID(), action: 'update', source: source(task), fields });
+      assert.equal(operation.status, 'done');
+      task = await latest();
+    }
+    f.store = new CollaborationStore(f.dir, f.gateway);
+    task = await latest();
+    let workflow = await f.store.claim('bob', { id: randomUUID(), action: 'claim', source: source(task), destination: 'bob' });
+    assert.deepEqual(workflow.events.map(event => event.type), ['claimed']);
+    assert.equal(workflow.fields.title, '认领前修改标题');
+    assert.equal(workflow.fields.content, '认领前修改说明');
+    assert.equal(workflow.reviewerId, 'alice');
+    workflow = await act(f, workflow, 'alice', 'update-workflow', { fields: { content: '认领后修改说明' } });
+    assert.deepEqual(workflow.events.map(event => event.type), ['claimed', 'updated']);
+    assert.match(workflow.events[1].comment, /认领前修改说明.*认领后修改说明/);
+    await assert.rejects(f.store.execute('bob', { id: randomUUID(), action: 'update', source: source(task), fields: { title: '旧详情页修改' } }), /流程|认领/);
+  }
+});

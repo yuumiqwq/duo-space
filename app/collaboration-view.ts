@@ -41,6 +41,7 @@ export function collaborationDateLabel(task: DatedTask & { isAllDay: boolean }, 
   const date = new Date(value);
   const localDay = (value: Date) => Math.floor((value.getTime() + 8 * 3600000) / 86400000);
   const today = localDay(now), target = localDay(date), delta = target - today;
+  if (task.isAllDay ? delta < 0 : date.getTime() < now.getTime()) return "已过期";
   const weekday = (day: number) => (day + 3) % 7;
   const weekStart = today - weekday(today);
   let label: string;
