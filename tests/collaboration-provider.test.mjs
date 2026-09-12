@@ -5,7 +5,8 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { build } from 'esbuild';
 import { encryptToken } from '../app/api/ticktick/crypto.ts';
-import { remoteVersion, taskFields } from '../app/api/room/tasks/store.ts';
+import { CollaborationStore, remoteVersion, taskFields } from '../app/api/room/tasks/store.ts';
+import { randomUUID } from 'node:crypto';
 
 test('Dida provider works with Open API credentials despite V2 rejection and scopes transfers to the owner inbox', async () => {
   await mkdir('codex-generated/test-data', { recursive: true });
@@ -121,6 +122,66 @@ test('Dida provider works with Open API credentials despite V2 rejection and sco
     assert.ok(requests.some(request => request.owner === 'alice'));
     assert.equal(requests.filter(request => request.route.startsWith('/api/v2/')).length, 0);
     assert.equal(requests.filter(request => request.owner === 'alice' && request.method !== 'GET').length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousDir === undefined) delete process.env.DATA_DIR; else process.env.DATA_DIR = previousDir;
+    if (previousSecret === undefined) delete process.env.TICKTICK_STORAGE_SECRET; else process.env.TICKTICK_STORAGE_SECRET = previousSecret;
+  }
+});
+
+test('persisted deletion finishes after restart with an empty inbox whose ID is unavailable', async () => {
+  await mkdir('codex-generated/test-data', { recursive: true });
+  const dir = await mkdtemp(path.resolve('codex-generated/test-data/deletion-empty-inbox-'));
+  const previousDir = process.env.DATA_DIR, previousSecret = process.env.TICKTICK_STORAGE_SECRET, originalFetch = globalThis.fetch;
+  process.env.DATA_DIR = dir; process.env.TICKTICK_STORAGE_SECRET = 'synthetic-test-key';
+  try {
+    const members = [{ id: 'alice', name: 'Alice', connected: true }, { id: 'bob', name: 'Bob', connected: true }];
+    const tasks = new Map();
+    const seed = new CollaborationStore(dir, {
+      members: async () => members,
+      inbox: async owner => ({ projectId: `inbox-${owner}`, tasks: owner === 'bob' ? [...tasks.values()] : [] }),
+      get: async (owner, id) => tasks.get(id) || null,
+      create: async (owner, id, fields) => { tasks.set(id, { id, projectId: `inbox-${owner}`, ...fields }); },
+      remove: async (owner, id) => { tasks.delete(id); throw new Error('delete response lost'); },
+    });
+    await seed.execute('alice', { id: randomUUID(), action: 'create', fields: { title: '删除后收集箱为空' } });
+    const card = (await seed.snapshot('alice')).buffer[0];
+    let workflow = await seed.claim('bob', { id: randomUUID(), action: 'claim', source: { ownerId: null, taskId: card.id, version: card.version } });
+    workflow = await seed.workflowCommand('alice', { id: randomUUID(), workflowId: workflow.id, version: workflow.version, action: 'delete-owner-task' });
+    assert.equal(workflow.ownerDeletePending, true); assert.equal(tasks.size, 0);
+    await writeFile(path.join(dir, 'identities.json'), JSON.stringify({ version: 1, users: { alice: { nickname: 'Alice', ticktickToken: encryptToken('token-alice') }, bob: { nickname: 'Bob', ticktickToken: encryptToken('token-bob') } } }));
+    const output = path.join(dir, 'provider.mjs');
+    await build({ entryPoints: ['app/api/room/tasks/provider.ts'], bundle: true, platform: 'node', format: 'esm', outfile: output, logLevel: 'silent' });
+    const { gateway } = await import(pathToFileURL(output).href);
+    const requests = [];
+    let taskExists = false, detailFailure = false;
+    globalThis.fetch = async (url, init) => {
+      assert.equal(init.headers.Authorization, 'Bearer token-bob');
+      const route = new URL(url).pathname.replace('/open/v1', '');
+      requests.push({ route, method: init.method || 'GET' });
+      if (route === '/project/inbox/data') return Response.json({ tasks: [], columns: [] });
+      if (route === '/project/inbox') return new Response(null, { status: 404 });
+      if (route === `/project/inbox-bob/task/${workflow.targetId}`) {
+        if (detailFailure) return new Response(null, { status: 503 });
+        if (init.method === 'DELETE') { taskExists = false; return new Response(null, { status: 204 }); }
+        return taskExists ? Response.json({ id: workflow.targetId, projectId: 'inbox-bob', title: workflow.title }) : new Response(null, { status: 404 });
+      }
+      if (route === '/task/filter' || route === '/task/completed') return Response.json([]);
+      throw new Error(`Unexpected request: ${route}`);
+    };
+    const restarted = new CollaborationStore(dir, { ...gateway, members: async () => members });
+    await restarted.recoverPendingWorkflows();
+    const saved = (await restarted.snapshot('alice', null)).workflows.find(item => item.id === workflow.id);
+    assert.equal(saved.status, 'deleted', saved.error);
+    assert.equal(saved.ownerDeletePending, false);
+    assert.equal(requests.filter(item => item.method === 'DELETE').length, 0, 'confirmed absence does not repeat deletion');
+    taskExists = true;
+    await gateway.remove('bob', workflow.targetId, 'inbox-bob');
+    assert.equal(await gateway.get('bob', workflow.targetId, 'inbox-bob'), null);
+    detailFailure = true;
+    await assert.rejects(gateway.get('bob', workflow.targetId, 'inbox-bob'), { status: 502 });
+    detailFailure = false;
+    await assert.rejects(gateway.create('bob', 'new-task', taskFields({ title: '不得猜测收集箱编号' })), { status: 422 });
   } finally {
     globalThis.fetch = originalFetch;
     if (previousDir === undefined) delete process.env.DATA_DIR; else process.env.DATA_DIR = previousDir;

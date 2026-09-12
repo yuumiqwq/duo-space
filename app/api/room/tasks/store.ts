@@ -730,7 +730,15 @@ export class CollaborationStore {
     const event = workflow.events.find(item => item.id === eventId)!;
     // Completed requests from the old one-sided deletion behavior are receipts,
     // not authorization to apply the new behavior retroactively.
-    if (["owner-task-deleted", "claimant-task-deleted", "task-deleted"].includes(event.type) || workflow.status === 'deleted') return this.publicWorkflow(workflow);
+    if (["owner-task-deleted", "claimant-task-deleted", "task-deleted"].includes(event.type) || workflow.status === 'deleted') {
+      if (workflow.ownerDeletion?.id === eventId) {
+        delete workflow.ownerDeletion;
+        delete workflow.syncAttempts; delete workflow.syncRetryAt;
+        workflow.error = "";
+        await this.saveWorkflow(state, workflow);
+      }
+      return this.publicWorkflow(workflow);
+    }
     workflow.ownerDeletion ||= { id: eventId };
     const deletion = workflow.ownerDeletion;
     try {

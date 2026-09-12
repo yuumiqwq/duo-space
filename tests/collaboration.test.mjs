@@ -429,6 +429,8 @@ test('old one-sided deletion receipts do not remove a public card or another mem
     assert.deepEqual(snapshot.buffer.map(item => item.id), [task.id]);
     assert.ok(f.accounts.bob.has(w.targetId));
     assert.equal(f.counts.removes, 0);
+    assert.equal(snapshot.workflows.find(item => item.id === w.id).ownerDeletePending, false, 'completed legacy receipts must stop retrying');
+    assert.equal(JSON.parse(await readFile(file, 'utf8')).workflows[w.id].ownerDeletion, undefined);
   }
 });
 

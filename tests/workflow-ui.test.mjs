@@ -89,6 +89,11 @@ test('workflow detail offers settings to every member and direct completion only
   assert.ok(!silentRepair.includes('正在恢复未完成')); assert.ok(!silentRepair.includes('待补充提交'));
   assert.ok(!silentRepair.includes('workflow-sync-spinner'));
   delete workflow.reopenPending; delete workflow.needsSubmission;
+  workflow.ownerDeletePending = true; workflow.error = '滴答授权不足或已失效，请该成员重新连接';
+  const pendingDeletion = render('alice');
+  assert.match(pendingDeletion, /role="alert">滴答授权不足或已失效，请该成员重新连接/);
+  assert.ok(pendingDeletion.includes('workflow-sync-spinner'));
+  delete workflow.ownerDeletePending; delete workflow.error;
   workflow.taskAnomaly = true;
   for (const member of ['alice', 'bob', 'charlie']) {
     const html = render(member, 'submitted');

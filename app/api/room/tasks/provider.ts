@@ -33,7 +33,10 @@ async function context(owner: string, refreshInbox = false): Promise<Context> {
 }
 async function request(owner: string, route: string, init?: RequestInit, missing = false) {
   const account = await context(owner);
-  if (account.projectId === "inbox") throw new CollaborationError("收集箱为空且滴答未返回具体编号，暂不能分配任务；请先在滴答收集箱添加一项后刷新", 422);
+  // Existing workflow links keep their concrete project ID across restarts.
+  // An unknown empty inbox blocks only requests that still need that ID,
+  // not exact linked-task reads/deletes or account-wide absence checks.
+  if (account.projectId === "inbox" && (route.includes("{inbox}") || route.startsWith("/project/inbox/"))) throw new CollaborationError("收集箱为空且滴答未返回具体编号，暂不能分配任务；请先在滴答收集箱添加一项后刷新", 422);
   const response = await tickFetch(route.replaceAll("{inbox}", encodeURIComponent(account.projectId)), account.token, init);
   if (missing && response.status === 404) return null;
   if (!response.ok) throw new CollaborationError(response.status === 429 ? "滴答请求较频繁，请稍后重试" : response.status === 401 || response.status === 403 ? "滴答授权不足或已失效，请该成员重新连接" : "滴答操作暂未完成，请稍后继续处理", response.status >= 500 ? 502 : 422);
