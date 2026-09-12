@@ -134,7 +134,8 @@ export const gateway: Gateway = {
   },
   async remove(owner, id, projectId) {
     if (!validId(id) || (projectId !== undefined && !validId(projectId))) throw new CollaborationError("任务编号无效", 400);
-    await request(owner, `/project/${projectId ? encodeURIComponent(projectId) : "{inbox}"}/task/${encodeURIComponent(id)}`, { method: "DELETE" }, true);
+    const response = await request(owner, `/project/${projectId ? encodeURIComponent(projectId) : "{inbox}"}/task/${encodeURIComponent(id)}`, { method: "DELETE" }, true);
+    if (response === null) return "missing";
   },
   async reopen(owner, before, completedAfter) {
     const existing = await gateway.get(owner, before.id, before.projectId) || await gateway.locate!(owner, before.id, before.projectId, completedAfter);

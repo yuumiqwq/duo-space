@@ -522,6 +522,37 @@ test('unacknowledged deletion and a failed lookup remain pending instead of inve
   assert.equal(f.counts.removes, 1); assert.match(w.error, /完成记录不完整/);
 });
 
+test('missing DELETE routes do not create success receipts or archive moved or unreadable tasks', async () => {
+  for (const scenario of ['moved', 'unreadable', 'absent']) {
+    const f = await fixture(), task = await f.create('删除路径已不存在');
+    let w = await claim(f, task), requested = false;
+    const get = f.gateway.get;
+    f.gateway.get = async (owner, id, project) => {
+      const task = await get(owner, id);
+      return task && task.projectId === project ? task : null;
+    };
+    f.gateway.locate = async (owner, id) => {
+      if (requested && scenario === 'unreadable') throw new Error('lookup unavailable');
+      return get(owner, id);
+    };
+    f.gateway.remove = async (owner, id) => {
+      f.counts.removes++; requested = true;
+      if (scenario === 'moved') f.accounts[owner].get(id).projectId = 'another-project';
+      else f.accounts[owner].delete(id);
+      return 'missing';
+    };
+    w = await act(f, w, 'alice', 'delete-owner-task');
+    const persisted = JSON.parse(await readFile(path.join(f.dir, 'room-collaboration.json'), 'utf8')).workflows[w.id];
+    assert.equal(persisted.ownerDeletion?.acknowledged?.target, undefined);
+    assert.equal(f.counts.removes, 1);
+    if (scenario === 'absent') assert.equal(w.status, 'deleted', 'complete lookup may confirm absence without a positive DELETE receipt');
+    else {
+      assert.equal(w.ownerDeletePending, true); assert.notEqual(w.status, 'deleted');
+      assert.match(w.error, scenario === 'moved' ? /删除尚未完成/ : /lookup unavailable/);
+    }
+  }
+});
+
 test('positive deletion receipts still require readable absence and preserve a later recurring occurrence', async () => {
   for (const scenario of ['unreadable', 'advanced-occurrence']) {
     const f = await fixture(), task = await f.create('删除确认边界');

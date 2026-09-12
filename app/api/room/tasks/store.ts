@@ -19,7 +19,8 @@ export type Gateway = {
   taskAttachments?: { publish(actor: string, before: string, after: string): Promise<void>; remove(files: string[]): Promise<void> };
   create(owner: string, id: string, fields: TaskFields, receipt?: (actualId: string) => Promise<void>): Promise<void>;
   update(owner: string, id: string, fields: TaskFields, version: string, projectId?: string): Promise<void>;
-  remove(owner: string, id: string, projectId?: string): Promise<void>;
+  // A missing project/task route is distinct from a positive DELETE response.
+  remove(owner: string, id: string, projectId?: string): Promise<void | "missing">;
   complete(owner: string, id: string, projectId?: string): Promise<void>;
   reopen(owner: string, before: RemoteTask, completedAfter?: number): Promise<RemoteTask>;
   checkTransfer(owner: string, task: RemoteTask): Promise<void>;
@@ -802,11 +803,15 @@ export class CollaborationStore {
         const task = await this.linkedTask(state, workflow, side);
         if (task) {
           if (workflow.fields.repeatFlag && (taskFields(task).startDate !== workflow.fields.startDate || taskFields(task).dueDate !== workflow.fields.dueDate)) throw new CollaborationError("关联重复任务已进入其他日期，请在滴答中删除对应任务，避免影响下一次任务");
-          await this.gateway.remove(owner, task.id, task.projectId);
-          deletion.acknowledged ||= {};
-          deletion.acknowledged[side] = { id: task.id, projectId: task.projectId };
-          await this.saveWorkflow(state, workflow);
-          if (await this.gateway.get(owner, task.id, task.projectId)) throw new CollaborationError("删除尚未完成，正在自动重试");
+          const missing = await this.gateway.remove(owner, task.id, task.projectId) === "missing";
+          if (!missing) {
+            deletion.acknowledged ||= {};
+            deletion.acknowledged[side] = { id: task.id, projectId: task.projectId };
+            await this.saveWorkflow(state, workflow);
+          }
+          // A 404 may mean the task moved; it cannot create a success receipt.
+          const remaining = missing ? await this.linkedTask(state, workflow, side) : await this.gateway.get(owner, task.id, task.projectId);
+          if (remaining) throw new CollaborationError("删除尚未完成，正在自动重试");
         }
         deletion.done = [...(deletion.done || []), side];
         await this.saveWorkflow(state, workflow);

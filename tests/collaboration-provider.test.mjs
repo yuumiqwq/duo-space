@@ -43,7 +43,7 @@ test('Dida provider works with Open API credentials despite V2 rejection and sco
       if (route.endsWith('/data')) return Response.json({ tasks: [...accounts[owner].values(), { id: 'outside', projectId: 'other-list' }] });
       if (route.endsWith('/comments')) return Response.json(comments);
       const id = route.split('/')[6];
-      if (method === 'DELETE') { accounts[owner].delete(id); return new Response(null, { status: 204 }); }
+      if (method === 'DELETE') { return new Response(null, { status: accounts[owner].delete(id) ? 204 : 404 }); }
       if (route.endsWith('/complete')) { accounts[owner].get(id).status = 2; return new Response(null, { status: 204 }); }
       const task = accounts[owner].get(id);
       return task ? Response.json({ ...task, ...(wrongProject ? { projectId: 'foreign' } : {}) }) : new Response(null, { status: 404 });
@@ -80,7 +80,8 @@ test('Dida provider works with Open API credentials despite V2 rejection and sco
     await gateway.reopen('bob', completed); assert.equal(requests.filter(request => request.method === 'POST').length, writes);
     accounts.bob.get(task.id).status = 2; accounts.bob.get(task.id).title = 'concurrent edit';
     await assert.rejects(gateway.reopen('bob', completed), /发生变化/);
-    await gateway.remove('bob', task.id); await gateway.remove('bob', task.id);
+    assert.equal(await gateway.remove('bob', task.id), undefined);
+    assert.equal(await gateway.remove('bob', task.id), 'missing', '404 must remain distinguishable from an acknowledged deletion');
     assert.equal(accounts.bob.size, 0);
     allocatedId = 'server-assigned-id';
     let persistedId;
