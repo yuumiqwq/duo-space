@@ -1,12 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { currentIdentityId } from "../../identity/session";
 import { sendDeviceTestPush } from "../store";
+import { isSamePushOrigin } from "../origin";
 
 export const runtime = "nodejs";
 
 export async function POST(request: NextRequest) {
-  const origin = request.headers.get("origin");
-  if (origin && origin !== request.nextUrl.origin) return new NextResponse("Forbidden", { status: 403 });
+  if (!isSamePushOrigin(request)) return new NextResponse("Forbidden", { status: 403 });
   const identityId = await currentIdentityId();
   if (!identityId) return new NextResponse("Unauthorized", { status: 401 });
   const body = await request.json().catch(() => ({}));

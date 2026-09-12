@@ -6,6 +6,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { createHmac, randomUUID, createECDH, randomBytes } from 'node:crypto';
 import { createServer } from 'node:net';
+import { request as httpRequest } from 'node:http';
 import webPush from 'web-push';
 
 test('real push routes authenticate, repair subscription records, isolate deletion and retain chat after delivery is unavailable', { timeout: 45000 }, async () => {
@@ -20,8 +21,17 @@ test('real push routes authenticate, repair subscription records, isolate deleti
   });
   const origin = `http://127.0.0.1:${port}`;
   const cookie = identity => { const payload = `${identity}.${Math.floor(Date.now() / 1000) + 600}`; return `ss_access=${payload}.${createHmac('sha256', secret).update(payload).digest('base64url')}`; };
-  const call = (identity, route, method = 'GET', body, headers = {}) => fetch(origin + route, {
-    method, redirect: 'manual', headers: { Cookie: cookie(identity), 'Content-Type': 'application/json', ...headers }, ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  // Node fetch replaces Host, so use HTTP directly to emulate the proxy faithfully.
+  const call = (identity, route, method = 'GET', body, headers = {}) => new Promise((resolve, reject) => {
+    const bodyText = body === undefined ? undefined : JSON.stringify(body);
+    const req = httpRequest(origin + route, { method, headers: { Cookie: cookie(identity), 'Content-Type': 'application/json', ...(bodyText === undefined ? {} : { 'Content-Length': Buffer.byteLength(bodyText) }), ...headers } }, res => {
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('error', reject);
+      res.on('end', () => resolve(new Response(Buffer.concat(chunks), { status: res.statusCode })));
+    });
+    req.on('error', reject);
+    req.end(bodyText);
   });
   try {
     let ready = false;
@@ -30,6 +40,13 @@ test('real push routes authenticate, repair subscription records, isolate deleti
     assert.equal((await call('alice', '/api/push/public-key')).status, 200);
     assert.ok([307, 401].includes((await fetch(origin + '/api/push/subscriptions', { method: 'POST', redirect: 'manual' })).status));
     assert.equal((await call('alice', '/api/push/test', 'POST', { endpoint: 'https://push.example/not-registered' })).status, 404);
+    // Production terminates HTTPS at a proxy and preserves the public Host.
+    const proxyHeaders = { Host: 'study.example', Origin: 'https://study.example', 'X-Forwarded-Proto': 'https' };
+    assert.equal((await call('alice', '/api/push/test', 'POST', { endpoint: 'https://push.example/not-registered' }, proxyHeaders)).status, 404);
+    assert.equal((await call('alice', '/api/push/test', 'POST', { endpoint: 'https://push.example/not-registered' }, { ...proxyHeaders, Origin: 'https://foreign.invalid', 'X-Forwarded-Host': 'foreign.invalid' })).status, 403);
+    assert.equal((await call('alice', '/api/push/subscriptions', 'POST', {}, proxyHeaders)).status, 400);
+    assert.equal((await call('alice', '/api/push/subscriptions', 'DELETE', {}, proxyHeaders)).status, 400);
+    assert.equal((await call('alice', '/api/push/subscriptions', 'DELETE', {}, { ...proxyHeaders, Origin: 'https://foreign.invalid' })).status, 403);
     const ecdh = createECDH('prime256v1'); ecdh.generateKeys();
     const subscription = { endpoint: 'https://push.example/device', expirationTime: null, keys: { p256dh: ecdh.getPublicKey().toString('base64url'), auth: randomBytes(16).toString('base64url') } };
     const save = () => call('alice', '/api/push/subscriptions', 'POST', { subscription, deviceId: 'device-a' });

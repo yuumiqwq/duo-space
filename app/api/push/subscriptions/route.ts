@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { currentIdentityId } from "../../identity/session";
 import { removePushSubscription, savePushSubscription } from "../store";
+import { isSamePushOrigin } from "../origin";
 
 function validEndpoint(value: unknown): value is string {
   if (typeof value !== "string" || value.length > 2048) return false;
@@ -8,8 +9,7 @@ function validEndpoint(value: unknown): value is string {
 }
 
 export async function POST(request: NextRequest) {
-  const origin = request.headers.get("origin");
-  if (origin && origin !== request.nextUrl.origin) return new NextResponse("Forbidden", { status: 403 });
+  if (!isSamePushOrigin(request)) return new NextResponse("Forbidden", { status: 403 });
   const identityId = await currentIdentityId();
   if (!identityId) return new NextResponse("Unauthorized", { status: 401 });
   if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) {
@@ -37,8 +37,7 @@ export async function POST(request: NextRequest) {
 }
 
 export async function DELETE(request: NextRequest) {
-  const origin = request.headers.get("origin");
-  if (origin && origin !== request.nextUrl.origin) return new NextResponse("Forbidden", { status: 403 });
+  if (!isSamePushOrigin(request)) return new NextResponse("Forbidden", { status: 403 });
   const identityId = await currentIdentityId();
   if (!identityId) return new NextResponse("Unauthorized", { status: 401 });
   const body = await request.json().catch(() => ({})) as { endpoint?: unknown };
