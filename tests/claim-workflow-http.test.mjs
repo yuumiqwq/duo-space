@@ -46,7 +46,18 @@ test('claim workflow HTTP covers actual routes, sidebar guard, file streaming, r
     const before = await (await call('alice')).json(), sourceTask = before.members.find(member => member.id === 'alice').tasks[0];
     const claim = { id: randomUUID(), action: 'claim', source: { ownerId: 'alice', taskId: sourceTask.id, version: sourceTask.version }, destination: 'bob' };
     let response = await call('bob', '/api/room/tasks', claim); assert.equal(response.status, 200); let w = (await response.json()).workflow; assert.equal(w.status, 'working');
-    const act = async (actor, action, extra = {}) => call(actor, '/api/room/tasks', { id: randomUUID(), workflowId: w.id, version: w.version, action, ...extra });
+    const arrangeCurrent = async () => {
+      const snapshot = await (await call('bob', '/api/room/tasks?local=1')).json();
+      const response = await call('bob', '/api/room/tasks', { id: randomUUID(), action: 'arrange-execution', version: snapshot.executionVersion, workflowIds: [w.id] });
+      assert.equal(response.status, 200); w = (await response.json()).workflows.find(item => item.id === w.id);
+    };
+    assert.equal(w.executing, false);
+    assert.equal((await call('bob', '/api/room/tasks', { id: randomUUID(), workflowId: w.id, version: w.version, action: 'submit' })).status, 409);
+    await arrangeCurrent();
+    const act = async (actor, action, extra = {}) => {
+      if (actor === 'bob' && action === 'submit' && !w.executing) await arrangeCurrent();
+      return call(actor, '/api/room/tasks', { id: randomUUID(), workflowId: w.id, version: w.version, action, ...extra });
+    };
     assert.equal((await act('bob', 'nudge')).status, 403);
     response = await act('alice', 'nudge'); assert.equal(response.status, 200); w = (await response.json()).workflow;
     const nudge = w.events.find(event => event.type === 'nudge'); assert.ok(nudge);

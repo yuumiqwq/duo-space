@@ -33,6 +33,7 @@ export async function POST(request: NextRequest) {
     const command = JSON.parse(text);
     if (!command || typeof command !== "object") return json({ error: "操作无效" }, 400);
     if (command.action === "read-notices") return json(await store.markNoticesRead(actor, command.ids));
+    if (command.action === "arrange-execution") return json(await store.arrangeExecution(actor, command));
     after(() => store.deliverNotices().catch(() => undefined));
     if (command.action === "legacy-reset") return json(await store.resetLegacy(actor));
     if (command.action === "claim" || ["submit", "approve", "reject", "retry-workflow", "owner-complete", "update-workflow", "restore-workflow", "delete-claimed-task", "delete-owner-task", "nudge", "reply-nudge"].includes(command.action)) {

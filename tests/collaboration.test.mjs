@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { CollaborationError, CollaborationStore, fieldDifferences, remoteVersion, sameFields, taskFields } from '../app/api/room/tasks/store.ts';
+import { executionIds } from '../app/workflow-execution.ts';
 
 async function fixture() {
   await mkdir('codex-generated/test-data', { recursive: true });
@@ -141,8 +142,126 @@ test('collaboration includes the captured redacted diagnostic for the member who
 });
 
 const claim = (f, task, actor = 'bob', destination = actor) => f.store.claim(actor, { id: randomUUID(), action: 'claim', source: source(task), destination });
-const act = (f, workflow, actor, action, extra = {}) => f.store.workflowCommand(actor, { id: randomUUID(), workflowId: workflow.id, version: workflow.version, action, ...extra });
+const arrange = async (f, actor, workflowIds, extra = {}) => f.store.arrangeExecution(actor, { id: randomUUID(), action: 'arrange-execution', version: (await f.store.snapshot(actor, null)).executionVersion, workflowIds, ...extra });
+// Existing lifecycle cases explicitly arrange their task before exercising
+// submission; execution permission and limits have separate direct-call cases.
+const act = async (f, workflow, actor, action, extra = {}) => {
+  if (action === 'submit' && actor === workflow.claimantId && ['working', 'rejected'].includes(workflow.status) && !workflow.executing) {
+    const snapshot = await f.store.snapshot(actor, null), latest = snapshot.workflows.find(item => item.id === workflow.id);
+    if (latest?.version === workflow.version) {
+      const result = await arrange(f, actor, [...new Set([...executionIds(snapshot.workflows, actor), workflow.id])]);
+      workflow = result.workflows.find(item => item.id === workflow.id);
+    }
+  }
+  return f.store.workflowCommand(actor, { id: randomUUID(), workflowId: workflow.id, version: workflow.version, action, ...extra });
+};
 const refreshed = async (f, id) => { await f.store.checkWorkflows(); return (await f.store.snapshot('alice')).workflows.find(workflow => workflow.id === id); };
+
+test('claiming allocates a copy without execution; only the claimant can atomically arrange up to three tasks', async () => {
+  const f = await fixture(), workflows = [];
+  for (let index = 0; index < 4; index++) workflows.push(await claim(f, await f.create('待安排-' + index)));
+  assert.ok(workflows.every(workflow => workflow.executing === false)); assert.equal(f.counts.creates, 4);
+  const w = workflows[0];
+  await assert.rejects(f.store.workflowCommand('bob', { id: randomUUID(), workflowId: w.id, version: w.version, action: 'submit' }), /只有进行中/);
+  await assert.rejects(f.store.attachmentAccess('bob', w.id, true), { status: 403 });
+  const beforeTasks = structuredClone([...f.accounts.bob]), beforeNotices = (await f.store.revision('alice')).notices;
+  await assert.rejects(arrange(f, 'bob', workflows.map(workflow => workflow.id)), /执行中任务最多3个/);
+  await assert.rejects(arrange(f, 'alice', [w.id]), { status: 403 });
+  await assert.rejects(arrange(f, 'bob', [w.id, w.id]), { status: 400 });
+  const saved = await arrange(f, 'bob', workflows.slice(0, 3).map(workflow => workflow.id));
+  assert.equal(saved.workflows.filter(workflow => workflow.executing).length, 3);
+  assert.deepEqual([...f.accounts.bob], beforeTasks, 'planning does not alter Dida dates or task content');
+  assert.deepEqual((await f.store.revision('alice')).notices, beforeNotices);
+  assert.deepEqual(saved.workflows[0].events, w.events);
+  await f.store.attachmentAccess('bob', w.id, true);
+  assert.equal((await arrange(f, 'bob', [w.id])).workflows.filter(workflow => workflow.executing).length, 1);
+  assert.equal((await arrange(f, 'bob', [])).workflows.filter(workflow => workflow.executing).length, 0);
+  f.store = new CollaborationStore(f.dir, f.gateway);
+  assert.equal((await f.store.snapshot('bob', null)).executionVersion, 3);
+  assert.ok((await f.store.snapshot('bob', null)).workflows.every(workflow => !workflow.executing));
+});
+
+test('pending review retains its execution slot, rejection retains execution, and completion frees the slot', async () => {
+  const f = await fixture(), workflows = [];
+  for (let index = 0; index < 4; index++) workflows.push(await claim(f, await f.create('审批名额-' + index)));
+  let result = await arrange(f, 'bob', workflows.slice(0, 3).map(workflow => workflow.id));
+  let w = result.workflows.find(workflow => workflow.id === workflows[0].id);
+  w = await act(f, w, 'bob', 'submit', { comment: '保留材料' });
+  assert.equal(w.status, 'submitted'); assert.equal(w.executing, true);
+  let snapshot = await f.store.snapshot('bob', null);
+  assert.equal(executionIds(snapshot.workflows, 'bob').length, 3);
+  await assert.rejects(arrange(f, 'bob', [workflows[1].id, workflows[2].id, workflows[3].id]), /待审批任务仍占用/);
+  await assert.rejects(arrange(f, 'bob', workflows.map(workflow => workflow.id)), /最多3个/);
+  w = await act(f, w, 'alice', 'reject', { comment: '继续修改' }); assert.ok(w.executing);
+  w = await act(f, w, 'bob', 'submit', { comment: '重新提交' });
+  w = await act(f, w, 'alice', 'approve'); assert.equal(w.status, 'done'); assert.equal(w.executing, false);
+  result = await arrange(f, 'bob', workflows.slice(1).map(workflow => workflow.id));
+  assert.equal(result.workflows.filter(workflow => workflow.executing).length, 3);
+  snapshot = await f.store.snapshot('bob', null);
+  assert.equal(snapshot.workflows.find(item => item.id === w.id).events.filter(event => event.type === 'submit').length, 2);
+  const deleting = snapshot.workflows.find(item => item.id === workflows[1].id);
+  await act(f, deleting, 'alice', 'delete-owner-task');
+  assert.equal(executionIds((await f.store.snapshot('bob', null)).workflows, 'bob').length, 2);
+});
+
+test('each claimant has three independent execution slots and personal collection receipts never reserve a slot', async () => {
+  const f = await fixture(), a = [], b = [];
+  for (let i = 0; i < 3; i++) {
+    b.push(await claim(f, await f.create('Bob-' + i)));
+    await f.store.execute('bob', { id: randomUUID(), action: 'create', fields: { title: 'Alice-' + i } });
+    const task = (await f.store.snapshot('alice', null)).buffer.find(task => task.title === 'Alice-' + i);
+    a.push(await claim(f, task, 'alice'));
+  }
+  const personal = await claim(f, await f.create('历史个人收集记录'), 'alice');
+  const file = path.join(f.dir, 'room-collaboration.json'), state = JSON.parse(await readFile(file, 'utf8'));
+  state.workflows[personal.id].status = 'submitted'; delete state.workflows[personal.id].executing;
+  await writeFile(file, JSON.stringify(state));
+  await arrange(f, 'alice', a.map(workflow => workflow.id));
+  await arrange(f, 'bob', b.map(workflow => workflow.id));
+  const snapshot = await f.store.snapshot('bob', null);
+  assert.equal(executionIds(snapshot.workflows, 'alice').length, 3);
+  assert.equal(executionIds(snapshot.workflows, 'bob').length, 3);
+  assert.ok(!snapshot.workflows.some(workflow => workflow.id === personal.id));
+});
+
+test('concurrent execution plans use a separate version and old receipt replay cannot undo later plans', async () => {
+  const f = await fixture(), a = await claim(f, await f.create('A')), b = await claim(f, await f.create('B'));
+  const commands = [a, b].map(workflow => ({ id: randomUUID(), action: 'arrange-execution', version: 0, workflowIds: [workflow.id] }));
+  const results = await Promise.allSettled(commands.map(command => f.store.arrangeExecution('bob', command)));
+  assert.equal(results.filter(result => result.status === 'fulfilled').length, 1);
+  const index = results.findIndex(result => result.status === 'fulfilled'), winner = commands[index];
+  const first = results[index].value;
+  await assert.rejects(f.store.arrangeExecution('bob', { ...winner, workflowIds: [] }), /编号已使用/);
+  const task = first.workflows.find(workflow => workflow.id === winner.workflowIds[0]);
+  await act(f, task, 'alice', 'nudge');
+  await arrange(f, 'bob', [], { version: first.execution.version });
+  f.store = new CollaborationStore(f.dir, f.gateway);
+  const replay = await f.store.arrangeExecution('bob', winner);
+  assert.equal(replay.execution.version, 2); assert.ok(replay.workflows.every(workflow => !workflow.executing));
+});
+
+test('legacy claims stay unarranged while existing review materials and reserved slots remain available', async () => {
+  const f = await fixture(), pending = await claim(f, await f.create('旧待审批')), idle = await claim(f, await f.create('旧认领'));
+  const unclaimed = await f.create('尚无人认领');
+  const submitted = await act(f, pending, 'bob', 'submit', { comment: '历史提交材料' });
+  const file = path.join(f.dir, 'room-collaboration.json'), state = JSON.parse(await readFile(file, 'utf8'));
+  delete state.executionPlans; for (const workflow of Object.values(state.workflows)) delete workflow.executing;
+  await writeFile(file, JSON.stringify(state)); f.store = new CollaborationStore(f.dir, f.gateway);
+  const snapshot = await f.store.snapshot('bob', null);
+  assert.equal(snapshot.workflows.find(workflow => workflow.id === idle.id).executing, false);
+  assert.equal(snapshot.workflows.find(workflow => workflow.id === pending.id).executing, true);
+  assert.equal(snapshot.buffer.find(task => task.id === unclaimed.id).workflowId, undefined);
+  assert.ok(!snapshot.workflows.some(workflow => workflow.source.taskId === unclaimed.id));
+  assert.deepEqual(snapshot.workflows.find(workflow => workflow.id === pending.id).events, submitted.events);
+  assert.deepEqual(executionIds(snapshot.workflows, 'bob'), [pending.id]);
+  await arrange(f, 'bob', [pending.id, idle.id]);
+  f.store = new CollaborationStore(f.dir, f.gateway);
+  const restored = await f.store.snapshot('bob', null);
+  assert.equal(restored.workflows.find(workflow => workflow.id === idle.id).executing, true, 'later execution choices survive initialization and restart');
+  assert.equal(JSON.parse(await readFile(file, 'utf8')).workflows[pending.id].executing, true);
+  const completed = await act(f, snapshot.workflows.find(workflow => workflow.id === submitted.id), 'alice', 'approve');
+  assert.equal(completed.status, 'done'); assert.ok(completed.events.some(event => event.comment === '历史提交材料'));
+});
 
 test('provider date defaults and copied checklist IDs compare by content without weakening versions or real differences', () => {
   const fields = taskFields({ title: '全天检查清单', startDate: '2026-09-11T16:00:00.000Z', kind: 'CHECKLIST', items: [
@@ -759,7 +878,8 @@ test('concurrent claims serialize, command replay is idempotent, IDs cannot be r
   const [w1, w2] = await Promise.all([f2.store.claim('bob', command), f2.store.claim('bob', command)]);
   assert.equal(w1.id, w2.id); assert.equal(f2.counts.creates, 1);
   await assert.rejects(f2.store.claim('alice', command), /编号/);
-  const submit = { id: randomUUID(), workflowId: w1.id, version: w1.version, action: 'submit' };
+  const arranged = await arrange(f2, 'bob', [w1.id]);
+  const submit = { id: randomUUID(), workflowId: w1.id, version: arranged.workflows[0].version, action: 'submit' };
   await f2.store.workflowCommand('bob', submit); const repeated = await f2.store.workflowCommand('bob', submit);
   assert.equal(repeated.events.filter(event => event.type === 'submit').length, 1);
   await assert.rejects(f2.store.workflowCommand('bob', { ...submit, comment: 'changed' }), /编号/);

@@ -5,7 +5,8 @@ import { workflowSettingChanges } from "../../../workflow-setting-changes.ts";
 import { collaborationDate, collaborationDateAfter } from "../../../collaboration-view.ts";
 import { clearLegacyRecords } from "../../../legacy-record-cleanup.ts";
 import { collectTaskNotices, initializeTaskNotices, receivesTaskNotice, silentWorkflowEvent, unreadTaskNotices, type TaskNotice, type TaskNoticeState } from "../../../collaboration-notifications.ts";
-import type { ClaimWorkflow, WorkflowCommand, WorkflowFile, CollaborationCommand, CollaborationSnapshot, OperationView, RoomTask, TaskFields, TaskSource } from "../../../collaboration-types";
+import type { ClaimWorkflow, WorkflowCommand, WorkflowFile, CollaborationCommand, CollaborationSnapshot, ExecutionCommand, OperationView, RoomTask, TaskFields, TaskSource } from "../../../collaboration-types";
+import { EXECUTION_LIMIT, executionEligible, executionReserved, isExecuting } from '../../../workflow-execution.ts';
 import { descriptionAttachments } from "../../../task-description-attachments.ts";
 
 export type RemoteTask = Partial<TaskFields> & { id: string; projectId: string; status?: number; parentId?: string; [key: string]: unknown };
@@ -37,7 +38,7 @@ type Operation = OperationView & {
   phase: "prepared" | "destination-ready" | "source-removed";
   creation?: { state: "new" | "sent" | "received"; beforeIds?: string[] };
 };
-type State = { version: 1; revision: number; buffer: Record<string, BufferTask>; operations: Record<string, Operation>; workflows: Record<string, Workflow>; notifications?: TaskNoticeState; legacyCleanup?: { title: string; message: string }[]; legacyReset?: boolean };
+type State = { version: 1; revision: number; buffer: Record<string, BufferTask>; operations: Record<string, Operation>; workflows: Record<string, Workflow>; executionPlans?: Record<string, { version: number; receipts: { id: string; signature: string }[] }>; notifications?: TaskNoticeState; legacyCleanup?: { title: string; message: string }[]; legacyReset?: boolean };
 export const isPersonalCollection = (workflow: ClaimWorkflow) => workflow.source.ownerId === null && workflow.reviewerId === workflow.claimantId;
 export function collectionOperation(workflow: ClaimWorkflow): OperationView {
   return { id: workflow.id, actorId: workflow.events[0]?.actorId || workflow.claimantId, title: workflow.title, action: "collect", from: null, to: workflow.claimantId, status: workflow.status === "done" && !workflow.editPending ? "done" : "pending", error: workflow.error, createdAt: workflow.createdAt, updatedAt: workflow.updatedAt };
@@ -126,6 +127,10 @@ export class CollaborationStore {
       // even while linked inbox deletions are waiting for provider confirmation.
       // Old one-sided deletion receipts do not authorize removing another copy.
       for (const workflow of Object.values(state.workflows) as Workflow[]) {
+        // Initialize existing claims once. Pending submissions retain their
+        // execution slot and review history; ordinary claims start unarranged.
+        // Public tasks without a claimant have no workflow and are untouched.
+        workflow.executing ??= !isPersonalCollection(workflow) && !workflow.ownerDeletion && (workflow.status === 'submitted' || (workflow.status === 'approving' && workflow.events.some(event => event.type === 'submit')));
         const deleting = workflow.ownerDeletion && workflow.events.some(event => event.id === workflow.ownerDeletion?.id && event.type === 'task-delete-requested');
         if ((workflow.status === 'deleted' || deleting) && workflow.source.ownerId === null) delete state.buffer[workflow.source.taskId];
       }
@@ -316,7 +321,7 @@ export class CollaborationStore {
       return { ...task, workflowId: !collecting ? workflow?.id : undefined, pending: collecting ? workflow.id : pending.find(op => (op.source?.ownerId === task.ownerId && op.source.taskId === task.id) || (op.to === task.ownerId && op.targetId === task.id))?.id };
     };
     return {
-      identityId, revision: state.revision,
+      identityId, revision: state.revision, executionVersion: state.executionPlans?.[identityId]?.version || 0,
       notices: unreadTaskNotices(state, identityId),
       noticeVersion: state.notifications?.version || 0,
       buffer: Object.entries(state.buffer).filter(([, task]) => !task.completedAt).map(([id, task]) => lock({ ...task.fields, id, ownerId: null, version: String(task.version), publisherId: task.publisherId })),
@@ -486,10 +491,46 @@ export class CollaborationStore {
   }
   private publicWorkflow(workflow: Workflow): ClaimWorkflow {
     const { id, title, source, reviewerId, claimantId, targetId, reviewerTaskId, fields, status, version, createdAt, updatedAt, error, events } = workflow;
-    return { id, title, source, reviewerId, claimantId, targetId, reviewerTaskId, fields: workflow.edit?.fields || fields, status, version, createdAt, updatedAt, error, editPending: !!workflow.edit, ownerDeletePending: !!workflow.ownerDeletion, taskAnomaly: workflow.taskAnomaly, syncError: workflow.syncError, reopenPending: workflow.reopenPending, needsSubmission: workflow.needsSubmission, events: events.map(({ id, actorId, type, at, comment, files, replyTo }) => ({ id, actorId, type, at, comment, files, replyTo })) };
+    return { id, title, source, reviewerId, claimantId, targetId, reviewerTaskId, fields: workflow.edit?.fields || fields, status, version, createdAt, updatedAt, error, executing: !!workflow.executing, editPending: !!workflow.edit, ownerDeletePending: !!workflow.ownerDeletion, taskAnomaly: workflow.taskAnomaly, syncError: workflow.syncError, reopenPending: workflow.reopenPending, needsSubmission: workflow.needsSubmission, events: events.map(({ id, actorId, type, at, comment, files, replyTo }) => ({ id, actorId, type, at, comment, files, replyTo })) };
   }
   private async saveWorkflow(state: State, workflow: Workflow) {
+    if (workflow.executing && (['done', 'deleted'].includes(workflow.status) || workflow.ownerDeletion)) {
+      workflow.executing = false;
+      state.executionPlans ||= {};
+      const plan = state.executionPlans[workflow.claimantId] ||= { version: 0, receipts: [] };
+      plan.version++;
+    }
     workflow.updatedAt = Date.now(); workflow.version++; state.revision++; await this.write(state);
+  }
+  arrangeExecution(actor: string, command: ExecutionCommand) {
+    return this.serial(async () => {
+      await this.requireMember(actor);
+      if (!command || command.action !== 'arrange-execution' || !/^[a-f0-9-]{36}$/i.test(command.id) || !Number.isSafeInteger(command.version) || command.version < 0 || !Array.isArray(command.workflowIds) || command.workflowIds.some(id => typeof id !== 'string' || !/^[a-f0-9-]{36}$/i.test(id)) || new Set(command.workflowIds).size !== command.workflowIds.length) throw new CollaborationError('执行安排参数无效', 400);
+      if (command.workflowIds.length > EXECUTION_LIMIT) throw new CollaborationError('执行中任务最多3个', 400);
+      const state = await this.read(), signature = fingerprint({ actor, command });
+      state.executionPlans ||= {};
+      const plan = state.executionPlans[actor] ||= { version: 0, receipts: [] };
+      const response = () => ({ execution: { id: command.id, version: plan.version }, revision: state.revision, workflows: Object.values(state.workflows).filter(workflow => workflow.claimantId === actor && !isPersonalCollection(workflow)).map(workflow => this.publicWorkflow(workflow)) });
+      const prior = plan.receipts.find(receipt => receipt.id === command.id);
+      if (prior) { if (prior.signature !== signature) throw new CollaborationError('操作编号已使用'); return response(); }
+      if (plan.version !== command.version) throw new CollaborationError('执行安排已更新，请重新安排后保存');
+      const reserved = Object.values(state.workflows).filter(workflow => workflow.claimantId === actor && !isPersonalCollection(workflow) && executionReserved(this.publicWorkflow(workflow)));
+      if (reserved.some(workflow => !command.workflowIds.includes(workflow.id))) throw new CollaborationError('待审批任务仍占用执行名额');
+      for (const id of command.workflowIds) {
+        const workflow = state.workflows[id];
+        if (!workflow || workflow.claimantId !== actor || isPersonalCollection(workflow)) throw new CollaborationError('只能安排自己认领的任务', 403);
+        if (!executionEligible(this.publicWorkflow(workflow)) && !executionReserved(this.publicWorkflow(workflow))) throw new CollaborationError('任务状态已变化，请重新安排后保存');
+      }
+      const selected = new Set(command.workflowIds), now = Date.now();
+      for (const workflow of Object.values(state.workflows).filter(workflow => workflow.claimantId === actor && !isPersonalCollection(workflow))) {
+        const executing = selected.has(workflow.id);
+        if (!!workflow.executing === executing) continue;
+        workflow.executing = executing; workflow.version++; workflow.updatedAt = now;
+      }
+      plan.version++; plan.receipts = [...plan.receipts, { id: command.id, signature }].slice(-30);
+      state.revision++; await this.write(state);
+      return response();
+    });
   }
   private async requireMember(actor: string) {
     const members = await this.gateway.members();
@@ -715,6 +756,7 @@ export class CollaborationStore {
       if ([sides.source, sides.target].some(task => task?.status && task.status !== 2)) throw new CollaborationError("关联任务状态暂不支持完成，请刷新后重试");
       workflow.submitted = { source: sides.source ? remoteVersion(sides.source) : "", target: remoteVersion(sides.target) };
       workflow.approval = { sourceDone: !sides.source || sides.source.status === 2, targetDone: sides.target.status === 2 };
+      if (workflow.status === 'submitted') workflow.executing = true;
       workflow.status = "approving"; workflow.error = "";
       const request = workflow.completionRequest;
       workflow.events.push({ id: request.id, signature: request.signature, actorId: request.actor, type: request.review ? "approve" : "owner-complete", at: Date.now(), comment: request.review?.comment ?? "原任务所属成员或发布者已直接标记完成，正在同步双方任务", files: request.review?.files || [] });
@@ -863,6 +905,7 @@ export class CollaborationStore {
       const submit = command.action === "submit";
       if (actor !== (submit ? workflow.claimantId : workflow.reviewerId)) throw new CollaborationError(submit ? "只有认领者能提交完成" : "只有原任务所属用户或发布者能审批", 403);
       if (submit ? !["working", "rejected"].includes(workflow.status) : workflow.status !== "submitted") throw new CollaborationError("当前流程状态不支持此操作");
+      if (submit && !isExecuting(this.publicWorkflow(workflow))) throw new CollaborationError('只有进行中任务可以提交审批');
       const comment = command.comment ?? "";
       if (typeof comment !== "string" || comment.length > 10000 || !Array.isArray(command.attachments || []) || (command.attachments?.length || 0) > 10) throw new CollaborationError("评语或附件参数无效", 400);
       const files: WorkflowFile[] = [];
@@ -887,6 +930,10 @@ export class CollaborationStore {
         }
       }
       workflow.events.push({ id: command.id, signature, actorId: actor, type: command.action, at: Date.now(), comment: comment.trim(), files });
+      state.executionPlans ||= {};
+      const executionPlan = state.executionPlans[workflow.claimantId] ||= { version: 0, receipts: [] };
+      executionPlan.version++;
+      workflow.executing = true;
       workflow.status = submit ? "submitted" : "rejected";
       workflow.error = "";
       await this.saveWorkflow(state, workflow);
@@ -899,7 +946,7 @@ export class CollaborationStore {
     const workflow = (await this.read()).workflows[workflowId];
     if (!workflow) throw new CollaborationError("流程不存在", 404);
     if (file && file.actorId !== actor && !workflow.events.some(event => event.files.some(item => item.id === file.id))) throw new CollaborationError("附件尚未提交", 403);
-    if (upload && (workflow.edit || !((actor === workflow.claimantId && ["working", "rejected"].includes(workflow.status)) || (actor === workflow.reviewerId && workflow.status === "submitted")))) throw new CollaborationError("当前账号不能为此流程添加附件", 403);
+    if (upload && (workflow.edit || !((actor === workflow.claimantId && isExecuting(this.publicWorkflow(workflow)) && ["working", "rejected"].includes(workflow.status)) || (actor === workflow.reviewerId && workflow.status === "submitted")))) throw new CollaborationError("当前账号不能为此流程添加附件", 403);
     return true;
   }
   personalCompletion<T>(actor: string, taskId: string, complete: () => Promise<T>) {

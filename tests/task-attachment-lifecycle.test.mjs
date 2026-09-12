@@ -61,6 +61,8 @@ test('workflow attachment deletion waits for linked saves and resumes cleanup af
   const f = await fixture(), a = await f.stage();
   const task = await f.create(a.content);
   let w = await f.store.claim('bob', { id: randomUUID(), action: 'claim', source: { ownerId: null, taskId: task.id, version: task.version }, destination: 'bob' });
+  const snapshot = await f.store.snapshot('bob', null);
+  w = (await f.store.arrangeExecution('bob', { id: randomUUID(), action: 'arrange-execution', version: snapshot.executionVersion, workflowIds: [w.id] })).workflows.find(workflow => workflow.id === w.id);
   const act = (actor, action, extra = {}) => f.store.workflowCommand(actor, { id: randomUUID(), workflowId: w.id, version: w.version, action, ...extra });
   w = await act('bob', 'submit', { comment: '已提交材料' });
   const update = f.gateway.update;

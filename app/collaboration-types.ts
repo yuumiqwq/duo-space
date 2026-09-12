@@ -14,6 +14,7 @@ export type ClaimWorkflow = {
   status: "creating" | "working" | "submitted" | "rejected" | "approving" | "done" | "deleted";
   version: number; createdAt: number; updatedAt: number; error: string; events: WorkflowEvent[];
   editPending?: boolean;
+  executing?: boolean;
   ownerDeletePending?: boolean;
   taskAnomaly?: boolean;
   syncError?: string;
@@ -21,6 +22,7 @@ export type ClaimWorkflow = {
   needsSubmission?: boolean;
 };
 export type WorkflowCommand = { id: string; workflowId: string; version: number; action: "submit" | "approve" | "reject" | "retry-workflow" | "owner-complete" | "update-workflow" | "restore-workflow" | "delete-claimed-task" | "delete-owner-task" | "nudge" | "reply-nudge"; comment?: string; replyTo?: string; attachments?: string[]; fields?: Partial<TaskFields> };
-export type CollaborationSnapshot = { identityId: string; revision: number; noticeVersion?: number; buffer: RoomTask[]; members: CollaborationMember[]; operations: OperationView[]; workflows: ClaimWorkflow[]; legacyCleanup?: { title: string; message: string }[]; notices?: import("./collaboration-notifications").TaskNotice[] };
+export type ExecutionCommand = { id: string; action: "arrange-execution"; version: number; workflowIds: string[] };
+export type CollaborationSnapshot = { identityId: string; revision: number; executionVersion?: number; noticeVersion?: number; buffer: RoomTask[]; members: CollaborationMember[]; operations: OperationView[]; workflows: ClaimWorkflow[]; legacyCleanup?: { title: string; message: string }[]; notices?: import("./collaboration-notifications").TaskNotice[] };
 export type TaskSource = { ownerId: string | null; taskId: string; version: string };
 export type CollaborationCommand = { id: string; action: "create" | "update" | "move" | "claim" | "complete" | "delete"; source?: TaskSource; destination?: string | null; fields?: Partial<TaskFields>; dateAfter?: TaskSource };

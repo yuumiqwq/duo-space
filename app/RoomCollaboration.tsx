@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState, type CSSProperties, type Poin
 import type { PublicTaskPreview } from "./classroom-view";
 import { createPortal } from "react-dom";
 import { CircleAlert, Check, ClipboardList, Ellipsis, Loader2, Plus, RefreshCw, X } from "lucide-react";
-import type { CollaborationCommand, CollaborationSnapshot, OperationView, RoomTask, ClaimWorkflow, WorkflowCommand } from "./collaboration-types";
+import type { CollaborationCommand, CollaborationSnapshot, ExecutionCommand, OperationView, RoomTask, ClaimWorkflow, WorkflowCommand } from "./collaboration-types";
 import "./room-collaboration.css";
 import { TickTickDiagnostics } from "./TickTickDiagnostics";
 import { InlineTaskTitle } from "./InlineTaskTitle";
@@ -18,14 +18,14 @@ import { TaskAttachments } from "./TaskDescription";
 import { taskDescriptionPreview } from "./task-description";
 import { loadTaskStampFonts } from "./task-stamp-fonts";
 
-import { ClaimWorkflows, workflowStatus } from "./ClaimWorkflows";
+import { ClaimWorkflows } from "./ClaimWorkflows";
 import { applyWorkflowUpdate, removeSnapshotTask, withoutDeletedWorkflowTasks } from './collaboration-snapshot';
 import { loadCollaborationSnapshot, mergeCollaborationSnapshot } from './collaboration-loading';
 import { inboxClaimant } from './inbox-claim-stamp';
 import { InboxClaimStamp } from './InboxClaimStamp';
 import { readTaskResponse, taskErrorMessage } from './task-request';
 
-type RequestCommand = WorkflowCommand | { id: string; action: "legacy-reset" } | CollaborationCommand | { id: string; action: "resume" | "cancel" } | { id: string; action: "recover"; target: { id: string; version: string } };
+type RequestCommand = WorkflowCommand | ExecutionCommand | { id: string; action: "legacy-reset" } | CollaborationCommand | { id: string; action: "resume" | "cancel" } | { id: string; action: "recover"; target: { id: string; version: string } };
 const taskKey = (task: RoomTask) => `${task.ownerId || "buffer"}:${task.id}`;
 const taskSource = (task: RoomTask) => ({ ownerId: task.ownerId, taskId: task.id, version: task.version });
 const priorities = { 0: "无优先级", 1: "低", 3: "中", 5: "高" };
@@ -166,6 +166,11 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
       setSnapshot(current => {
         if (!current) return current;
         const next = structuredClone(current);
+        if (command.action === 'arrange-execution') {
+          for (const workflow of next.workflows) if (workflow.claimantId === next.identityId) workflow.executing = command.workflowIds.includes(workflow.id);
+          next.executionVersion = (next.executionVersion || 0) + 1;
+          return next;
+        }
         const source = "source" in command ? command.source : undefined;
         const list = source?.ownerId ? next.members.find(member => member.id === source.ownerId)?.tasks : next.buffer;
         const task = list?.find(item => item.id === source?.taskId);
@@ -195,13 +200,15 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
     if (locked.current) return false;
     generation.current++; fetching.current = false; loadController.current?.abort(); setLoading(false);
     locked.current = true; setBusy(true); setError(""); setNotice(""); setUncertain(command);
-    let operation: OperationView | undefined, workflow: ClaimWorkflow | undefined;
+    let operation: OperationView | undefined, workflow: ClaimWorkflow | undefined, executionSaved = false;
     try {
       const response = await fetch("/api/room/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(command), signal: AbortSignal.timeout(90000) });
       if (!response.ok && response.status < 500) setUncertain(null);
       const data = await readTaskResponse(response, '请求结果未确认，请核对并重试');
-      if (command.action !== 'legacy-reset' && !data.operation?.id && !data.workflow?.id) throw new Error('请求结果未确认，请核对并重试');
+      executionSaved = command.action === 'arrange-execution' && data.execution?.id === command.id && Array.isArray(data.workflows);
+      if (command.action !== 'legacy-reset' && !executionSaved && !data.operation?.id && !data.workflow?.id) throw new Error('请求结果未确认，请核对并重试');
       operation = data.operation; workflow = data.workflow;
+      if (executionSaved) setSnapshot(current => current ? { ...data.workflows.reduce(applyWorkflowUpdate, current), executionVersion: data.execution.version, revision: data.revision } : current);
       if (workflow) setSnapshot(current => current ? applyWorkflowUpdate(current, workflow!) : current);
       const deletedSource = command.action === 'delete' ? command.source : undefined;
       if (operation?.status === 'done' && deletedSource) setSnapshot(current => current ? removeSnapshotTask(current, deletedSource.ownerId, deletedSource.taskId) : current);
@@ -225,7 +232,7 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
       void onChanged();
     }
     if (operation?.status === "done" || operation?.status === "cancelled") setDraftId(current => current === command.id ? null : current);
-    return workflow ? (command.action === 'update-workflow' && workflow.events.some(event => event.id === command.id)) || (!workflow.error && !workflow.syncError) : operation?.status === "done";
+    return executionSaved || (workflow ? (command.action === 'update-workflow' && workflow.events.some(event => event.id === command.id)) || (!workflow.error && !workflow.syncError) : operation?.status === "done");
   }
   const unavailable = busy || !!uncertain;
   const ownerName = (owner: string | null) => owner === null ? "任务板" : snapshot?.members.find(member => member.id === owner)?.name || "成员";
@@ -346,7 +353,7 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
       <div className="coop-task-footer">{((task.ownerId === null && collaborationDate(task)) || task.repeatFlag || (!compactClaim && !!claimButton)) && <div className="coop-task-meta">{task.ownerId === null && collaborationDate(task) && <span >{collaborationDateLabel(task)}</span>}{task.repeatFlag && <span>重复</span>}
         {!compactClaim && claimButton}
       </div>}
-      {workflow && task.ownerId === null && (canComplete ? <div className="coop-stamp-clip"><span className="coop-claim-stamp" data-fonts-ready={stampFontsReady} aria-label={`认领者：${ownerName(workflow.claimantId)}`}><span className="coop-claim-stamp-name">{ownerName(workflow.claimantId)}</span></span></div> : <span className={`coop-workflow-badge ${workflow.status}`}>{workflowStatus[workflow.status]} · {ownerName(workflow.claimantId)} 认领</span>)}</div>
+      {workflow && task.ownerId === null && <div className="coop-stamp-clip"><span className="coop-claim-stamp" data-fonts-ready={stampFontsReady} aria-label={`认领者：${ownerName(workflow.claimantId)}`}><span className="coop-claim-stamp-name">{ownerName(workflow.claimantId)}</span></span></div>}</div>
       {stampedClaimant && <InboxClaimStamp name={ownerName(stampedClaimant)} fontsReady={stampFontsReady} />}
       {!workflow && task.transferBlocked && <small className="coop-transfer-note">{task.transferBlocked}</small>}
       {pending && <button type="button" className="coop-pending-label" onClick={() => setRecoveryOpen(true)}><CircleAlert size={12} aria-hidden="true" />查看待处理操作</button>}

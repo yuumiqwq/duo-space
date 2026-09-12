@@ -13,7 +13,7 @@ test('workflow detail offers settings to every member and direct completion only
   const dir = await mkdtemp(path.resolve('codex-generated/test-data/workflow-ui-')), output = path.join(dir, 'component.mjs');
   await build({ entryPoints: ['app/ClaimWorkflows.tsx'], bundle: true, platform: 'node', format: 'esm', packages: 'external', jsx: 'automatic', outfile: output, logLevel: 'silent' });
   const { ClaimWorkflows, WorkflowList } = await import(pathToFileURL(output).href);
-  const workflow = { id: 'workflow', title: '测试', reviewerId: 'alice', claimantId: 'bob', fields: taskFields({ title: '测试' }), status: 'working', events: [] };
+  const workflow = { id: 'workflow', title: '测试', reviewerId: 'alice', claimantId: 'bob', fields: taskFields({ title: '测试' }), status: 'working', executing: true, events: [] };
   const render = (identityId, status = 'working', editPending = false, error = '') => renderToStaticMarkup(createElement(ClaimWorkflows, { initialId: workflow.id, busy: false, error, onClose() {}, onEdit() {}, perform() {}, snapshot: { identityId, members: ['alice', 'bob', 'charlie'].map(id => ({ id, name: id })), workflows: [{ ...workflow, status, editPending }] } }));
   for (const member of ['alice', 'bob', 'charlie']) for (const status of ['creating', 'working', 'submitted', 'rejected', 'approving', 'done', 'deleted']) {
     const html = render(member, status); assert.match(html, /<form[^>]+aria-label="详细设置"/); assert.ok(!html.includes(">详细设置</button>"));
@@ -30,7 +30,7 @@ test('workflow detail offers settings to every member and direct completion only
   assert.ok(!active.includes('已删除归档示例')); const archive = overview(true); assert.ok(archive.includes('已删除归档示例')); assert.ok(archive.includes('归档事项示例')); assert.ok(!archive.includes('我认领的事项')); assert.ok(!archive.includes('他人认领的事项')); assert.ok(archive.includes('未完成流程'));
   const notices = [{ id: 'nudge-notice', workflowId: 'theirs', eventType: 'nudge' }, { id: 'done-notice', workflowId: 'done', eventType: 'completed' }];
   const withNotices = renderToStaticMarkup(createElement(WorkflowList, { workflows, notices, archived: false, setArchived() {}, select() {}, name: id => id }));
-  assert.ok(withNotices.indexOf('他人认领的事项') < withNotices.indexOf('我认领的事项'), 'unread workflow is temporarily first');
+  assert.ok(withNotices.indexOf('我认领的事项') < withNotices.indexOf('他人认领的事项'), 'unread badges do not reorder equal-priority execution tasks');
   assert.match(withNotices, /1 条归档新记录/); assert.match(withNotices, /task-notice-dot/);
   assert.match(withNotices, /coop-workflow-status has-update">有更新/);
   assert.ok(!overview(false).includes('有更新'), 'read workflow returns to its actual status');
@@ -40,12 +40,18 @@ test('workflow detail offers settings to every member and direct completion only
       for (const updated of [false, true]) {
         const html = renderToStaticMarkup(createElement(WorkflowList, { workflows: [{ ...workflow, ...flags, status }], notices: updated ? [{ id: 'update', workflowId: workflow.id }] : [], archived: false, setArchived() {}, select() {}, name: id => id }));
         const label = html.match(/coop-workflow-status [^"]+">([^<]+)<\/span>/)?.[1];
-        assert.equal(label, updated ? '有更新' : status === 'submitted' ? '待审批' : '进行中');
+        assert.equal(label, updated ? '有更新' : undefined, 'active stages are shown by group titles rather than trailing status badges');
       }
     }
   }
   const ordered = renderToStaticMarkup(createElement(WorkflowList, { workflows: [...workflows, { ...workflow, id: 'review', title: '优先审批事项', status: 'submitted', createdAt: 1 }], notices, archived: false, setArchived() {}, select() {}, name: id => id }));
-  assert.ok(ordered.indexOf('优先审批事项') < ordered.indexOf('他人认领的事项'), 'pending review outranks unread working tasks');
+  assert.ok(ordered.indexOf('他人认领的事项') < ordered.indexOf('优先审批事项'), 'execution is the first group');
+  workflow.executing = false;
+  assert.ok(!render('bob').includes('提交完成')); assert.ok(render('bob').includes('已认领'));
+  workflow.executing = true;
+  const choosing = renderToStaticMarkup(createElement(WorkflowList, { workflows: [...workflows, { ...workflow, id: 'reserved', status: 'submitted' }], notices, archived: false, setArchived() {}, select() {}, name: id => id, identityId: 'bob', executionDraft: ['mine', 'reserved'], toggleExecution() {} }));
+  assert.ok(!choosing.includes('>有更新<')); assert.match(choosing, /role="checkbox" aria-checked="true"/);
+  assert.match(choosing, /coop-complete coop-execution-checkbox/); assert.match(choosing, /role="checkbox" aria-checked="true" disabled/);
   workflow.events = ['claimed', 'submit', 'approve', 'completed'].map((type, index) => ({ id: String(index), actorId: 'bob', type, at: 1700000000000, comment: type === 'completed' ? '不可显示的后台完成说明' : '', files: [] }));
   const history = render('alice', 'done');
   assert.ok(!history.includes('安排认领')); assert.ok(!history.includes('完成同步')); assert.ok(!history.includes('不可显示的后台完成说明'));
