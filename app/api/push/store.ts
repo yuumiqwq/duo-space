@@ -3,6 +3,7 @@ import path from "node:path";
 import webPush from "web-push";
 import { receivesTaskNotice, type TaskNotice } from "../../collaboration-notifications";
 import { getUser, listRoomMembers } from "../identity/store";
+import { chatPushPayload, deliverChatNotification } from "./delivery";
 
 export type StoredPushSubscription = {
   endpoint: string;
@@ -55,32 +56,59 @@ export function savePushSubscription(subscription: StoredPushSubscription) {
   });
 }
 
-export function removePushSubscription(endpoint: string) {
-  return mutate((store) => { store.subscriptions = store.subscriptions.filter((item) => item.endpoint !== endpoint); });
+export function removePushSubscription(endpoint: string, identityId?: string) {
+  return mutate((store) => { store.subscriptions = store.subscriptions.filter((item) => item.endpoint !== endpoint || (identityId !== undefined && item.identityId !== identityId)); });
 }
 
-export async function sendChatPush(message: { sender: string; body: string; attachment?: { kind: string; name: string } }, senderDeviceId: string) {
+export async function sendDeviceTestPush(identityId: string, endpoint: string) {
+  const publicKey = process.env.VAPID_PUBLIC_KEY, privateKey = process.env.VAPID_PRIVATE_KEY;
+  if (!publicKey || !privateKey) return { status: 503, error: "服务器尚未完整配置消息推送" };
+  await mutationQueue;
+  const subscription = (await readStore()).subscriptions.find(item => item.endpoint === endpoint && item.identityId === identityId);
+  if (!subscription) return { status: 404, error: "服务器没有此设备的订阅，请重新开启提醒" };
+  webPush.setVapidDetails(process.env.VAPID_SUBJECT || "https://study.11scat.xyz", publicKey, privateKey);
+  try {
+    await webPush.sendNotification(subscription, JSON.stringify({
+      title: "11scat 测试提醒", body: "如果你看到了这条系统通知，此设备现在可以收到推送提醒。", url: "/",
+    }), { TTL: 60, urgency: "high", timeout: 10_000 });
+    return { status: 200 };
+  } catch (error) {
+    const status = (error as { statusCode?: number }).statusCode;
+    if (status === 404 || status === 410) {
+      await removePushSubscription(endpoint);
+      return { status: 410, error: "此设备订阅已过期，请关闭提醒后重新开启" };
+    }
+    console.warn("test-push", JSON.stringify({ provider: new URL(endpoint).hostname, status: status || "network-error" }));
+    return { status: 502, error: "推送服务未接受测试通知，请检查服务器网络和推送密钥配置" };
+  }
+}
+
+export async function sendChatPush(message: { id?: string; sender: string; body: string; attachment?: { kind: string; name: string } }, senderDeviceId: string) {
   const publicKey = process.env.VAPID_PUBLIC_KEY;
   const privateKey = process.env.VAPID_PRIVATE_KEY;
-  if (!publicKey || !privateKey) return;
+  if (!publicKey || !privateKey) { console.warn("chat-push", JSON.stringify({ messageId: message.id, status: "unconfigured" })); return; }
   webPush.setVapidDetails(process.env.VAPID_SUBJECT || "https://study.11scat.xyz", publicKey, privateKey);
   await mutationQueue;
   const store = await readStore();
-  const payload = JSON.stringify({
-    title: `${message.sender} 发来消息`,
-    body: message.body || (message.attachment?.kind === "image" ? "发送了一张图片" : `发送了文件：${message.attachment?.name || "文件"}`),
-    url: "/",
-  });
+  const payload = chatPushPayload(message);
   const expired = new Set<string>();
-  await Promise.allSettled(store.subscriptions.filter((item) => item.deviceId !== senderDeviceId).map(async (item) => {
+  const members = new Set((await listRoomMembers()).map(member => member.id));
+  const recipients = store.subscriptions.filter((item) => item.deviceId !== senderDeviceId && members.has(item.identityId));
+  let accepted = 0, failed = 0;
+  await Promise.allSettled(recipients.map(async (item) => {
     try {
-      await webPush.sendNotification({ endpoint: item.endpoint, expirationTime: item.expirationTime, keys: item.keys }, payload, { TTL: 60 * 60, urgency: "high", timeout: 10_000 });
+      const response = await deliverChatNotification({ endpoint: item.endpoint, expirationTime: item.expirationTime, keys: item.keys }, payload);
+      accepted++;
+      console.info("chat-push", JSON.stringify({ messageId: message.id, provider: new URL(item.endpoint).hostname, status: response.statusCode }));
     } catch (error) {
+      failed++;
       const statusCode = (error as { statusCode?: number }).statusCode;
       if (statusCode === 404 || statusCode === 410) expired.add(item.endpoint);
+      console.warn("chat-push", JSON.stringify({ messageId: message.id, provider: new URL(item.endpoint).hostname, status: statusCode || "network-error" }));
     }
   }));
   if (expired.size) await mutate((current) => { current.subscriptions = current.subscriptions.filter((item) => !expired.has(item.endpoint)); });
+  console.info("chat-push", JSON.stringify({ messageId: message.id, accepted, failed, recipients: recipients.length }));
 }
 
 export async function sendTaskPush(notice: TaskNotice) {

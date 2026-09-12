@@ -63,6 +63,8 @@ export async function POST(request: NextRequest) {
     createdAt: now,
   }, () => { created = true; });
   const senderDeviceId = (request.headers.get("x-device-id") || "").trim().slice(0, 80);
-  if (created) after(() => sendChatPush(message, senderDeviceId).catch(() => undefined));
+  if (created) after(() => sendChatPush(message, senderDeviceId).catch(() => {
+    console.warn("chat-push", JSON.stringify({ messageId: message.id, status: "internal-error" }));
+  }));
   return NextResponse.json({ message }, { status: 201, headers: { "Cache-Control": "no-store" } });
 }

@@ -4,7 +4,7 @@ import test from "node:test";
 
 const projectFile = (path) => new URL(`../${path}`, import.meta.url);
 
-test("retains installed PWA push delivery without the retired notification settings", async () => {
+test("retains installed PWA push delivery and restores per-device notification controls", async () => {
   const [layout, page, manifestText, serviceWorker, proxy, messageRoute, pushStore] = await Promise.all([
     readFile(projectFile("app/layout.tsx"), "utf8"),
     readFile(projectFile("app/page.tsx"), "utf8"),
@@ -21,7 +21,9 @@ test("retains installed PWA push delivery without the retired notification setti
   assert.match(layout, /manifest:\s*"\/manifest\.webmanifest"/);
   assert.match(layout, /appleWebApp:\s*\{\s*capable:\s*true/);
   assert.match(page, /navigator\.serviceWorker\.register\("\/sw\.js"\)/);
-  assert.doesNotMatch(page, /Notification\.requestPermission\(\)|enablePushNotifications|disablePushNotifications/);
+  assert.match(page, /Notification\.requestPermission\(\)/);
+  assert.match(page, /testPushNotifications/);
+  assert.match(page, /subscriptionNeedsRenewal/);
   assert.match(serviceWorker, /addEventListener\("push"/);
   assert.match(serviceWorker, /showNotification/);
   assert.match(serviceWorker, /addEventListener\("notificationclick"/);

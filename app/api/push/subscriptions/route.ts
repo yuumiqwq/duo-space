@@ -8,12 +8,21 @@ function validEndpoint(value: unknown): value is string {
 }
 
 export async function POST(request: NextRequest) {
+  const origin = request.headers.get("origin");
+  if (origin && origin !== request.nextUrl.origin) return new NextResponse("Forbidden", { status: 403 });
   const identityId = await currentIdentityId();
   if (!identityId) return new NextResponse("Unauthorized", { status: 401 });
+  if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) {
+    return NextResponse.json({ error: "消息推送尚未配置" }, { status: 503 });
+  }
   const body = await request.json().catch(() => ({})) as { subscription?: PushSubscriptionJSON; deviceId?: unknown };
   const subscription = body.subscription;
   const deviceId = typeof body.deviceId === "string" ? body.deviceId.trim().slice(0, 80) : "";
-  if (!subscription || !validEndpoint(subscription.endpoint) || !subscription.keys?.p256dh || !subscription.keys.auth || !deviceId) {
+  if (!subscription || !validEndpoint(subscription.endpoint)
+    || typeof subscription.keys?.p256dh !== "string" || !/^[\w-]{87}=?$/.test(subscription.keys.p256dh)
+    || typeof subscription.keys.auth !== "string" || !/^[\w-]{22}(==)?$/.test(subscription.keys.auth)
+    || (subscription.expirationTime != null && (!Number.isFinite(subscription.expirationTime) || subscription.expirationTime <= Date.now()))
+    || !deviceId) {
     return NextResponse.json({ error: "推送订阅无效" }, { status: 400 });
   }
   await savePushSubscription({
@@ -28,9 +37,12 @@ export async function POST(request: NextRequest) {
 }
 
 export async function DELETE(request: NextRequest) {
-  if (!(await currentIdentityId())) return new NextResponse("Unauthorized", { status: 401 });
+  const origin = request.headers.get("origin");
+  if (origin && origin !== request.nextUrl.origin) return new NextResponse("Forbidden", { status: 403 });
+  const identityId = await currentIdentityId();
+  if (!identityId) return new NextResponse("Unauthorized", { status: 401 });
   const body = await request.json().catch(() => ({})) as { endpoint?: unknown };
   if (!validEndpoint(body.endpoint)) return NextResponse.json({ error: "推送订阅无效" }, { status: 400 });
-  await removePushSubscription(body.endpoint);
+  await removePushSubscription(body.endpoint, identityId);
   return NextResponse.json({ enabled: false });
 }

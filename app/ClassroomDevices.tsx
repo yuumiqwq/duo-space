@@ -76,10 +76,11 @@ export function ClassroomGeneralSettings({ draft, onChange, disabled }: { draft:
   </div>;
 }
 
-export function ClassroomSettings({ profile, identityId, onSave, error, triggerContent }: { profile: ClassroomProfile; identityId: string; onSave: (draft: ClassroomSettingsDraft) => Promise<void> | void; error?: string; triggerContent: ReactNode }) {
+export function ClassroomSettings({ profile, identityId, onSave, error, triggerContent, notifications }: { profile: ClassroomProfile; identityId: string; onSave: (draft: ClassroomSettingsDraft) => Promise<void> | void; error?: string; triggerContent: ReactNode; notifications?: ReactNode }) {
   const value = classroomSettingsDraft(profile, identityId);
   const canSave = value.seat !== null && profile.seats.length === 2;
   return <RoomSettings value={value} onSave={onSave} canSave={canSave} error={error} triggerContent={triggerContent} sections={[
     { id: 'general', label: '通用', icon: <SlidersHorizontal size={18} />, content: (draft, onChange, saving) => <ClassroomGeneralSettings draft={draft} onChange={onChange} disabled={saving || !canSave} /> },
+    ...(notifications ? [{ id: 'notifications', label: '消息提醒', icon: null, content: () => notifications }] : []),
   ]} />;
 }
