@@ -29,9 +29,10 @@ type Creation = { state: "new" | "sent" | "received"; beforeIds?: string[] };
 type AttachmentChange = { actor: string; before: string; after: string; publishBefore?: string };
 type WorkflowEdit = { id: string; fields: TaskFields; attachments?: AttachmentChange; summary?: string; targets?: { owner: string; id: string; before: string; done: boolean }[] };
 type WorkflowSide = "source" | "target";
+type WorkflowDeletion = { id: string; done?: WorkflowSide[]; acknowledged?: Partial<Record<WorkflowSide, { id: string; projectId: string }>> };
 type ReviewDecision = { comment: string; files: WorkflowFile[] };
 type TaskRecovery = { id: string; creation: Creation; done?: boolean };
-type Workflow = ClaimWorkflow & { completionRequest?: { id: string; actor: string; signature: string; review?: ReviewDecision }; publishedAt?: number; missingGeneration?: number; restoration?: { id: string; generation: number }; ownerDeletion?: { id: string; done?: WorkflowSide[] }; syncRetryAt?: number; syncAttempts?: number; reopenReceipt?: { before: RemoteTask; retryAt: number }; sourceReopenReceipt?: { before: RemoteTask; retryAt: number }; submittedFields?: { source: TaskFields; target: TaskFields }; projects?: Partial<Record<WorkflowSide, string>>; recovery?: Partial<Record<WorkflowSide, TaskRecovery>>; signature: string; targetCreation: Creation; reviewerCreation?: Creation; approval?: { targetDone: boolean; sourceDone: boolean; sourceSent?: boolean; targetSent?: boolean; repeating?: boolean }; submitted?: { source: string; target: string }; edit?: WorkflowEdit };
+type Workflow = ClaimWorkflow & { completionRequest?: { id: string; actor: string; signature: string; review?: ReviewDecision }; publishedAt?: number; missingGeneration?: number; restoration?: { id: string; generation: number }; ownerDeletion?: WorkflowDeletion; syncRetryAt?: number; syncAttempts?: number; reopenReceipt?: { before: RemoteTask; retryAt: number }; sourceReopenReceipt?: { before: RemoteTask; retryAt: number }; submittedFields?: { source: TaskFields; target: TaskFields }; projects?: Partial<Record<WorkflowSide, string>>; recovery?: Partial<Record<WorkflowSide, TaskRecovery>>; signature: string; targetCreation: Creation; reviewerCreation?: Creation; approval?: { targetDone: boolean; sourceDone: boolean; sourceSent?: boolean; targetSent?: boolean; repeating?: boolean }; submitted?: { source: string; target: string }; edit?: WorkflowEdit };
 type Operation = OperationView & {
   signature: string; source?: TaskSource; fields: TaskFields; targetId: string;
   attachments?: AttachmentChange;
@@ -206,7 +207,8 @@ export class CollaborationStore {
       const state = await this.read();
       const pending = Object.values(state.workflows).filter(workflow => workflow.status !== 'deleted' &&
         (workflow.ownerDeletion || workflow.completionRequest || workflow.edit || ['creating', 'approving'].includes(workflow.status) || workflow.reopenReceipt || workflow.sourceReopenReceipt) &&
-        (workflow.syncRetryAt || 0) <= Date.now()).slice(0, 3);
+        (workflow.syncRetryAt || 0) <= Date.now())
+        .sort((a, b) => (a.syncRetryAt || 0) - (b.syncRetryAt || 0) || a.createdAt - b.createdAt).slice(0, 3);
       for (const workflow of pending) {
         // Persist backoff before network requests. Reloads and two open browsers
         // share the same retry schedule and the existing idempotent receipts.
@@ -234,8 +236,9 @@ export class CollaborationStore {
     if (this.maintenance) return this.maintenance;
     if (Date.now() < this.maintenanceAfter) return Promise.resolve();
     const work = (async () => {
-      await this.checkWorkflows();
+      // Already accepted user actions must not sit behind unrelated slow checks.
       await this.recoverPendingWorkflows();
+      await this.checkWorkflows();
       await this.deliverNotices();
     })();
     this.maintenance = work.finally(() => { this.maintenance = undefined; this.maintenanceAfter = Date.now() + 15000; });
@@ -786,11 +789,23 @@ export class CollaborationStore {
     try {
       for (const side of ['source', 'target'] as const) {
         if (deletion.done?.includes(side)) continue;
+        const { owner, id } = this.sideReference(workflow, side);
+        const acknowledged = deletion.acknowledged?.[side];
+        // A positive DELETE response plus an absent exact task confirms this side.
+        // Preserve that response before readback so a restart does not require an
+        // unrelated capped history search. An uncertain DELETE has no receipt.
+        if (acknowledged && acknowledged.id === id && !await this.gateway.get(owner, id, acknowledged.projectId)) {
+          deletion.done = [...(deletion.done || []), side];
+          await this.saveWorkflow(state, workflow);
+          continue;
+        }
         const task = await this.linkedTask(state, workflow, side);
         if (task) {
           if (workflow.fields.repeatFlag && (taskFields(task).startDate !== workflow.fields.startDate || taskFields(task).dueDate !== workflow.fields.dueDate)) throw new CollaborationError("关联重复任务已进入其他日期，请在滴答中删除对应任务，避免影响下一次任务");
-          const { owner } = this.sideReference(workflow, side);
           await this.gateway.remove(owner, task.id, task.projectId);
+          deletion.acknowledged ||= {};
+          deletion.acknowledged[side] = { id: task.id, projectId: task.projectId };
+          await this.saveWorkflow(state, workflow);
           if (await this.gateway.get(owner, task.id, task.projectId)) throw new CollaborationError("删除尚未完成，正在自动重试");
         }
         deletion.done = [...(deletion.done || []), side];

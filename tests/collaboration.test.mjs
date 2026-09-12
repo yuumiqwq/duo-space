@@ -481,6 +481,113 @@ test('partial deletion automatically resumes after restart without duplicate del
   await f.store.recoverPendingWorkflows();assert.equal(f.counts.removes,2);
 });
 
+test('acknowledged deletion survives failed readback and restart without depending on unrelated completion history', async () => {
+  const f = await fixture(), task = await f.create('保存滴答删除确认');
+  let w = await claim(f, task), failReadback = true, deleteAccepted = false;
+  const get = f.gateway.get, remove = f.gateway.remove;
+  f.gateway.locate = async (owner, id, project) => {
+    const task = await get(owner, id, project);
+    if (!task) throw new CollaborationError('滴答完成记录不完整，请稍后重试', 502);
+    return task;
+  };
+  f.gateway.remove = async (...args) => { await remove(...args); deleteAccepted = true; };
+  f.gateway.get = async (...args) => {
+    if (deleteAccepted && failReadback) throw new Error('readback timed out');
+    return get(...args);
+  };
+  w = await act(f, w, 'alice', 'delete-owner-task');
+  assert.equal(w.ownerDeletePending, true); assert.equal(f.accounts.bob.size, 0);
+  const file = path.join(f.dir, 'room-collaboration.json');
+  const pending = JSON.parse(await readFile(file, 'utf8')).workflows[w.id];
+  assert.deepEqual(pending.ownerDeletion.acknowledged?.target, { id: w.targetId, projectId: 'inbox-bob' });
+  failReadback = false;
+  f.store = new CollaborationStore(f.dir, f.gateway);
+  await f.store.recoverPendingWorkflows();
+  w = (await f.store.snapshot('alice', null)).workflows.find(item => item.id === w.id);
+  assert.equal(w.status, 'deleted', w.error); assert.equal(w.ownerDeletePending, false);
+  assert.equal(f.counts.removes, 1, 'no second DELETE after a positive receipt and a missing exact task');
+});
+
+test('unacknowledged deletion and a failed lookup remain pending instead of inventing success', async () => {
+  const f = await fixture(), task = await f.create('删除回执仍未知');
+  let w = await claim(f, task);
+  f.loseDelete(); w = await act(f, w, 'alice', 'delete-owner-task');
+  const pending = JSON.parse(await readFile(path.join(f.dir, 'room-collaboration.json'), 'utf8')).workflows[w.id];
+  assert.equal(pending.ownerDeletion.acknowledged?.target, undefined);
+  f.gateway.locate = async () => { throw new CollaborationError('滴答完成记录不完整，请稍后重试', 502); };
+  f.store = new CollaborationStore(f.dir, f.gateway);
+  await f.store.recoverPendingWorkflows();
+  w = (await f.store.snapshot('alice', null)).workflows.find(item => item.id === w.id);
+  assert.equal(w.ownerDeletePending, true); assert.notEqual(w.status, 'deleted');
+  assert.equal(f.counts.removes, 1); assert.match(w.error, /完成记录不完整/);
+});
+
+test('positive deletion receipts still require readable absence and preserve a later recurring occurrence', async () => {
+  for (const scenario of ['unreadable', 'advanced-occurrence']) {
+    const f = await fixture(), task = await f.create('删除确认边界');
+    let w = await claim(f, task);
+    const get = f.gateway.get;
+    f.gateway.remove = async () => { f.counts.removes++; };
+    w = await act(f, w, 'alice', 'delete-owner-task');
+    assert.equal(w.ownerDeletePending, true); assert.equal(f.counts.removes, 1);
+    const file = path.join(f.dir, 'room-collaboration.json');
+    if (scenario === 'unreadable') f.gateway.get = async () => { throw new Error('readback unavailable'); };
+    else {
+      const state = JSON.parse(await readFile(file, 'utf8'));
+      state.workflows[w.id].fields.repeatFlag = 'RRULE:FREQ=DAILY';
+      state.workflows[w.id].fields.dueDate = '2026-09-12T00:00:00Z';
+      await writeFile(file, JSON.stringify(state));
+      f.accounts.bob.get(w.targetId).dueDate = '2026-09-13T00:00:00Z';
+    }
+    f.store = new CollaborationStore(f.dir, f.gateway);
+    await f.store.recoverPendingWorkflows();
+    w = (await f.store.snapshot('alice', null)).workflows.find(item => item.id === w.id);
+    assert.equal(w.ownerDeletePending, true); assert.notEqual(w.status, 'deleted');
+    assert.equal(f.counts.removes, 1, 'an unreadable or advanced task cannot be deleted again');
+    assert.match(w.error, scenario === 'unreadable' ? /readback unavailable/ : /其他日期/);
+    f.gateway.get = get;
+  }
+});
+
+test('due deletion recovery precedes a stalled unrelated workflow status lookup', { timeout: 3000 }, async () => {
+  const f = await fixture(), slowCard = await f.create('无关的慢查询'), deletedCard = await f.create('等待删除确认');
+  const slow = await claim(f, slowCard);
+  let deleting = await claim(f, deletedCard);
+  f.loseDelete(); deleting = await act(f, deleting, 'alice', 'delete-owner-task');
+  f.accounts.bob.delete(slow.targetId);
+  let release, entered;
+  const gate = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { entered = resolve; });
+  const get = f.gateway.get;
+  f.gateway.locate = async (owner, id, project) => {
+    if (id === slow.targetId) { entered(); await gate; }
+    return get(owner, id, project);
+  };
+  const maintenance = f.store.maintainWorkflows();
+  try {
+    await started;
+    const current = (await f.store.snapshot('alice', null)).workflows.find(item => item.id === deleting.id);
+    assert.equal(current.status, 'deleted', 'accepted deletion must not wait behind unrelated periodic reconciliation');
+  } finally { release(); await maintenance; }
+});
+
+test('slow failed deletions cannot repeatedly take all recovery slots ahead of untouched requests', async () => {
+  const f = await fixture(), workflows = [];
+  for (let index = 0; index < 5; index++) workflows.push(await claim(f, await f.create(`等待删除 ${index}`)));
+  f.gateway.remove = async () => { throw new Error('provider unavailable'); };
+  for (const w of workflows) await act(f, w, 'alice', 'delete-owner-task');
+  const originalNow = Date.now, attempts = [];
+  let now = originalNow();
+  Date.now = () => now;
+  f.gateway.remove = async (owner, id) => { attempts.push(id); now += 360000; throw new Error('slow provider unavailable'); };
+  try {
+    await f.store.recoverPendingWorkflows();
+    assert.equal(attempts.length, 3, 'retain the per-round recovery bound');
+    await f.store.recoverPendingWorkflows();
+    assert.ok(workflows.every(workflow => attempts.includes(workflow.targetId)), 'older retries must yield to requests that have not received a recovery attempt');
+  } finally { Date.now = originalNow; }
+});
+
 test('archived deletion suppresses a stale public card after restart without touching remote tasks',async()=>{
   const f=await fixture(),task=await f.create('不得重现的便签');let w=await claim(f,task);
   const file=path.join(f.dir,'room-collaboration.json'),before=JSON.parse(await readFile(file,'utf8')).buffer[task.id];
