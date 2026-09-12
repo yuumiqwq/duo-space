@@ -40,7 +40,12 @@ test('room collaboration HTTP authenticates members, shares the buffer and rejec
     assert.equal((await call('unknown')).status, 401);
     assert.ok(JSON.parse(await readFile(legacyFile, 'utf8')).operations.obsolete);
     assert.equal((await fetch(`${origin}/api/room/tasks?revision=1`, { headers: { Cookie: cookie('alice') } })).status, 200);
-    const migrated = JSON.parse(await readFile(legacyFile, 'utf8'));
+    let migrated;
+    for (let attempt = 0; attempt < 50; attempt++) {
+      migrated = JSON.parse(await readFile(legacyFile, 'utf8'));
+      if (!migrated.operations.obsolete) break;
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
     assert.deepEqual(migrated.operations, {}); assert.ok(!('legacyCleanup' in migrated));
     const inspectPath = `${origin}/api/room/tasks?diagnose=${randomUUID()}`;
     assert.ok([307, 401].includes((await fetch(inspectPath, { redirect: 'manual' })).status));

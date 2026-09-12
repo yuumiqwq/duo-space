@@ -19,7 +19,8 @@ test('Dida provider works with Open API credentials despite V2 rejection and sco
     await build({ entryPoints: ['app/api/room/tasks/provider.ts'], bundle: true, platform: 'node', format: 'esm', outfile: output, logLevel: 'silent' });
     const { gateway } = await import(pathToFileURL(output).href);
     const accounts = { alice: new Map(), bob: new Map() }, requests = [];
-    let comments = [], wrongProject = false, allocatedId = null, omitReceipt = false;
+    let comments = [], wrongProject = false, allocatedId = null, omitReceipt = false, normalizeWrites = false, inboxGate = null;
+    const providerFields = task => normalizeWrites ? { ...task, dueDate: task.dueDate ?? task.startDate, items: task.items.map((item, index) => ({ ...item, id: `allocated-item-${index}` })) } : task;
     globalThis.fetch = async (url, init) => {
       const owner = String(init.headers.Authorization).replace('Bearer token-', '');
       assert.ok(Object.hasOwn(accounts, owner), 'request uses the selected owner token');
@@ -27,15 +28,15 @@ test('Dida provider works with Open API credentials despite V2 rejection and sco
       const body = init.body ? JSON.parse(init.body) : null;
       requests.push({ owner, route, method, body });
       if (route === '/api/v2/batch/check/0') return new Response(null, { status: 401 });
-      if (route === '/open/v1/project/inbox/data') return Response.json({ tasks: [...accounts[owner].values()], columns: [] });
+      if (route === '/open/v1/project/inbox/data') { if (inboxGate) await inboxGate(); return Response.json({ tasks: [...accounts[owner].values()], columns: [] }); }
       if (route === '/open/v1/project/inbox') return Response.json({ id: `inbox-${owner}` });
       if (route === '/open/v1/task/batch') {
-        for (const task of body.add || []) { assert.equal(task.projectId, `inbox-${owner}`); const actual = { ...structuredClone(task), id: allocatedId || task.id }; accounts[owner].set(actual.id, actual); }
+        for (const task of body.add || []) { assert.equal(task.projectId, `inbox-${owner}`); const actual = providerFields({ ...structuredClone(task), id: allocatedId || task.id }); accounts[owner].set(actual.id, actual); }
         for (const task of body.update || []) { assert.equal(task.projectId, `inbox-${owner}`); accounts[owner].set(task.id, { ...task, etag: 'reopened' }); }
         return Response.json({ id2etag: omitReceipt ? {} : Object.fromEntries((body.add || body.update).map(task => [allocatedId || task.id, "etag"])) });
       }
       if (method === 'POST' && /^\/open\/v1\/task\/[^/]+$/.test(route)) {
-        assert.equal(body.projectId, `inbox-${owner}`); accounts[owner].set(body.id, structuredClone(body)); return Response.json(body);
+        assert.equal(body.projectId, `inbox-${owner}`); accounts[owner].set(body.id, providerFields(structuredClone(body))); return Response.json(body);
       }
       assert.ok(route.startsWith(`/open/v1/project/inbox-${owner}/`), 'project route cannot use another owner inbox');
       if (route.endsWith('/data')) return Response.json({ tasks: [...accounts[owner].values(), { id: 'outside', projectId: 'other-list' }] });
@@ -93,6 +94,29 @@ test('Dida provider works with Open API credentials despite V2 rejection and sco
     omitReceipt = true; allocatedId = 'unacknowledged-task';
     await assert.rejects(gateway.create('bob', 'missing-receipt', fields), /未返回明确的创建编号/);
     await gateway.remove('bob', allocatedId);
+    omitReceipt = false; allocatedId = null; normalizeWrites = true;
+    const allDay = taskFields({ title: '全天任务', startDate: '2026-09-11T16:00:00Z', kind: 'CHECKLIST', items: [{ id: 'source-item', title: '核对内容', status: 0, sortOrder: 0 }] });
+    await gateway.create('bob', 'normalized-task', allDay);
+    const normalized = await gateway.get('bob', 'normalized-task');
+    assert.equal(normalized.dueDate, '2026-09-11T16:00:00+0000'); assert.equal(normalized.items[0].id, 'allocated-item-0');
+    await gateway.create('bob', 'normalized-task', allDay);
+    assert.equal(requests.filter(request => request.body?.add?.some(task => task.id === 'normalized-task')).length, 1);
+    await gateway.update('bob', normalized.id, { ...allDay, title: '修改说明后的全天任务' }, remoteVersion(normalized));
+    const changed = await gateway.get('bob', normalized.id);
+    assert.equal(changed.title, '修改说明后的全天任务'); assert.equal(changed.items[0].id, 'allocated-item-0');
+    accounts.bob.get(normalized.id).items[0].title = '其他内容';
+    await assert.rejects(gateway.create('bob', normalized.id, { ...allDay, title: changed.title }), /检查项/);
+    await assert.rejects(gateway.update('bob', normalized.id, allDay, remoteVersion(changed)), /刚被修改/);
+    let release, entered;
+    const gate = new Promise(resolve => { release = resolve; }), started = new Promise(resolve => { entered = resolve; });
+    inboxGate = async () => { entered(); await gate; };
+    const inboxReads = () => requests.filter(request => request.route.endsWith('/project/inbox/data')).length;
+    const beforeReads = inboxReads(), concurrent = Promise.all([gateway.inbox('bob'), gateway.inbox('bob'), gateway.inbox('bob')]);
+    await started;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(inboxReads(), beforeReads + 1, 'concurrent display and maintenance share the same account request');
+    release(); await concurrent; inboxGate = null;
+    await gateway.inbox('bob'); assert.equal(inboxReads(), beforeReads + 2, 'a later explicit refresh still reads new provider data');
     await gateway.inbox('alice');
     assert.ok(requests.some(request => request.owner === 'alice'));
     assert.equal(requests.filter(request => request.route.startsWith('/api/v2/')).length, 0);

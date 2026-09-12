@@ -13,10 +13,12 @@ export async function GET(request: NextRequest) {
   try {
     // Migrate when the active server receives member traffic. Deployment candidates
     // share the data mount, so startup/health checks must never mutate this store.
-    await store.resetLegacy(id);
-    after(() => store.maintainWorkflows().catch(() => undefined));
+    const local = request.nextUrl.searchParams.has("local"), member = request.nextUrl.searchParams.get("member");
+    const revision = request.nextUrl.searchParams.has("revision");
+    if (!local && member === null && !revision) await store.resetLegacy(id);
+    after(async () => { await store.resetLegacy(id).catch(() => undefined); await store.maintainWorkflows().catch(() => undefined); });
     const diagnostic = request.nextUrl.searchParams.get("diagnose");
-    return json(diagnostic !== null ? await store.inspectTransfer(id, diagnostic) : request.nextUrl.searchParams.has("revision") ? await store.revision(id) : await store.snapshot(id));
+    return json(diagnostic !== null ? await store.inspectTransfer(id, diagnostic) : revision ? await store.revision(id) : await store.snapshot(id, local ? null : member ?? undefined));
   }
   catch (error) { return json({ error: error instanceof CollaborationError ? error.message : "协作区暂时无法读取，请重试" }, error instanceof CollaborationError ? error.status : 503); }
 }

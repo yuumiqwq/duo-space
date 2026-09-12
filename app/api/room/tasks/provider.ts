@@ -6,18 +6,30 @@ import type { TaskFields } from "../../../collaboration-types";
 
 type Context = { token: string; projectId: string; tasks: RemoteTask[]; encrypted: string; expires: number; search?: Promise<RemoteTask[]>; projects?: Promise<string[]>; completed?: Map<string, Promise<RemoteTask[]>> };
 const contexts = new Map<string, Context>();
+const contextLoads = new Map<string, { id: symbol; encrypted: string; promise: Promise<Context> }>();
 async function context(owner: string, refreshInbox = false): Promise<Context> {
+  const before = contexts.get(owner);
   const user = await getUser(owner);
   if (!user?.ticktickToken) throw new CollaborationError("该成员尚未连接滴答清单", 422);
   const cached = contexts.get(owner);
-  if (!refreshInbox && cached?.encrypted === user.ticktickToken && cached.expires > Date.now()) return cached;
+  if ((!refreshInbox || cached !== before) && cached?.encrypted === user.ticktickToken && cached.expires > Date.now()) return cached;
+  const pending = contextLoads.get(owner);
+  if (pending?.encrypted === user.ticktickToken) return pending.promise;
   let token: string;
   try { token = decryptToken(user.ticktickToken); } catch { throw new CollaborationError("该成员需要重新连接滴答清单", 422); }
-  let inbox;
-  try { inbox = await tickInboxData<RemoteTask>(token); }
-  catch (error) { throw new CollaborationError(error instanceof TickApiError ? error.message : "收集箱暂时无法读取，请稍后刷新", error instanceof TickApiError && [401, 403].includes(error.status) ? 422 : 502, error instanceof TickApiError ? error.diagnostic : undefined); }
-  const next = { token, ...inbox, encrypted: user.ticktickToken, expires: Date.now() + 15000 };
-  contexts.set(owner, next); return next;
+  const encrypted = user.ticktickToken;
+  const loadId = Symbol(owner);
+  const promise: Promise<Context> = (async () => {
+    let inbox;
+    try { inbox = await tickInboxData<RemoteTask>(token); }
+    catch (error) { throw new CollaborationError(error instanceof TickApiError ? error.message : "收集箱暂时无法读取，请稍后刷新", error instanceof TickApiError && [401, 403].includes(error.status) ? 422 : 502, error instanceof TickApiError ? error.diagnostic : undefined); }
+    const next = { token, ...inbox, encrypted, expires: Date.now() + 15000 };
+    if (contextLoads.get(owner)?.id === loadId) contexts.set(owner, next);
+    return next;
+  })();
+  contextLoads.set(owner, { id: loadId, encrypted, promise });
+  try { return await promise; }
+  finally { if (contextLoads.get(owner)?.promise === promise) contextLoads.delete(owner); }
 }
 async function request(owner: string, route: string, init?: RequestInit, missing = false) {
   const account = await context(owner);

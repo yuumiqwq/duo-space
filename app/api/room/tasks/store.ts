@@ -66,12 +66,18 @@ function comparableFields(task: Partial<TaskFields>) {
   const fields = taskFields(task);
   // Dida can reorder tags/reminders and choose a default repeat origin even
   // when repetition is disabled. These do not change the user's task.
-  return { ...fields, tags: [...new Set(fields.tags)].sort(), reminders: [...new Set(fields.reminders)].sort(), repeatFrom: fields.repeatFlag ? fields.repeatFrom : '' };
+  // A single all-day date can also be returned as start=end. Limit that
+  // equivalence to tasks without recurrence or deadline-based reminders.
+  const dueDate = fields.isAllDay && !fields.repeatFlag && !fields.reminders.length ? fields.dueDate ?? fields.startDate : fields.dueDate;
+  // Copied checklist items receive new provider IDs. Compare their content in
+  // order, retaining all other fields; remoteVersion still includes raw IDs.
+  const items = fields.items.map(item => Object.fromEntries(Object.entries(item).filter(([key]) => key !== 'id')));
+  return { ...fields, dueDate, items, tags: [...new Set(fields.tags)].sort(), reminders: [...new Set(fields.reminders)].sort(), repeatFrom: fields.repeatFlag ? fields.repeatFrom : '' };
 }
 export const sameFields = (a: Partial<TaskFields>, b: Partial<TaskFields>) => fingerprint(comparableFields(a)) === fingerprint(comparableFields(b));
 const fieldLabels: Record<keyof TaskFields, string> = { title: "标题", content: "说明", priority: "优先级", startDate: "开始时间", dueDate: "截止时间", isAllDay: "全天设置", timeZone: "时区", tags: "标签", reminders: "提醒", repeatFlag: "重复规则", repeatFrom: "重复计算方式", desc: "检查项说明", kind: "任务类型", items: "检查项" };
 export function fieldDifferences(a: Partial<TaskFields>, b: Partial<TaskFields>): string[] {
-  const left = taskFields(a), right = taskFields(b);
+  const left = comparableFields(a), right = comparableFields(b);
   return (Object.keys(fieldLabels) as (keyof TaskFields)[]).filter(key => fingerprint(left[key]) !== fingerprint(right[key])).map(key => fieldLabels[key]);
 }
 export function verificationIssue(task: RemoteTask | null, fields: TaskFields): string {
@@ -279,14 +285,17 @@ export class CollaborationStore {
       return { status: op.status, phase: op.phase, sourceExists: !!source, sourceUnchanged, destinationExists: !!target, destinationCompleted, differences, candidates: candidates.map(task => ({ id: task.id, version: remoteVersion(task) })), message: `${sourceMessage}${targetMessage}${candidates.length ? `接收方另有 ${candidates.length} 项完整内容一致的任务，旧记录无法仅凭内容确定这些任务的来源。` : ""}本次核对只读取状态，没有继续或取消转移。` };
     });
   }
-  private async readInboxes() {
-    const members = await this.gateway.members();
+  private async readInboxes(memberId?: string | null) {
+    const allMembers = await this.gateway.members();
+    if (typeof memberId === 'string' && !allMembers.some(member => member.id === memberId)) throw new CollaborationError("成员不存在", 404);
+    const members = typeof memberId === 'string' ? allMembers.filter(member => member.id === memberId) : allMembers;
     const inboxes = new Map<string, RemoteTask[]>();
     const inboxProjects = new Map<string, string>();
     const results: CollaborationSnapshot["members"] = [];
     for (let index = 0; index < members.length; index += 3) results.push(...await Promise.all(members.slice(index, index + 3).map(async member => {
       try {
         if (!member.connected) return { ...member, tasks: [], error: "尚未连接滴答清单" };
+        if (memberId === null) return { ...member, tasks: [], loading: true };
         const inbox = await this.gateway.inbox(member.id);
         inboxes.set(member.id, inbox.tasks);
         inboxProjects.set(member.id, inbox.projectId);
@@ -296,10 +305,10 @@ export class CollaborationStore {
     })));
     return { results, inboxes, inboxProjects };
   }
-  async snapshot(identityId: string): Promise<CollaborationSnapshot> {
+  async snapshot(identityId: string, memberId?: string | null): Promise<CollaborationSnapshot> {
     // Atomic state reads and inbox display must not wait behind remote writes
     // or workflow searches. Reconciliation runs after the HTTP response.
-    const { results, inboxes } = await this.readInboxes();
+    const { results, inboxes } = await this.readInboxes(memberId);
     const state = await this.read();
     const pending = Object.values(state.operations).filter(op => op.status === "pending");
     const lock = (task: RoomTask) => {

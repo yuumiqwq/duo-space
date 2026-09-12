@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { CollaborationError, CollaborationStore, remoteVersion, taskFields } from '../app/api/room/tasks/store.ts';
+import { CollaborationError, CollaborationStore, fieldDifferences, remoteVersion, sameFields, taskFields } from '../app/api/room/tasks/store.ts';
 
 async function fixture() {
   await mkdir('codex-generated/test-data', { recursive: true });
@@ -144,6 +144,86 @@ const claim = (f, task, actor = 'bob', destination = actor) => f.store.claim(act
 const act = (f, workflow, actor, action, extra = {}) => f.store.workflowCommand(actor, { id: randomUUID(), workflowId: workflow.id, version: workflow.version, action, ...extra });
 const refreshed = async (f, id) => { await f.store.checkWorkflows(); return (await f.store.snapshot('alice')).workflows.find(workflow => workflow.id === id); };
 
+test('provider date defaults and copied checklist IDs compare by content without weakening versions or real differences', () => {
+  const fields = taskFields({ title: '全天检查清单', startDate: '2026-09-11T16:00:00.000Z', kind: 'CHECKLIST', items: [
+    { id: 'source-one', title: '视频一', status: 0, sortOrder: 0, isAllDay: false, timeZone: 'Asia/Shanghai' },
+    { id: 'source-two', title: '视频二', status: 0, sortOrder: 268435456, isAllDay: true, timeZone: 'Asia/Shanghai' },
+  ] });
+  const copy = { ...structuredClone(fields), dueDate: fields.startDate, items: fields.items.map((item, index) => ({ ...item, id: `copy-${index}` })) };
+  assert.ok(sameFields(fields, copy)); assert.deepEqual(fieldDifferences(fields, copy), []);
+  assert.equal(fields.dueDate, null); assert.equal(fields.items[0].id, 'source-one');
+  const original = { ...fields, id: 'task', projectId: 'inbox' };
+  assert.notEqual(remoteVersion(original), remoteVersion({ ...original, items: copy.items }));
+  assert.notEqual(remoteVersion(original), remoteVersion({ ...original, dueDate: copy.dueDate }));
+  for (const patch of [{ isAllDay: false }, { repeatFlag: 'RRULE:FREQ=DAILY' }, { reminders: ['TRIGGER:-PT15M'] }]) {
+    assert.ok(!sameFields({ ...fields, ...patch }, { ...copy, ...patch }), 'time, recurrence and reminder semantics remain strict');
+  }
+  for (const patch of [{ dueDate: '2026-09-12T16:00:00Z' }, { startDate: null }, { title: '改过标题' }, { content: '增加说明' }]) {
+    assert.ok(!sameFields(fields, { ...copy, ...patch }));
+  }
+  for (const patch of [{ title: '另一项' }, { status: 1 }, { sortOrder: 100 }, { startDate: '2026-09-12T16:00:00Z' }, { isAllDay: true }, { timeZone: 'UTC' }]) {
+    const changed = structuredClone(copy); Object.assign(changed.items[0], patch);
+    assert.ok(!sameFields(fields, changed)); assert.deepEqual(fieldDifferences(fields, changed), ['检查项']);
+  }
+  assert.ok(!sameFields(fields, { ...copy, items: copy.items.toReversed() }));
+  assert.ok(!sameFields(fields, { ...copy, items: copy.items.slice(1) }));
+});
+
+test('persisted all-day claim verification resumes with a provider-filled deadline and honors a saved completion decision', async () => {
+  for (const completing of [false, true]) for (const status of [0, 2]) {
+    const f = await fixture();
+    await f.store.execute('alice', { id: randomUUID(), action: 'create', fields: { title: '全天组卷任务', startDate: '2026-09-11T16:00:00.000Z' } });
+    const task = (await f.store.snapshot('alice')).buffer[0];
+    f.gateway.create = async (owner, id, fields, receipt) => {
+      f.counts.creates++; f.accounts[owner].set('actual-all-day', { ...fields, dueDate: fields.startDate, id: 'actual-all-day', projectId: 'inbox-' + owner, status });
+      await receipt('actual-all-day'); throw new Error('接收方副本核对不一致：截止时间；原任务仍保留');
+    };
+    let w = await claim(f, task); assert.equal(w.status, 'creating');
+    if (completing) {
+      f.gateway.locate = async () => { throw new Error('暂时无法核对'); };
+      w = await act(f, w, 'alice', 'owner-complete'); assert.equal(w.status, 'creating');
+    }
+    f.gateway.locate = f.gateway.get;
+    let reopens = 0, completes = 0;
+    const reopen = f.gateway.reopen, complete = f.gateway.complete;
+    f.gateway.reopen = async (...args) => { reopens++; return reopen(...args); };
+    f.gateway.complete = async (...args) => { completes++; return complete(...args); };
+    f.gateway.update = async () => assert.fail('verification must not rewrite the task');
+    f.store = new CollaborationStore(f.dir, f.gateway);
+    await f.store.recoverPendingWorkflows();
+    w = (await f.store.snapshot('alice')).workflows.find(item => item.id === w.id);
+    assert.equal(w.status, completing ? 'done' : 'working'); assert.equal(w.error, '');
+    assert.equal(w.fields.dueDate, null); assert.equal(w.targetId, 'actual-all-day');
+    assert.equal(f.accounts.bob.get(w.targetId).dueDate, task.startDate);
+    assert.equal(f.accounts.bob.get(w.targetId).status, completing ? 2 : 0);
+    assert.equal(f.accounts.alice.size, 0); assert.equal(f.counts.creates, 1);
+    assert.equal(reopens, !completing && status === 2 ? 1 : 0);
+    assert.equal(completes, completing && status === 0 ? 1 : 0);
+    assert.equal(w.events.filter(event => event.type === 'owner-complete').length, completing ? 1 : 0);
+  }
+});
+
+test('personal checklist claims accept new item IDs and preserve both copies through review', async () => {
+  const f = await fixture(), task = await personal(f, { kind: 'CHECKLIST', items: [
+    { id: 'source-one', title: '视频一', status: 0, sortOrder: 0 },
+    { id: 'source-two', title: '视频二', status: 0, sortOrder: 268435456 },
+  ] });
+  f.gateway.create = async (owner, id, fields, receipt) => {
+    f.counts.creates++; f.accounts[owner].set('actual-checklist', { ...fields, items: fields.items.map((item, index) => ({ ...item, id: `copy-${index}` })), id: 'actual-checklist', projectId: 'inbox-' + owner });
+    await receipt('actual-checklist'); throw new Error('接收方副本核对不一致：检查项；原任务仍保留');
+  };
+  let w = await claim(f, task); assert.equal(w.status, 'creating');
+  f.store = new CollaborationStore(f.dir, f.gateway); await f.store.recoverPendingWorkflows();
+  w = (await f.store.snapshot('alice')).workflows[0];
+  assert.equal(w.status, 'working'); assert.equal(w.error, '');
+  assert.equal(w.source.ownerId, 'alice'); assert.equal(w.reviewerId, 'alice'); assert.equal(w.events[0].actorId, 'bob');
+  w = await act(f, w, 'bob', 'submit', { comment: '已完成' });
+  w = await act(f, w, 'alice', 'approve', { comment: '通过' });
+  assert.equal(w.status, 'done'); assert.equal(f.counts.creates, 1);
+  assert.deepEqual(f.accounts.alice.get(task.id).items, task.items);
+  assert.deepEqual(f.accounts.bob.get(w.targetId).items.map(item => item.id), ['copy-0', 'copy-1']);
+});
+
 test('board reads and settled migration bypass a stalled workflow search, and background polls share one job', { timeout: 3000 }, async () => {
   const f = await fixture(), task = await f.create('仍可打开的任务板');
   const w = await claim(f, task); await f.store.resetLegacy('alice');
@@ -167,6 +247,32 @@ test('board reads and settled migration bypass a stalled workflow search, and ba
   } finally { clearTimeout(timer); release(); await job; }
   assert.ok((await f.store.snapshot('alice')).workflows[0].taskAnomaly);
   await f.store.maintainWorkflows(); assert.equal(calls, 1, 'finished maintenance is throttled across revision polls');
+});
+
+test('website-only and individual-member reads remain available while another inbox is stalled', { timeout: 3000 }, async () => {
+  const f = await fixture(), task = await f.create('不等待收集箱的公共任务');
+  const workflow = await claim(f, task), inbox = f.gateway.inbox;
+  let release, entered;
+  const gate = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { entered = resolve; });
+  const reads = [];
+  f.gateway.inbox = async owner => { reads.push(owner); if (owner === 'bob') { entered(); await gate; } return inbox(owner); };
+  const slow = f.store.snapshot('alice', 'bob');
+  let timer;
+  try {
+    await started;
+    const [local, alice] = await Promise.race([
+      Promise.all([f.store.snapshot('alice', null), f.store.snapshot('alice', 'alice')]),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('local records waited for another inbox')), 500); }),
+    ]);
+    assert.equal(local.buffer[0].id, task.id); assert.equal(local.workflows[0].id, workflow.id);
+    assert.ok(local.members.filter(member => member.connected).every(member => member.loading && member.tasks.length === 0));
+    assert.deepEqual(alice.members.map(member => member.id), ['alice']);
+    assert.deepEqual(reads, ['bob', 'alice']);
+    await assert.rejects(f.store.snapshot('alice', 'unknown-member'), { status: 404 });
+  } finally { clearTimeout(timer); release(); }
+  const bob = await slow;
+  assert.equal(bob.members[0].tasks[0].workflowId, workflow.id);
 });
 
 test('an explicit completion before claim verification survives a failed lookup and server restart', async () => {

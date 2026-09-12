@@ -22,6 +22,7 @@ import { loadTaskStampFonts } from "./task-stamp-fonts";
 import { ClaimWorkflows, workflowStatus } from "./ClaimWorkflows";
 import { WorkflowTaskDeletion } from "./WorkflowTaskDeletion";
 import { applyWorkflowUpdate, removeSnapshotTask, withoutDeletedWorkflowTasks } from './collaboration-snapshot';
+import { loadCollaborationSnapshot, mergeCollaborationSnapshot } from './collaboration-loading';
 import { inboxClaimant } from './inbox-claim-stamp';
 import { InboxClaimStamp } from './InboxClaimStamp';
 import { readTaskResponse, taskErrorMessage } from './task-request';
@@ -115,17 +116,17 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
     fetching.current = true; setLoading(true);
     const id = ++generation.current;
     try {
-      const response = await fetch("/api/room/tasks", { cache: "no-store", signal: AbortSignal.any([controller.signal, AbortSignal.timeout(60000)]) });
-      const data = await readTaskResponse(response, '协作区读取失败');
-      if (!Array.isArray(data.buffer) || !Array.isArray(data.members) || !Array.isArray(data.workflows)) throw new Error('协作区读取失败');
-      if (id !== generation.current) return null;
-      const next = withoutDeletedWorkflowTasks(data);
-      setSnapshot(next);
-      acceptNotices(data.notices || [], data.noticeVersion);
-      revision.current = data.revision;
-      return next;
+      const data = await loadCollaborationSnapshot({ signal: controller.signal,
+        accept: (next, memberId) => {
+          if (id !== generation.current) return;
+          setSnapshot(current => mergeCollaborationSnapshot(current, next, memberId));
+          acceptNotices(next.notices || [], next.noticeVersion);
+          revision.current = Math.max(revision.current ?? 0, next.revision);
+        },
+        settled: () => { if (id === generation.current) { fetching.current = false; setLoading(false); } },
+      });
+      return id === generation.current ? withoutDeletedWorkflowTasks(data) : null;
     } catch (cause) { if (id === generation.current) setError(taskErrorMessage(cause, '协作区暂时无法读取')); return null; }
-    finally { if (id === generation.current) { fetching.current = false; setLoading(false); } }
   }, [acceptNotices, previewSnapshot]);
 
   useEffect(() => {
@@ -134,15 +135,17 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
     const poll = async () => {
       if (stopped || polling || document.hidden || locked.current) return;
       polling = true;
+      const startedGeneration = generation.current;
       try {
-        const response = await fetch("/api/room/tasks?revision=1", { cache: "no-store", signal: AbortSignal.timeout(8000) });
+        const response = await fetch(open ? "/api/room/tasks?local=1" : "/api/room/tasks?revision=1", { cache: "no-store", signal: AbortSignal.timeout(8000) });
         if (!response.ok) return;
         const data = await response.json();
-        if (stopped) return;
+        if (stopped || locked.current || startedGeneration !== generation.current) return;
         if (revision.current !== null && data.revision < revision.current) return;
         acceptNotices(data.notices || [], data.noticeVersion);
         if (Array.isArray(data.bufferPreview)) onPublicTasks?.(data.bufferPreview);
-        if (revision.current !== null && revision.current !== data.revision) { void onChanged(); if (open) void load(); }
+        if (revision.current !== null && revision.current !== data.revision) void onChanged();
+        if (open && Array.isArray(data.buffer) && Array.isArray(data.members) && Array.isArray(data.workflows)) setSnapshot(current => mergeCollaborationSnapshot(current, data));
         revision.current = data.revision;
       } catch { /* Try again on the next poll or focus. */ }
       finally { polling = false; }
@@ -196,6 +199,7 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
       return true;
     }
     if (locked.current) return false;
+    generation.current++; fetching.current = false; loadController.current?.abort(); setLoading(false);
     locked.current = true; setBusy(true); setError(""); setNotice(""); setUncertain(command);
     let operation: OperationView | undefined, workflow: ClaimWorkflow | undefined;
     try {
@@ -232,7 +236,7 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
   }
   const unavailable = busy || !!uncertain;
   const ownerName = (owner: string | null) => owner === null ? "任务板" : snapshot?.members.find(member => member.id === owner)?.name || "成员";
-  const canDrop = (owner: string) => owner !== "" && snapshot?.members.some(member => member.id === owner && member.connected && !member.error);
+  const canDrop = (owner: string) => owner !== "" && snapshot?.members.some(member => member.id === owner && member.connected && !member.loading && !member.error);
   const move = async (task: RoomTask, owner: string, previous?: RoomTask) => {
     if (unavailable || task.workflowId || task.pending || task.transferBlocked || !canDrop(owner)) return;
     const dateAfter = previous && Object.keys(collaborationDateAfter(task, previous)).length ? taskSource(previous) : undefined;
@@ -360,10 +364,10 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
       {pending && <button type="button" className="coop-pending-label" onClick={() => setRecoveryOpen(true)}><CircleAlert size={12} aria-hidden="true" />查看待处理操作</button>}
     </article>;
   }
-  function column(owner: string | null, name: string, tasks: RoomTask[], problem?: string, diagnostic?: string) {
+  function column(owner: string | null, name: string, tasks: RoomTask[], problem?: string, diagnostic?: string, memberLoading = false) {
     const { dated, undated } = splitCollaborationTasks(tasks);
     return <section key={owner || "buffer"} data-coop-owner={owner || ""} className={`coop-column${owner === null ? " buffer" : ""}${hoverOwner === (owner || "") ? " drop-active" : ""}`}>
-      <header>{owner !== null && <><span className="coop-notebook-title">title:</span><h3>{name}</h3></>}<span className="coop-count">{tasks.length}</span>{owner === null && <><button type="button" className="coop-recovery-trigger" onClick={() => { setWorkflowId(null); setWorkflowOpen(true); setError(""); }}><TaskNoticeDot ids={workflowNoticeIds} />工作流程 {workflowNoticeIds.length > 0 && <span className="task-notice-count">{workflowNoticeIds.length}</span>}</button><button type="button" className="coop-icon coop-refresh" disabled={loading || busy}  aria-label="刷新全室任务" onClick={() => { setError(""); void load(); void onChanged(); }}><RefreshCw size={17} className={loading ? "coop-spin" : ""} /></button><button type="button" className="coop-icon coop-close" disabled={busy || !!editor}  aria-label="关闭协作区" onClick={close}><X size={21} /></button></>}</header>
+      <header>{owner !== null && <><span className="coop-notebook-title">title:</span><h3>{name}</h3></>}<span className="coop-count">{memberLoading ? <Loader2 size={14} className="coop-spin" aria-label="正在读取…" /> : tasks.length}</span>{owner === null && <><button type="button" className="coop-recovery-trigger" onClick={() => { setWorkflowId(null); setWorkflowOpen(true); setError(""); }}><TaskNoticeDot ids={workflowNoticeIds} />工作流程 {workflowNoticeIds.length > 0 && <span className="task-notice-count">{workflowNoticeIds.length}</span>}</button><button type="button" className="coop-icon coop-refresh" disabled={loading || busy}  aria-label="刷新全室任务" onClick={() => { setError(""); void load(); void onChanged(); }}><RefreshCw size={17} className={loading ? "coop-spin" : ""} /></button><button type="button" className="coop-icon coop-close" disabled={busy || !!editor}  aria-label="关闭协作区" onClick={close}><X size={21} /></button></>}</header>
       {problem ? <div className="coop-task-list"><p className="coop-empty">{problem}</p>{(diagnostic || owner === identityId) && <TickTickDiagnostics report={diagnostic} />}</div> : owner !== null ? <div className="coop-member-lanes">{([{ label: "有日期", tasks: dated }, { label: "无日期", tasks: undated }]).map(lane => <section className="coop-lane" data-coop-lane={lane.label === "有日期" ? "dated" : "undated"} key={lane.label} aria-label={`${name}的${lane.label}待办`}><header><h4>{lane.label}</h4><span>{lane.tasks.length}</span></header><div className="coop-task-list">{lane.tasks.map(task => card(task))}</div></section>)}</div> : <div className="coop-task-list">{tasks.map(task => card(task))}{draftId ? <div className="coop-new-task editing"><Plus size={18} aria-hidden="true" /><InlineTaskTitle key={draftId} initialValue="" label="新任务标题" disabled={unavailable || !!snapshot?.operations.some(operation => operation.id === draftId && operation.status === "pending")} onCancel={() => setDraftId(null)} onSave={async title => {
         const done = await perform({ id: draftId, action: "create", fields: { title } }); if (done) setDraftId(null); return done;
       }} /></div> : <button className="coop-new-task" type="button"  aria-label="新建任务" disabled={unavailable || !!inlineTask} onClick={() => { setDraftId(crypto.randomUUID()); setError(""); }}><Plus size={25} aria-hidden="true" /></button>}</div>}
@@ -383,7 +387,7 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
     }}>
       <div className="coop-surface">
       {!snapshot && <div className="coop-loading-toolbar"><button type="button" className="coop-icon coop-close" disabled={busy || !!editor}  aria-label="关闭协作区" onClick={close}><X size={21} /></button></div>}
-      <div className="coop-layout" aria-busy={loading || busy}>{snapshot ? <>{column(null, "任务板", snapshot.buffer)}<div ref={membersPane} className="coop-notebook"><div className="coop-members">{snapshot.members.map(member => column(member.id, member.name, member.tasks, member.error, member.diagnostic))}</div></div></> : <div className="coop-empty"><p>{loading ? "正在读取…" : "暂时无法读取任务"}</p><button type="button" className="coop-icon" disabled={loading} aria-label="重新读取任务" onClick={() => { setError(""); void load(); }}><RefreshCw size={18} className={loading ? "coop-spin" : ""} /></button>{uncertain && <button type="button" onClick={() => setRecoveryOpen(true)}>查看待处理操作</button>}</div>}</div>
+      <div className="coop-layout" aria-busy={busy || (loading && !snapshot)}>{snapshot ? <>{column(null, "任务板", snapshot.buffer)}<div ref={membersPane} className="coop-notebook"><div className="coop-members">{snapshot.members.map(member => column(member.id, member.name, member.tasks, member.error, member.diagnostic, member.loading))}</div></div></> : <div className="coop-empty"><p>{loading ? "正在读取…" : "暂时无法读取任务"}</p><button type="button" className="coop-icon" disabled={loading} aria-label="重新读取任务" onClick={() => { setError(""); void load(); }}><RefreshCw size={18} className={loading ? "coop-spin" : ""} /></button>{uncertain && <button type="button" onClick={() => setRecoveryOpen(true)}>查看待处理操作</button>}</div>}</div>
       {!editor && !recoveryOpen && !workflowOpen && (error || notice || busy) && <div className={`coop-toast${error ? " error" : ""}`} role="status">{busy && <Loader2 className="coop-spin" size={14} />}<span>{error || (busy ? "正在保存…" : notice)}</span>{(pending.length > 0 || uncertain) && <button type="button" onClick={() => setRecoveryOpen(true)}>查看</button>}{!busy && <button type="button" aria-label="收起提示" onClick={() => { setError(""); setNotice(""); }}><X size={14} /></button>}</div>}
       {workflowOpen && snapshot && <ClaimWorkflows snapshot={snapshot} notices={taskNotices} onRead={nudge ? undefined : markViewed} initialId={workflowId} busy={busy} error={error} perform={perform} retryUncertain={uncertain ? () => void perform(uncertain) : undefined} onClose={() => setWorkflowOpen(false)} />}
       {recoveryOpen && <CollaborationRecovery busy={busy} onClose={() => setRecoveryOpen(false)}>

@@ -22,7 +22,10 @@ globalThis.fetch = async (input, init = {}) => {
     return Response.json(Object.values(tasks).filter(task => task.status === 2 && (!body.startDate || Date.parse(task.completedTime) >= Date.parse(body.startDate))).slice(0, 200));
   }
   if (route === '/project/inbox') return Response.json({ id: `inbox-${owner}` });
-  if (route === '/project/inbox/data') return Response.json({ tasks: Object.values(tasks).filter(task => !task.status), columns: [] });
+  if (route === '/project/inbox/data') {
+    if (owner === 'bob' && process.env.DIDA_FIXTURE_INBOX_DELAY_MS) await new Promise(resolve => setTimeout(resolve, Number(process.env.DIDA_FIXTURE_INBOX_DELAY_MS)));
+    return Response.json({ tasks: Object.values(tasks).filter(task => !task.status), columns: [] });
+  }
   if (route === '/task/batch') {
     const body = JSON.parse(init.body), ids = {};
     for (const task of body.add || []) { const id = randomUUID().replaceAll('-', '').slice(0, 24); tasks[id] = { ...task, id }; ids[id] = 'created'; }
