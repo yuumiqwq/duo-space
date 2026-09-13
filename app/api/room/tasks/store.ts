@@ -206,8 +206,13 @@ export class CollaborationStore {
   recoverPendingWorkflows() {
     return this.serial(async () => {
       const state = await this.read();
+      // Old accepted deletions now finish locally, regardless of provider state
+      // or the former retry schedule. Never resume their external cleanup.
+      for (const workflow of Object.values(state.workflows)) {
+        if (workflow.ownerDeletion) await this.settleLegacyDeletion(state, workflow);
+      }
       const pending = Object.values(state.workflows).filter(workflow => workflow.status !== 'deleted' &&
-        (workflow.ownerDeletion || workflow.completionRequest || workflow.edit || ['creating', 'approving'].includes(workflow.status) || workflow.reopenReceipt || workflow.sourceReopenReceipt) &&
+        (workflow.completionRequest || workflow.edit || ['creating', 'approving'].includes(workflow.status) || workflow.reopenReceipt || workflow.sourceReopenReceipt) &&
         (workflow.syncRetryAt || 0) <= Date.now())
         .sort((a, b) => (a.syncRetryAt || 0) - (b.syncRetryAt || 0) || a.createdAt - b.createdAt).slice(0, 3);
       for (const workflow of pending) {
@@ -217,8 +222,7 @@ export class CollaborationStore {
         workflow.syncRetryAt = Date.now() + Math.min(300_000, 5000 * 2 ** Math.min(workflow.syncAttempts, 6));
         await this.write(state);
         try {
-          if (workflow.ownerDeletion) await this.deleteWorkflowTasks(state, workflow, workflow.ownerDeletion.id);
-          else if (workflow.completionRequest) await this.completeByOwner(state, workflow, workflow.completionRequest.actor, workflow.completionRequest.id, workflow.completionRequest.signature);
+          if (workflow.completionRequest) await this.completeByOwner(state, workflow, workflow.completionRequest.actor, workflow.completionRequest.id, workflow.completionRequest.signature);
           else if (workflow.edit) await this.finishWorkflowEdit(state, workflow);
           else if (workflow.status === 'creating') await this.startWorkflow(state, workflow);
           else if (workflow.status === 'approving') await this.finishApproval(state, workflow);
@@ -772,63 +776,56 @@ export class CollaborationStore {
       await this.saveWorkflow(state, workflow); return this.publicWorkflow(workflow);
     }
   }
-  private async deleteWorkflowTasks(state: State, workflow: Workflow, eventId: string) {
-    const event = workflow.events.find(item => item.id === eventId)!;
-    // Completed requests from the old one-sided deletion behavior are receipts,
-    // not authorization to apply the new behavior retroactively.
-    if (["owner-task-deleted", "claimant-task-deleted", "task-deleted"].includes(event.type) || workflow.status === 'deleted') {
-      if (workflow.ownerDeletion?.id === eventId) {
-        delete workflow.ownerDeletion;
-        delete workflow.syncAttempts; delete workflow.syncRetryAt;
-        workflow.error = "";
-        await this.saveWorkflow(state, workflow);
-      }
-      return this.publicWorkflow(workflow);
-    }
-    workflow.ownerDeletion ||= { id: eventId };
-    const deletion = workflow.ownerDeletion;
-    try {
-      for (const side of ['source', 'target'] as const) {
-        if (deletion.done?.includes(side)) continue;
-        const { owner, id } = this.sideReference(workflow, side);
-        const acknowledged = deletion.acknowledged?.[side];
-        // A positive DELETE response plus an absent exact task confirms this side.
-        // Preserve that response before readback so a restart does not require an
-        // unrelated capped history search. An uncertain DELETE has no receipt.
-        if (acknowledged && acknowledged.id === id && !await this.gateway.get(owner, id, acknowledged.projectId)) {
-          deletion.done = [...(deletion.done || []), side];
-          await this.saveWorkflow(state, workflow);
-          continue;
-        }
-        const task = await this.linkedTask(state, workflow, side);
-        if (task) {
-          if (workflow.fields.repeatFlag && (taskFields(task).startDate !== workflow.fields.startDate || taskFields(task).dueDate !== workflow.fields.dueDate)) throw new CollaborationError("关联重复任务已进入其他日期，请在滴答中删除对应任务，避免影响下一次任务");
-          const missing = await this.gateway.remove(owner, task.id, task.projectId) === "missing";
-          if (!missing) {
-            deletion.acknowledged ||= {};
-            deletion.acknowledged[side] = { id: task.id, projectId: task.projectId };
-            await this.saveWorkflow(state, workflow);
-          }
-          // A 404 may mean the task moved; it cannot create a success receipt.
-          const remaining = missing ? await this.linkedTask(state, workflow, side) : await this.gateway.get(owner, task.id, task.projectId);
-          if (remaining) throw new CollaborationError("删除尚未完成，正在自动重试");
-        }
-        deletion.done = [...(deletion.done || []), side];
-        await this.saveWorkflow(state, workflow);
-      }
-      if (workflow.source.ownerId === null) delete state.buffer[workflow.source.taskId];
-      event.type = "task-deleted"; event.comment = "";
-      workflow.status = 'deleted'; workflow.taskAnomaly = false;
-      delete workflow.ownerDeletion;
-      delete workflow.completionRequest;
-      delete workflow.edit; delete workflow.approval; delete workflow.recovery;
-      delete workflow.reopenReceipt; delete workflow.sourceReopenReceipt; workflow.reopenPending = false; workflow.needsSubmission = false;
-      workflow.error = ""; workflow.syncError = undefined;
-    } catch (error) { workflow.error = error instanceof Error ? error.message : "删除尚未完成，正在自动重试"; }
-    await this.saveWorkflow(state, workflow); return this.publicWorkflow(workflow);
+  private archiveWorkflow(state: State, workflow: Workflow, event: Workflow["events"][number], error = "") {
+    if (workflow.source.ownerId === null) delete state.buffer[workflow.source.taskId];
+    event.type = "task-deleted"; event.comment = "";
+    workflow.status = 'deleted'; workflow.taskAnomaly = false;
+    delete workflow.ownerDeletion; delete workflow.syncAttempts; delete workflow.syncRetryAt;
+    delete workflow.completionRequest; delete workflow.edit; delete workflow.approval; delete workflow.recovery;
+    delete workflow.reopenReceipt; delete workflow.sourceReopenReceipt;
+    workflow.reopenPending = false; workflow.needsSubmission = false;
+    workflow.error = error; workflow.syncError = undefined;
   }
-  workflowCommand(actor: string, command: WorkflowCommand) {
-    return this.serial(async () => {
+  private async settleLegacyDeletion(state: State, workflow: Workflow) {
+    const deletion = workflow.ownerDeletion;
+    if (!deletion) return this.publicWorkflow(workflow);
+    const event = workflow.events.find(item => item.id === deletion.id);
+    if (!event) return this.publicWorkflow(workflow);
+    if (["owner-task-deleted", "claimant-task-deleted"].includes(event.type)) {
+      // Completed historical one-sided actions retain their original scope.
+      delete workflow.ownerDeletion; delete workflow.syncAttempts; delete workflow.syncRetryAt;
+      workflow.error = "";
+    } else if (["task-delete-requested", "owner-delete-requested", "claimant-delete-requested", "task-deleted"].includes(event.type)) {
+      const confirmed = event.type === 'task-deleted' || (['source', 'target'] as const).every(side => {
+        const { id } = this.sideReference(workflow, side);
+        return !id || deletion.done?.includes(side) || deletion.acknowledged?.[side]?.id === id;
+      });
+      this.archiveWorkflow(state, workflow, event, confirmed ? "" : "滴答清单中删除失败");
+    } else return this.publicWorkflow(workflow);
+    await this.saveWorkflow(state, workflow);
+    return this.publicWorkflow(workflow);
+  }
+  private async deleteLinkedTasksOnce(workflow: Workflow, completedAfter: number) {
+    let failed = false;
+    for (const side of ['source', 'target'] as const) {
+      const { owner, id } = this.sideReference(workflow, side);
+      if (!id) continue;
+      try {
+        const task = await (this.gateway.locate
+          ? this.gateway.locate(owner, id, workflow.projects?.[side], completedAfter)
+          : this.gateway.get(owner, id, workflow.projects?.[side]));
+        if (!task) continue;
+        // Preserve subsequent recurring occurrences even though the website
+        // archive is final. Failure on one account does not skip the other.
+        if (workflow.fields.repeatFlag && (taskFields(task).startDate !== workflow.fields.startDate || taskFields(task).dueDate !== workflow.fields.dueDate)) { failed = true; continue; }
+        if (await this.gateway.remove(owner, task.id, task.projectId) === "missing") failed = true;
+      } catch { failed = true; }
+    }
+    return failed ? "滴答清单中删除失败" : "";
+  }
+  async workflowCommand(actor: string, command: WorkflowCommand) {
+    let cleanup: { workflow: Workflow; completedAfter: number } | undefined;
+    const result = await this.serial(async () => {
       await this.requireMember(actor);
       if (!command || !/^[a-f0-9-]{36}$/i.test(command.id) || !/^[a-f0-9-]{36}$/i.test(command.workflowId) || !Number.isSafeInteger(command.version)) throw new CollaborationError("流程参数无效", 400);
       const state = await this.read(), workflow = state.workflows[command.workflowId];
@@ -845,10 +842,10 @@ export class CollaborationStore {
         if (workflow.status === 'deleted') return this.publicWorkflow(workflow);
         if (command.action === "delete-owner-task") {
           if (actor !== workflow.reviewerId) throw new CollaborationError("只有原任务所属成员或公共任务发布者能删除发起任务", 403);
-          return this.deleteWorkflowTasks(state, workflow, command.id);
+          return this.settleLegacyDeletion(state, workflow);
         }
-        if (workflow.ownerDeletion) return workflow.ownerDeletion.id === command.id ? this.deleteWorkflowTasks(state, workflow, command.id) : this.publicWorkflow(workflow);
-        if (command.action === "delete-claimed-task") return this.deleteWorkflowTasks(state, workflow, command.id);
+        if (workflow.ownerDeletion) return workflow.ownerDeletion.id === command.id ? this.settleLegacyDeletion(state, workflow) : this.publicWorkflow(workflow);
+        if (command.action === "delete-claimed-task") return this.settleLegacyDeletion(state, workflow);
         if (["nudge", "reply-nudge"].includes(command.action)) return this.publicWorkflow(workflow);
         if (command.action === "restore-workflow") return workflow.taskAnomaly && workflow.restoration?.id === command.id && workflow.restoration.generation === (workflow.missingGeneration || 0) ? this.restoreWorkflow(state, workflow) : this.publicWorkflow(workflow);
         if (workflow.edit?.id === command.id) return this.finishWorkflowEdit(state, workflow);
@@ -875,13 +872,14 @@ export class CollaborationStore {
       if (["delete-owner-task", "delete-claimed-task"].includes(command.action) || (command.action === "retry-workflow" && workflow.ownerDeletion)) {
         const permitted = command.action === 'delete-owner-task' ? actor === workflow.reviewerId : command.action === 'delete-claimed-task' ? actor === workflow.claimantId : [workflow.reviewerId, workflow.claimantId].includes(actor);
         if (!permitted) throw new CollaborationError("只有任务发起者或认领者能删除对应任务", 403);
-        if (!workflow.ownerDeletion) {
-          workflow.ownerDeletion = { id: command.id };
-          workflow.events.push({ id: command.id, signature, actorId: actor, type: "task-delete-requested", at: Date.now(), comment: "", files: [] });
-          if (workflow.source.ownerId === null) delete state.buffer[workflow.source.taskId];
-          await this.saveWorkflow(state, workflow);
-        }
-        return this.deleteWorkflowTasks(state, workflow, workflow.ownerDeletion.id);
+        if (workflow.ownerDeletion) return this.settleLegacyDeletion(state, workflow);
+        const event = { id: command.id, signature, actorId: actor, type: "task-deleted", at: Date.now(), comment: "", files: [] };
+        const completedAfter = this.completedAfter(state, workflow);
+        workflow.events.push(event);
+        this.archiveWorkflow(state, workflow, event);
+        await this.saveWorkflow(state, workflow);
+        cleanup = { workflow: structuredClone(workflow), completedAfter };
+        return this.publicWorkflow(workflow);
       }
       if (workflow.ownerDeletion) throw new CollaborationError("发起任务的删除结果尚未确认，请由发起者核对并继续");
       if (command.action === "restore-workflow") {
@@ -957,6 +955,15 @@ export class CollaborationStore {
       workflow.status = submit ? "submitted" : "rejected";
       workflow.error = "";
       await this.saveWorkflow(state, workflow);
+      return this.publicWorkflow(workflow);
+    });
+    if (!cleanup) return result;
+    // This request makes one best-effort attempt after durable local archival.
+    // It runs outside the mutation queue and has no persisted cleanup receipt.
+    const error = await this.deleteLinkedTasksOnce(cleanup.workflow, cleanup.completedAfter);
+    return this.serial(async () => {
+      const state = await this.read(), workflow = state.workflows[command.workflowId];
+      if (workflow.error !== error) { workflow.error = error; await this.saveWorkflow(state, workflow); }
       return this.publicWorkflow(workflow);
     });
   }

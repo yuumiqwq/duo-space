@@ -169,6 +169,25 @@ test('claim workflow HTTP covers actual routes, sidebar guard, file streaming, r
     assert.ok(!(await (await call('alice')).json()).buffer.some(task => task.id === removable.id));
     response = await act('alice', 'approve'); assert.equal(response.status, 409);
     assert.equal(w.events.find(event => event.type === 'submit').comment, '删除后保留的结果');
+    await call('alice', '/api/room/tasks', { id: randomUUID(), action: 'create', fields: { title: '滴答失败也归档' } });
+    const failedCard = (await (await call('bob')).json()).buffer.find(task => task.title === '滴答失败也归档');
+    response = await call('bob', '/api/room/tasks', { id: randomUUID(), action: 'claim', source: { ownerId: null, taskId: failedCard.id, version: failedCard.version }, destination: 'bob' });
+    const failedWorkflow = (await response.json()).workflow;
+    const remoteFile = path.join(dir, 'fake-dida.json'), remoteState = JSON.parse(await readFile(remoteFile, 'utf8'));
+    remoteState.bob[failedWorkflow.targetId].fixtureDeleteFailure = true;
+    await writeFile(remoteFile, JSON.stringify(remoteState));
+    const failedDeletion = { id: randomUUID(), workflowId: failedWorkflow.id, version: failedWorkflow.version, action: 'delete-owner-task' };
+    response = await call('alice', '/api/room/tasks', failedDeletion);
+    assert.equal(response.status, 200, 'website deletion is final even when Dida fails');
+    const archived = (await response.json()).workflow;
+    assert.equal(archived.status, 'deleted'); assert.equal(archived.error, '滴答清单中删除失败'); assert.equal(archived.ownerDeletePending, false);
+    response = await call('alice', '/api/room/tasks', failedDeletion);
+    assert.equal(response.status, 200); assert.equal((await response.json()).workflow.error, '滴答清单中删除失败');
+    const archivedSnapshot = await (await call('bob', '/api/room/tasks?local=1')).json();
+    assert.ok(!archivedSnapshot.buffer.some(task => task.id === failedCard.id));
+    assert.equal(archivedSnapshot.workflows.find(item => item.id === archived.id).status, 'deleted');
+    assert.equal(JSON.parse(await readFile(remoteFile, 'utf8')).bob[archived.targetId].deleteAttempts, 1);
+    assert.equal(JSON.parse(await readFile(path.join(dir, 'room-collaboration.json'), 'utf8')).workflows[archived.id].ownerDeletion, undefined);
     assert.equal((await call('bob', '/api/room/tasks', { action: 'legacy-reset' })).status, 200);
   } finally { child.kill(); }
 });

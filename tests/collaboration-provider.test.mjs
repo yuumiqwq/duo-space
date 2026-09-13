@@ -130,7 +130,7 @@ test('Dida provider works with Open API credentials despite V2 rejection and sco
   }
 });
 
-test('persisted deletion finishes after restart with an empty inbox whose ID is unavailable', async () => {
+test('archived deletion never retries after restart and exact reads still work with an unknown empty inbox', async () => {
   await mkdir('codex-generated/test-data', { recursive: true });
   const dir = await mkdtemp(path.resolve('codex-generated/test-data/deletion-empty-inbox-'));
   const previousDir = process.env.DATA_DIR, previousSecret = process.env.TICKTICK_STORAGE_SECRET, originalFetch = globalThis.fetch;
@@ -149,7 +149,8 @@ test('persisted deletion finishes after restart with an empty inbox whose ID is 
     const card = (await seed.snapshot('alice')).buffer[0];
     let workflow = await seed.claim('bob', { id: randomUUID(), action: 'claim', source: { ownerId: null, taskId: card.id, version: card.version } });
     workflow = await seed.workflowCommand('alice', { id: randomUUID(), workflowId: workflow.id, version: workflow.version, action: 'delete-owner-task' });
-    assert.equal(workflow.ownerDeletePending, true); assert.equal(tasks.size, 0);
+    assert.equal(workflow.ownerDeletePending, false); assert.equal(workflow.status, 'deleted');
+    assert.equal(workflow.error, '滴答清单中删除失败'); assert.equal(tasks.size, 0);
     await writeFile(path.join(dir, 'identities.json'), JSON.stringify({ version: 1, users: { alice: { nickname: 'Alice', ticktickToken: encryptToken('token-alice') }, bob: { nickname: 'Bob', ticktickToken: encryptToken('token-bob') } } }));
     const output = path.join(dir, 'provider.mjs');
     await build({ entryPoints: ['app/api/room/tasks/provider.ts'], bundle: true, platform: 'node', format: 'esm', outfile: output, logLevel: 'silent' });
@@ -175,7 +176,8 @@ test('persisted deletion finishes after restart with an empty inbox whose ID is 
     const saved = (await restarted.snapshot('alice', null)).workflows.find(item => item.id === workflow.id);
     assert.equal(saved.status, 'deleted', saved.error);
     assert.equal(saved.ownerDeletePending, false);
-    assert.equal(requests.filter(item => item.method === 'DELETE').length, 0, 'confirmed absence does not repeat deletion');
+    assert.equal(saved.error, '滴答清单中删除失败');
+    assert.equal(requests.length, 0, 'archived deletion performs no further external cleanup');
     taskExists = true;
     await gateway.remove('bob', workflow.targetId, 'inbox-bob');
     assert.equal(await gateway.get('bob', workflow.targetId, 'inbox-bob'), null);

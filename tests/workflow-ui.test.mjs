@@ -100,6 +100,13 @@ test('workflow detail offers settings to every member and direct completion only
   assert.match(pendingDeletion, /role="alert">滴答授权不足或已失效，请该成员重新连接/);
   assert.ok(pendingDeletion.includes('workflow-sync-spinner'));
   delete workflow.ownerDeletePending; delete workflow.error;
+  workflow.error = '滴答清单中删除失败';
+  const archivedDeletion = render('alice', 'deleted');
+  assert.match(archivedDeletion, /role="alert">滴答清单中删除失败/);
+  assert.match(archivedDeletion, />已删除<\/span>/);
+  assert.ok(!archivedDeletion.includes('workflow-sync-spinner'));
+  assert.ok(!archivedDeletion.includes('aria-label="删除任务"'));
+  delete workflow.error;
   workflow.taskAnomaly = true;
   for (const member of ['alice', 'bob', 'charlie']) {
     const html = render(member, 'submitted');

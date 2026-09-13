@@ -42,7 +42,10 @@ globalThis.fetch = async (input, init = {}) => {
   if (match && match[1] === `inbox-${owner}`) {
     const id = match[2];
     if (!tasks[id]) return new Response(null, { status: 404 });
-    if (method === 'DELETE') { delete tasks[id]; save(); return new Response(null, { status: 204 }); }
+    if (method === 'DELETE') {
+      if (tasks[id].fixtureDeleteFailure) { tasks[id].deleteAttempts = (tasks[id].deleteAttempts || 0) + 1; save(); return new Response(null, { status: 503 }); }
+      delete tasks[id]; save(); return new Response(null, { status: 204 });
+    }
     if (match[3] && method === 'POST') { tasks[id].status = 2; tasks[id].completedTime = new Date().toISOString(); save(); return new Response(null, { status: 204 }); }
     return Response.json(tasks[id]);
   }

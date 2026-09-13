@@ -232,7 +232,7 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
       void onChanged();
     }
     if (operation?.status === "done" || operation?.status === "cancelled") setDraftId(current => current === command.id ? null : current);
-    return executionSaved || (workflow ? (command.action === 'update-workflow' && workflow.events.some(event => event.id === command.id)) || (!workflow.error && !workflow.syncError) : operation?.status === "done");
+    return executionSaved || (workflow ? workflow.status === 'deleted' || (command.action === 'update-workflow' && workflow.events.some(event => event.id === command.id)) || (!workflow.error && !workflow.syncError) : operation?.status === "done");
   }
   const unavailable = busy || !!uncertain;
   const ownerName = (owner: string | null) => owner === null ? "任务板" : snapshot?.members.find(member => member.id === owner)?.name || "成员";
