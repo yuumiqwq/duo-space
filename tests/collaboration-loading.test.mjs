@@ -60,3 +60,38 @@ test('independent refreshes retain loaded members and latest workflow records wi
   assert.deepEqual(result.members[1].tasks, [{ id: 'other-task' }]);
   assert.deepEqual(mergeCollaborationSnapshot(result, { ...oldMember, identityId: 'different' }, 'bob'), result);
 });
+
+test('a failed refresh keeps preloaded tasks, successful retry replaces them, and disconnect clears them', async () => {
+  const known = { id: 'preloaded-task' };
+  let current = { ...local(), members: [{ ...member('alice'), loading: false, tasks: [known] }, { ...member('bob'), loading: false, tasks: [{ id: 'peer-task' }] }] };
+  let fail = true;
+  const refresh = async () => {
+    const done = deferred();
+    await loadCollaborationSnapshot({ signal: new AbortController().signal,
+      request: async url => {
+        if (url.endsWith('local=1')) return Response.json(local());
+        if (url.endsWith('alice') && fail) throw new DOMException('Timed out', 'TimeoutError');
+        const id = url.endsWith('alice') ? 'alice' : 'bob';
+        return Response.json({ ...local(), members: [{ ...member(id), loading: false, tasks: [{ id: id + '-new-task' }] }] });
+      },
+      accept: (next, id) => { current = mergeCollaborationSnapshot(current, next, id); },
+      settled: done.resolve,
+    });
+    await done.promise;
+  };
+  await refresh();
+  assert.deepEqual(current.members[0].tasks, [known]); assert.ok(current.members[0].error); assert.equal(current.members[0].loading, false);
+  assert.deepEqual(current.members[1].tasks, [{ id: 'bob-new-task' }]);
+  fail = false; await refresh();
+  assert.deepEqual(current.members[0].tasks, [{ id: 'alice-new-task' }]); assert.equal(current.members[0].error, undefined);
+  current = mergeCollaborationSnapshot(current, { ...local(), members: [{ ...member('alice'), connected: false, loading: false, error: '未连接' }] }, 'alice');
+  assert.deepEqual(current.members[0].tasks, []); assert.equal(current.members[0].connected, false);
+});
+
+test('preserving cached tasks after a refresh error never restores an archived workflow task', () => {
+  const snapshot = { ...local(), members: [{ ...member('alice'), loading: false, tasks: [{ id: 'target' }, { id: 'unrelated' }] }] };
+  const deleted = { id: 'workflow', status: 'deleted', source: { ownerId: null, taskId: 'public' }, claimantId: 'alice', targetId: 'target', events: [] };
+  const result = mergeCollaborationSnapshot(snapshot, { ...local(), revision: 3, workflows: [deleted], members: [{ ...member('alice'), error: '收集箱暂时无法读取' }] }, 'alice');
+  assert.deepEqual(result.members[0].tasks, [{ id: 'unrelated' }]); assert.equal(result.members[0].loading, false);
+  assert.equal(result.workflows[0].status, 'deleted');
+});

@@ -14,7 +14,9 @@ export function mergeCollaborationSnapshot(current: CollaborationSnapshot | null
     }) });
   }
   const member = incoming.members.find(item => item.id === memberId);
-  return withoutDeletedWorkflowTasks({ ...(fresh ? incoming : current), members: current.members.map(item => item.id === memberId && member ? { ...member, loading: false } : item) });
+  return withoutDeletedWorkflowTasks({ ...(fresh ? incoming : current), members: current.members.map(item => item.id === memberId && member
+    ? { ...member, loading: false, tasks: member.connected && member.error ? item.tasks : member.tasks }
+    : item) });
 }
 
 // Return website records as soon as they arrive. Each inbox updates independently;

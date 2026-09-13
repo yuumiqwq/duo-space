@@ -123,6 +123,14 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
     } catch (cause) { if (id === generation.current) setError(taskErrorMessage(cause, '协作区暂时无法读取')); return null; }
   }, [acceptNotices, previewSnapshot]);
 
+  // Warm each member's tasks when entering the classroom. Opening the board
+  // shares this request; closing it does not discard useful in-flight reads.
+  useEffect(() => {
+    if (!identityId || previewSnapshot) return;
+    const timer = setTimeout(() => { void load(); }, 0);
+    return () => { clearTimeout(timer); generation.current++; fetching.current = false; loadController.current?.abort(); };
+  }, [identityId, load, previewSnapshot]);
+
   useEffect(() => {
     if (!identityId || previewSnapshot) return;
     let stopped = false, polling = false;
@@ -155,10 +163,9 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
     const element = dialog.current, button = trigger.current;
     element?.showModal();
     if (previewSnapshot) return () => { element?.close(); button?.focus({ preventScroll: true }); };
-    const first = setTimeout(() => { void load(true); }, 0);
+    const first = setTimeout(() => { void load(); }, 0);
     const timer = setInterval(() => { if (!document.hidden && !locked.current && !drag.current) void load(); }, 15000);
-    const invalidate = () => { generation.current++; fetching.current = false; loadController.current?.abort(); };
-    return () => { clearTimeout(first); clearInterval(timer); invalidate(); element?.close(); button?.focus({ preventScroll: true }); };
+    return () => { clearTimeout(first); clearInterval(timer); element?.close(); button?.focus({ preventScroll: true }); };
   }, [open, load, previewSnapshot]);
 
   async function perform(command: RequestCommand): Promise<boolean> {
@@ -363,7 +370,8 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
     const { dated, undated } = splitCollaborationTasks(tasks);
     return <section key={owner || "buffer"} data-coop-owner={owner || ""} className={`coop-column${owner === null ? " buffer" : ""}${hoverOwner === (owner || "") ? " drop-active" : ""}`}>
       <header>{owner !== null && <><span className="coop-notebook-title">title:</span><h3>{name}</h3></>}<span className="coop-count">{memberLoading ? <Loader2 size={14} className="coop-spin" aria-label="正在读取…" /> : tasks.length}</span>{owner === null && <><button type="button" className="coop-recovery-trigger" onClick={() => { setEditor(null); setWorkflowId(null); setWorkflowOpen(true); setError(""); }}><TaskNoticeDot ids={workflowNoticeIds} />工作流程 {workflowNoticeIds.length > 0 && <span className="task-notice-count">{workflowNoticeIds.length}</span>}</button><button type="button" className="coop-icon coop-refresh" disabled={loading || busy}  aria-label="刷新全室任务" onClick={() => { setError(""); void load(); void onChanged(); }}><RefreshCw size={17} className={loading ? "coop-spin" : ""} /></button><button type="button" className="coop-icon coop-close" disabled={busy || !!editor}  aria-label="关闭协作区" onClick={close}><X size={21} /></button></>}</header>
-      {problem ? <div className="coop-task-list"><p className="coop-empty">{problem}</p>{(diagnostic || owner === identityId) && <TickTickDiagnostics report={diagnostic} />}</div> : owner !== null ? <div className="coop-member-lanes">{([{ label: "有日期", tasks: dated }, { label: "无日期", tasks: undated }]).map(lane => <section className="coop-lane" data-coop-lane={lane.label === "有日期" ? "dated" : "undated"} key={lane.label} aria-label={`${name}的${lane.label}待办`}><header><h4>{lane.label}</h4><span>{lane.tasks.length}</span></header><div className="coop-task-list">{lane.tasks.map(task => card(task))}</div></section>)}</div> : <div className="coop-task-list">{tasks.map(task => card(task))}{draftId ? <div className="coop-new-task editing"><Plus size={18} aria-hidden="true" /><InlineTaskTitle key={draftId} initialValue="" label="新任务标题" disabled={unavailable || !!snapshot?.operations.some(operation => operation.id === draftId && operation.status === "pending")} onCancel={() => setDraftId(null)} onSave={async title => {
+      {problem && <div className="coop-task-list"><p className="coop-empty">{problem}</p>{(diagnostic || owner === identityId) && <TickTickDiagnostics report={diagnostic} />}</div>}
+      {problem && !tasks.length ? null : owner !== null ? <div className="coop-member-lanes">{([{ label: "有日期", tasks: dated }, { label: "无日期", tasks: undated }]).map(lane => <section className="coop-lane" data-coop-lane={lane.label === "有日期" ? "dated" : "undated"} key={lane.label} aria-label={`${name}的${lane.label}待办`}><header><h4>{lane.label}</h4><span>{lane.tasks.length}</span></header><div className="coop-task-list">{lane.tasks.map(task => card(task))}</div></section>)}</div> : <div className="coop-task-list">{tasks.map(task => card(task))}{draftId ? <div className="coop-new-task editing"><Plus size={18} aria-hidden="true" /><InlineTaskTitle key={draftId} initialValue="" label="新任务标题" disabled={unavailable || !!snapshot?.operations.some(operation => operation.id === draftId && operation.status === "pending")} onCancel={() => setDraftId(null)} onSave={async title => {
         const done = await perform({ id: draftId, action: "create", fields: { title } }); if (done) setDraftId(null); return done;
       }} /></div> : <button className="coop-new-task" type="button"  aria-label="新建任务" disabled={unavailable} onClick={() => { setDraftId(crypto.randomUUID()); setError(""); }}><Plus size={25} aria-hidden="true" /></button>}</div>}
     </section>;

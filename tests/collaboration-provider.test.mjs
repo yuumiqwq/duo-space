@@ -8,6 +8,105 @@ import { encryptToken } from '../app/api/ticktick/crypto.ts';
 import { CollaborationStore, remoteVersion, taskFields } from '../app/api/room/tasks/store.ts';
 import { randomUUID } from 'node:crypto';
 
+const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
+async function providerFixture(run) {
+  await mkdir('codex-generated/test-data', { recursive: true });
+  const dir = await mkdtemp(path.resolve('codex-generated/test-data/direct-provider-'));
+  const previousDir = process.env.DATA_DIR, previousSecret = process.env.TICKTICK_STORAGE_SECRET, originalFetch = globalThis.fetch;
+  process.env.DATA_DIR = dir; process.env.TICKTICK_STORAGE_SECRET = 'synthetic-test-key';
+  const saveToken = token => writeFile(path.join(dir, 'identities.json'), JSON.stringify({ version: 1, users: { alice: { nickname: 'Alice', ...(token ? { ticktickToken: encryptToken(token) } : {}) } } }));
+  try {
+    await saveToken('token-alice');
+    const output = path.join(dir, 'provider.mjs');
+    await build({ entryPoints: ['app/api/room/tasks/provider.ts'], bundle: true, platform: 'node', format: 'esm', outfile: output, logLevel: 'silent' });
+    await run((await import(pathToFileURL(output).href)).gateway, saveToken);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousDir === undefined) delete process.env.DATA_DIR; else process.env.DATA_DIR = previousDir;
+    if (previousSecret === undefined) delete process.env.TICKTICK_STORAGE_SECRET; else process.env.TICKTICK_STORAGE_SECRET = previousSecret;
+  }
+}
+
+test('exact linked reads and deletion bypass a stalled or failed inbox and a moved ID uses account search directly', async () => {
+  await providerFixture(async gateway => {
+    const gate = deferred(), entered = deferred(), requests = [];
+    const task = { id: 'known', projectId: 'saved-list', title: '已知编号', status: 0 };
+    globalThis.fetch = async (url, init) => {
+      assert.equal(init.headers.Authorization, 'Bearer token-alice');
+      const route = new URL(url).pathname.replace('/open/v1', '');
+      requests.push(route);
+      if (route === '/project/inbox/data') { entered.resolve(); await gate.promise; return new Response(null, { status: 503 }); }
+      if (route === '/project/saved-list/task/known') return init.method === 'DELETE' ? new Response(null, { status: 204 }) : Response.json(task);
+      if (route === '/project/old-list/task/known') return new Response(null, { status: 404 });
+      if (route === '/task/filter') return Response.json([task]);
+      throw new Error(`Unexpected request: ${route}`);
+    };
+    const inboxFailure = assert.rejects(gateway.inbox('alice'), { status: 502 });
+    let timer;
+    try {
+      await entered.promise;
+      const direct = (async () => {
+        assert.deepEqual(await gateway.locate('alice', task.id, task.projectId), task);
+        await gateway.remove('alice', task.id, task.projectId);
+        assert.deepEqual(await gateway.locate('alice', task.id, 'old-list'), task);
+      })();
+      await Promise.race([direct, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Exact ID operation waited for the inbox')), 2000); })]);
+      assert.equal(requests.filter(route => route === '/project/inbox/data').length, 1);
+      assert.ok(!requests.includes('/task/completed'));
+    } finally { clearTimeout(timer); gate.resolve(); await inboxFailure; }
+    assert.deepEqual(await gateway.get('alice', task.id, task.projectId), task, 'an earlier inbox error does not poison direct operations');
+  });
+});
+
+test('credential rotation isolates in-flight inbox data, aliases resolve concretely, and disconnect blocks cached access', async () => {
+  await providerFixture(async (gateway, saveToken) => {
+    const gate = deferred(), entered = deferred(), requests = [];
+    globalThis.fetch = async (url, init) => {
+      const route = new URL(url).pathname.replace('/open/v1', ''), token = init.headers.Authorization;
+      requests.push({ route, token });
+      const projectId = token === 'Bearer token-alice' ? 'old-inbox' : 'new-inbox';
+      if (route === '/project/inbox/data') {
+        if (projectId === 'old-inbox') { entered.resolve(); await gate.promise; }
+        return Response.json({ project: { id: projectId }, tasks: [] });
+      }
+      if (route === `/project/${projectId}/task/known`) return Response.json({ id: 'known', projectId, title: '当前账号' });
+      throw new Error(`Unexpected request: ${route}`);
+    };
+    const old = gateway.inbox('alice');
+    try {
+      await entered.promise;
+      await saveToken('token-reconnected');
+      assert.equal((await gateway.inbox('alice')).projectId, 'new-inbox');
+      assert.equal((await gateway.get('alice', 'known', 'new-inbox')).projectId, 'new-inbox');
+    } finally { gate.resolve(); await old; }
+    assert.equal((await gateway.get('alice', 'known', 'inbox')).projectId, 'new-inbox', 'late old data cannot replace the new inbox');
+    await saveToken(null);
+    const before = requests.length;
+    await assert.rejects(gateway.get('alice', 'known', 'new-inbox'), { status: 422 });
+    await assert.rejects(gateway.inbox('alice'), { status: 422 });
+    assert.equal(requests.length, before, 'disconnect forbids requests even with a fresh cache');
+  });
+});
+
+test('a capped account search still finds an exact task moved into an initially unknown inbox', async () => {
+  await providerFixture(async gateway => {
+    const requests = [];
+    const task = { id: 'moved-to-inbox', projectId: 'actual-inbox', title: '移动到收集箱', status: 0 };
+    globalThis.fetch = async (url) => {
+      const route = new URL(url).pathname.replace('/open/v1', ''); requests.push(route);
+      if (route === '/project/old-list/task/moved-to-inbox') return new Response(null, { status: 404 });
+      if (route === '/task/filter') return Response.json(Array.from({ length: 200 }, (_, index) => ({ id: `other-${index}`, projectId: 'old-list', status: 0 })));
+      if (route === '/project') return Response.json([{ id: 'old-list' }]);
+      if (route === '/project/inbox/data') return Response.json({ tasks: [task] });
+      if (route === '/project/actual-inbox/task/moved-to-inbox') return Response.json(task);
+      throw new Error(`Unexpected request: ${route}`);
+    };
+    assert.deepEqual(await gateway.locate('alice', task.id, 'old-list'), task);
+    assert.ok(requests.indexOf('/project/inbox/data') > requests.indexOf('/task/filter'));
+    assert.ok(!requests.includes('/task/completed'));
+  });
+});
+
 test('Dida provider works with Open API credentials despite V2 rejection and scopes transfers to the owner inbox', async () => {
   await mkdir('codex-generated/test-data', { recursive: true });
   const dir = await mkdtemp(path.resolve('codex-generated/test-data/cooperation-provider-'));

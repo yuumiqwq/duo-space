@@ -4,40 +4,53 @@ import { tickFetch, tickInboxData, TickApiError } from "../../ticktick/client";
 import { CollaborationError, remoteVersion, sameFields, verificationIssue, type Gateway, type RemoteTask } from "./store";
 import type { TaskFields } from "../../../collaboration-types";
 
-type Context = { token: string; projectId: string; tasks: RemoteTask[]; encrypted: string; expires: number; search?: Promise<RemoteTask[]>; projects?: Promise<string[]>; completed?: Map<string, Promise<RemoteTask[]>> };
+type Context = { token: string; encrypted: string; expires: number; search?: Promise<RemoteTask[]>; projects?: Promise<string[]>; completed?: Map<string, Promise<RemoteTask[]>> };
+type Inbox = { projectId: string; tasks: RemoteTask[] };
 const contexts = new Map<string, Context>();
-const contextLoads = new Map<string, { id: symbol; encrypted: string; promise: Promise<Context> }>();
-async function context(owner: string, refreshInbox = false): Promise<Context> {
-  const before = contexts.get(owner);
+const inboxes = new Map<string, Inbox & { encrypted: string; expires: number }>();
+const inboxLoads = new Map<string, { id: symbol; encrypted: string; promise: Promise<Inbox> }>();
+async function context(owner: string): Promise<Context> {
   const user = await getUser(owner);
-  if (!user?.ticktickToken) throw new CollaborationError("该成员尚未连接滴答清单", 422);
+  if (!user?.ticktickToken) { contexts.delete(owner); inboxes.delete(owner); inboxLoads.delete(owner); throw new CollaborationError("该成员尚未连接滴答清单", 422); }
   const cached = contexts.get(owner);
-  if ((!refreshInbox || cached !== before) && cached?.encrypted === user.ticktickToken && cached.expires > Date.now()) return cached;
-  const pending = contextLoads.get(owner);
-  if (pending?.encrypted === user.ticktickToken) return pending.promise;
+  if (cached?.encrypted === user.ticktickToken && cached.expires > Date.now()) return cached;
   let token: string;
   try { token = decryptToken(user.ticktickToken); } catch { throw new CollaborationError("该成员需要重新连接滴答清单", 422); }
-  const encrypted = user.ticktickToken;
+  const account = { token, encrypted: user.ticktickToken, expires: Date.now() + 15000 };
+  contexts.set(owner, account);
+  return account;
+}
+async function inboxContext(owner: string, refresh = false): Promise<Inbox> {
+  const before = inboxes.get(owner), account = await context(owner), cached = inboxes.get(owner);
+  if ((!refresh || cached !== before) && cached?.encrypted === account.encrypted && cached.expires > Date.now()) return cached;
+  const pending = inboxLoads.get(owner);
+  if (pending?.encrypted === account.encrypted) return pending.promise;
   const loadId = Symbol(owner);
-  const promise: Promise<Context> = (async () => {
-    let inbox;
-    try { inbox = await tickInboxData<RemoteTask>(token); }
+  const promise: Promise<Inbox> = (async () => {
+    let inbox: Inbox;
+    try { inbox = await tickInboxData<RemoteTask>(account.token); }
     catch (error) { throw new CollaborationError(error instanceof TickApiError ? error.message : "收集箱暂时无法读取，请稍后刷新", error instanceof TickApiError && [401, 403].includes(error.status) ? 422 : 502, error instanceof TickApiError ? error.diagnostic : undefined); }
-    const next = { token, ...inbox, encrypted, expires: Date.now() + 15000 };
-    if (contextLoads.get(owner)?.id === loadId) contexts.set(owner, next);
-    return next;
+    if (inboxLoads.get(owner)?.id === loadId) {
+      inboxes.set(owner, { ...inbox, encrypted: account.encrypted, expires: Date.now() + 15000 });
+      const current = contexts.get(owner);
+      if (current?.encrypted === account.encrypted) { delete current.search; delete current.projects; delete current.completed; }
+    }
+    return inbox;
   })();
-  contextLoads.set(owner, { id: loadId, encrypted, promise });
+  inboxLoads.set(owner, { id: loadId, encrypted: account.encrypted, promise });
   try { return await promise; }
-  finally { if (contextLoads.get(owner)?.promise === promise) contextLoads.delete(owner); }
+  finally { if (inboxLoads.get(owner)?.promise === promise) inboxLoads.delete(owner); }
 }
 async function request(owner: string, route: string, init?: RequestInit, missing = false) {
   const account = await context(owner);
-  // Existing workflow links keep their concrete project ID across restarts.
-  // An unknown empty inbox blocks only requests that still need that ID,
-  // not exact linked-task reads/deletes or account-wide absence checks.
-  if (account.projectId === "inbox" && (route.includes("{inbox}") || route.startsWith("/project/inbox/"))) throw new CollaborationError("收集箱为空且滴答未返回具体编号，暂不能分配任务；请先在滴答收集箱添加一项后刷新", 422);
-  const response = await tickFetch(route.replaceAll("{inbox}", encodeURIComponent(account.projectId)), account.token, init);
+  // Exact task/project routes and account-wide searches need only credentials.
+  // Resolve the inbox only for operations whose path still uses its alias.
+  if (route.includes("{inbox}") || route.startsWith("/project/inbox/")) {
+    const inbox = await inboxContext(owner);
+    if (inbox.projectId === "inbox") throw new CollaborationError("收集箱为空且滴答未返回具体编号，暂不能分配任务；请先在滴答收集箱添加一项后刷新", 422);
+    route = route.replaceAll("{inbox}", encodeURIComponent(inbox.projectId)).replace("/project/inbox/", "/project/" + encodeURIComponent(inbox.projectId) + "/");
+  }
+  const response = await tickFetch(route, account.token, init);
   if (missing && response.status === 404) return null;
   if (!response.ok) throw new CollaborationError(response.status === 429 ? "滴答请求较频繁，请稍后重试" : response.status === 401 || response.status === 403 ? "滴答授权不足或已失效，请该成员重新连接" : "滴答操作暂未完成，请稍后继续处理", response.status >= 500 ? 502 : 422);
   if (response.status === 204) return {};
@@ -66,13 +79,11 @@ async function completedTask(owner: string, account: Context, id: string, comple
 export const gateway: Gateway = {
   async members() { return Promise.all((await listRoomMembers()).map(async member => ({ ...member, connected: !!(await getUser(member.id))?.ticktickToken }))); },
   async inbox(owner) {
-    const account = await context(owner, true);
-    return { projectId: account.projectId, tasks: account.tasks };
+    return inboxContext(owner, true);
   },
   async get(owner, id, projectId) {
     if (!validId(id) || (projectId !== undefined && !validId(projectId))) throw new CollaborationError("任务编号无效", 400);
-    const account = await context(owner);
-    const project = projectId || account.projectId;
+    const project = projectId && projectId !== "inbox" ? projectId : (await inboxContext(owner)).projectId;
     const task = await request(owner, `/project/${encodeURIComponent(project)}/task/${encodeURIComponent(id)}`, undefined, true);
     if (task && (task.id !== id || task.projectId !== project)) throw new CollaborationError("滴答返回的任务编号或清单与请求不符", 403);
     return task as RemoteTask | null;
@@ -96,11 +107,14 @@ export const gateway: Gateway = {
     // An uncapped account-wide result exhausts unfinished tasks. Only a full
     // page needs per-project fallback before querying completed history.
     if (unfinished.length < 200) return completed || await completedTask(owner, account, id, completedAfter);
-    account.projects ||= request(owner, "/project").then(data => {
+    account.projects ||= request(owner, "/project").then(async data => {
       if (!Array.isArray(data) || data.some(project => !project || typeof project.id !== "string" || !validId(project.id))) throw new CollaborationError("滴答清单列表不完整，请稍后重试", 502);
-      return [...new Set([account.projectId, ...data.map(project => project.id as string)])];
+      // A capped search can omit a task moved into the inbox, which may not
+      // appear in /project. Resolve that location only for this fallback.
+      const inbox = await inboxContext(owner);
+      return [...new Set([inbox.projectId, ...data.map(project => project.id as string)])];
     });
-    const projects = (await account.projects).filter(project => project !== (projectId || account.projectId) && project !== "inbox");
+    const projects = (await account.projects).filter(project => project !== (projectId || "inbox") && project !== "inbox");
     for (let index = 0; index < projects.length; index += 3) {
       const tasks = await Promise.all(projects.slice(index, index + 3).map(project => gateway.get(owner, id, project)));
       const open = tasks.find(task => task && !task.status); if (open) return open;
@@ -111,8 +125,8 @@ export const gateway: Gateway = {
   async create(owner, id, fields, receipt) {
     const existing = await gateway.get(owner, id);
     if (existing) { if (existing.status || !sameFields(existing, fields)) throw new CollaborationError(verificationIssue(existing, fields)); return; }
-    const account = await context(owner);
-    const data = await request(owner, "/task/batch", { method: "POST", body: JSON.stringify({ add: [{ ...payload(fields), id, projectId: account.projectId }] }) });
+    const inbox = await inboxContext(owner);
+    const data = await request(owner, "/task/batch", { method: "POST", body: JSON.stringify({ add: [{ ...payload(fields), id, projectId: inbox.projectId }] }) });
     if (data?.id2error?.[id] && data.id2error[id] !== "EXISTED") throw new CollaborationError("接收方未接受任务，请检查授权或账户配额", 422);
     // A batch add may allocate its own ID. The response, not the proposed ID,
     // identifies the task that was actually created.
@@ -124,12 +138,12 @@ export const gateway: Gateway = {
     if (!created || created.status || !sameFields(created, fields)) throw new CollaborationError(verificationIssue(created, fields));
   },
   async update(owner, id, fields, version, projectId) {
-    const account = await context(owner), existing = await gateway.get(owner, id, projectId);
+    const existing = await gateway.get(owner, id, projectId);
     if (!existing) throw new CollaborationError("任务不存在");
     if (remoteVersion(existing) !== version) throw new CollaborationError("任务刚被修改，请刷新后重新编辑");
     // Keep provider-specific task fields while updating only the editor's supported values.
-    await request(owner, `/task/${encodeURIComponent(id)}`, { method: "POST", body: JSON.stringify({ ...existing, ...payload(fields), id, projectId: projectId || account.projectId }) });
-    const saved = await gateway.get(owner, id, projectId);
+    await request(owner, `/task/${encodeURIComponent(id)}`, { method: "POST", body: JSON.stringify({ ...existing, ...payload(fields), id, projectId: existing.projectId }) });
+    const saved = await gateway.get(owner, id, existing.projectId);
     if (!saved || !sameFields(saved, fields)) throw new CollaborationError("关联任务的修改正在自动同步");
   },
   async remove(owner, id, projectId) {
