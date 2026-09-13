@@ -9,7 +9,8 @@ import { attachmentDisplayText } from "./task-description-attachments";
 import { TaskNoticeDot } from "./TaskNoticeDot";
 import { silentWorkflowEvent, workflowEventLabels, type TaskNotice } from "./collaboration-notifications";
 import type { ClaimWorkflow, CollaborationCommand, CollaborationSnapshot, ExecutionCommand, RoomTask, WorkflowCommand, WorkflowFile } from "./collaboration-types";
-import { executionEligible, executionIds, executionReserved, isExecuting, toggleExecution, workflowGroups, workflowLabel } from './workflow-execution';
+import { executionReserved, isExecuting, workflowGroups, workflowLabel } from './workflow-execution';
+import { ExecutionPlanner } from './ExecutionPlanner';
 import { clipboardFiles } from './cloud-drive-actions';
 import { insertAttachmentPlaceholders, pastedAttachmentName } from './task-attachment-labels';
 import { readTaskResponse, taskErrorMessage } from './task-request';
@@ -22,20 +23,7 @@ export function ClaimWorkflows({ snapshot, initialId, task, busy, error, perform
   const [selected, setSelected] = useState(initialId);
   const [taskSelected, setTaskSelected] = useState(!!task);
   const [archived, setArchived] = useState(false);
-  const [executionDraft, setExecutionDraft] = useState<{ ids: string[]; version: number } | null>(null);
-  const [limitWarning, setLimitWarning] = useState(0);
-  useEffect(() => { if (!limitWarning) return; const timer = setTimeout(() => setLimitWarning(0), 2200); return () => clearTimeout(timer); }, [limitWarning]);
-  async function arrange() {
-    if (!executionDraft) { setExecutionDraft({ ids: executionIds(snapshot.workflows, snapshot.identityId), version: snapshot.executionVersion || 0 }); return; }
-    await perform({ id: crypto.randomUUID(), action: 'arrange-execution', version: executionDraft.version, workflowIds: executionDraft.ids });
-    setExecutionDraft(null);
-  }
-  function toggle(id: string) {
-    if (!executionDraft) return;
-    const ids = toggleExecution(executionDraft.ids, id);
-    if (ids === executionDraft.ids) { setLimitWarning(Date.now()); return; }
-    setExecutionDraft({ ...executionDraft, ids });
-  }
+  const [arranging, setArranging] = useState(false);
   const retryRequest = useRef(retryUncertain);
   useEffect(() => { retryRequest.current = retryUncertain; }, [retryUncertain]);
   const uncertain = !!retryUncertain;
@@ -49,28 +37,26 @@ export function ClaimWorkflows({ snapshot, initialId, task, busy, error, perform
   const unclaimed = taskSelected && !workflow ? task : undefined;
   const back = () => { setSelected(null); setTaskSelected(false); };
   const name = (id: string) => snapshot.members.find(member => member.id === id)?.name || "成员";
-  return <dialog ref={dialog} className="coop-workflows" aria-label="认领工作流程" onCancel={event => { event.preventDefault(); if (!busy) { if (executionDraft) setExecutionDraft(null); else onClose(); } }} onKeyDown={event => event.stopPropagation()}>
-    <header><div className="coop-workflow-title-actions"><h3><ClipboardCheck size={20} />{archived ? "已归档" : "工作流程"}</h3>{!workflow && !unclaimed && !archived && <button type="button" className="coop-nudge" disabled={busy || uncertain} onClick={() => void arrange()}>{executionDraft ? '保存' : '安排执行'}</button>}</div><button className="coop-icon" type="button" aria-label="关闭工作流程" disabled={busy} onClick={onClose}><X size={20} /></button></header>
+  return <dialog ref={dialog} className="coop-workflows" aria-label="认领工作流程" onCancel={event => { event.preventDefault(); if (!busy && !arranging) onClose(); }} onKeyDown={event => event.stopPropagation()}>
+    <header><div className="coop-workflow-title-actions"><h3><ClipboardCheck size={20} />{archived ? "已归档" : "工作流程"}</h3>{!workflow && !unclaimed && !archived && <button type="button" className="coop-nudge" disabled={busy || uncertain || arranging} onClick={() => setArranging(true)}>安排执行</button>}</div><button className="coop-icon" type="button" aria-label="关闭工作流程" disabled={busy || arranging} onClick={onClose}><X size={20} /></button></header>
     {retryUncertain && <span className="workflow-sync-spinner" role="status" aria-label="正在确认操作结果" />}
-    {workflow ? <WorkflowDetail key={workflow.id} notices={notices} onRead={onRead} workflow={workflow} identityId={snapshot.identityId} name={name} busy={busy || !!retryUncertain} error={error} perform={perform} back={back} /> : unclaimed ? <UnclaimedTaskDetail key={`${unclaimed.ownerId || "buffer"}:${unclaimed.id}`} task={unclaimed} identityId={snapshot.identityId} name={name} busy={busy || uncertain} error={error} perform={perform} back={back} /> : <WorkflowList notices={notices} onRead={onRead} workflows={snapshot.workflows} archived={archived} setArchived={setArchived} select={setSelected} name={name} identityId={snapshot.identityId} executionDraft={executionDraft?.ids} toggleExecution={toggle} disabled={busy || uncertain} />}
-    {!workflow && !unclaimed && error && <p className="coop-feedback error" role="alert">{taskErrorMessage(error)}</p>}
-    {!!limitWarning && <div className="coop-toast coop-execution-limit" role="status">执行中任务最多3个</div>}
+    {workflow ? <WorkflowDetail key={workflow.id} notices={notices} onRead={onRead} workflow={workflow} identityId={snapshot.identityId} name={name} busy={busy || !!retryUncertain} error={error} perform={perform} back={back} /> : unclaimed ? <UnclaimedTaskDetail key={`${unclaimed.ownerId || "buffer"}:${unclaimed.id}`} task={unclaimed} identityId={snapshot.identityId} name={name} busy={busy || uncertain} error={error} perform={perform} back={back} /> : <WorkflowList notices={notices} onRead={onRead} workflows={snapshot.workflows} archived={archived} setArchived={setArchived} select={setSelected} name={name} identityId={snapshot.identityId} disabled={busy || uncertain || arranging} />}
+    {!workflow && !unclaimed && !arranging && error && <p className="coop-feedback error" role="alert">{taskErrorMessage(error)}</p>}
+    {arranging && <ExecutionPlanner snapshot={snapshot} notices={notices} name={name} busy={busy} uncertain={uncertain} error={error} perform={perform} onClose={() => setArranging(false)} />}
   </dialog>;
 }
-export function WorkflowList({ workflows, archived, setArchived, select, name, notices = [], identityId = '', executionDraft, toggleExecution, disabled = false }: { notices?: TaskNotice[]; onRead?: (ids: string[]) => void; workflows: ClaimWorkflow[]; archived: boolean; setArchived: (value: boolean) => void; select: (id: string) => void; name: (id: string) => string; identityId?: string; executionDraft?: string[]; toggleExecution?: (id: string) => void; disabled?: boolean }) {
+export function WorkflowList({ workflows, archived, setArchived, select, name, notices = [], identityId, disabled = false }: { notices?: TaskNotice[]; onRead?: (ids: string[]) => void; workflows: ClaimWorkflow[]; archived: boolean; setArchived: (value: boolean) => void; select: (id: string) => void; name: (id: string) => string; identityId: string; disabled?: boolean }) {
   const unread = (id: string) => notices.filter(item => item.workflowId === id).map(item => item.id);
   const archiveUnread = workflows.filter(item => ["done", "deleted"].includes(item.status)).reduce((count, item) => count + unread(item.id).length, 0);
-  const editing = executionDraft !== undefined;
   const archivedItems = workflows.filter(item => ['done', 'deleted'].includes(item.status)).sort((a, b) => Number(unread(b.id).length > 0) - Number(unread(a.id).length > 0) || b.updatedAt - a.updatedAt);
-  const checked = (item: ClaimWorkflow) => item.claimantId === identityId ? !!executionDraft?.includes(item.id) : isExecuting(item) || executionReserved(item);
-  const card = (item: ClaimWorkflow) => <button type="button" className="coop-workflow-card" key={item.id} role={editing ? 'checkbox' : undefined} aria-checked={editing ? checked(item) : undefined} disabled={disabled || (editing && (item.claimantId !== identityId || !executionEligible(item)))} onClick={() => editing ? toggleExecution?.(item.id) : select(item.id)}>
+  const card = (item: ClaimWorkflow) => <button type="button" className="coop-workflow-card" key={item.id} disabled={disabled} onClick={() => select(item.id)}>
     <span><strong><TaskNoticeDot ids={unread(item.id)} />{item.title}</strong><small>{name(item.claimantId)} 认领 · {name(item.reviewerId)} 审批</small></span>
-    {editing ? <span className="coop-complete coop-execution-checkbox" aria-hidden="true">{checked(item) && <Check size={16} />}</span> : unread(item.id).length ? <span className="coop-workflow-status has-update">有更新</span> : archived ? <span className={`coop-workflow-status ${item.status}`}>{workflowLabel(item)}</span> : null}
+    <span className="coop-workflow-actions">{!archived && executionReserved(item) && <span className={`coop-workflow-status ${item.status}`}>待审批</span>}{unread(item.id).length ? <span className="coop-workflow-status has-update">有更新</span> : archived ? <span className={`coop-workflow-status ${item.status}`}>{workflowLabel(item)}</span> : null}</span>
   </button>;
   return <>
-    <div className="coop-workflow-navigation"><button type="button" className="coop-workflow-back" disabled={editing || disabled} onClick={() => setArchived(!archived)}>{archived ? <><ArrowLeft size={15} />未完成流程</> : <><Archive size={15} />已归档 <span>{archivedItems.length}</span>{archiveUnread > 0 && <span className="task-notice-count" aria-label={`${archiveUnread} 条归档新记录`}>{archiveUnread}</span>}</>}</button></div>
+    <div className="coop-workflow-navigation"><button type="button" className="coop-workflow-back" disabled={disabled} onClick={() => setArchived(!archived)}>{archived ? <><ArrowLeft size={15} />未完成流程</> : <><Archive size={15} />已归档 <span>{archivedItems.length}</span>{archiveUnread > 0 && <span className="task-notice-count" aria-label={`${archiveUnread} 条归档新记录`}>{archiveUnread}</span>}</>}</button></div>
     <div className="coop-workflow-list">
-      {archived ? archivedItems.length ? archivedItems.map(card) : <p className="coop-empty">暂无归档任务</p> : workflowGroups(workflows).filter(group => group.title === '进行中' || group.workflows.length).map(group => <section className="coop-workflow-group" key={group.title} aria-label={group.title}><h4>{group.title}<span>{group.workflows.length}</span></h4>{group.workflows.map(card)}</section>)}
+      {archived ? archivedItems.length ? archivedItems.map(card) : <p className="coop-empty">暂无归档任务</p> : workflowGroups(workflows, identityId).map(group => <section className="coop-workflow-group" key={group.title} aria-label={group.title}><h4>{group.title}<span>{group.workflows.length}</span></h4>{group.workflows.map(card)}</section>)}
     </div>
   </>;
 }
