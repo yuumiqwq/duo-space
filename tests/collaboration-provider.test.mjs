@@ -53,11 +53,42 @@ test('single-date edits preserve the selected field and a partial write cannot c
     }
     omitDate = true;
     const fields = taskFields({ title: task.title, priority: 5, startDate: date }), before = remoteVersion(task);
-    await assert.rejects(gateway.update('alice', task.id, fields, before, task.projectId), /正在自动同步/);
+    await assert.rejects(gateway.update('alice', task.id, fields, before, task.projectId), error => {
+      assert.match(error.message, /正在自动同步/);
+      const trace = JSON.parse(error.diagnostic);
+      assert.equal(trace.stage, 'read-back'); assert.equal(trace.expectedVersion, before);
+      assert.equal(trace.requested.startDate, date); assert.equal(trace.response.startDate, null); assert.equal(trace.readBack.startDate, null);
+      assert.equal(trace.response.priority, 5); assert.equal(trace.readBack.priority, 5);
+      assert.ok(!error.diagnostic.includes('token-alice')); assert.ok(!error.diagnostic.includes('日期核对'));
+      return true;
+    });
     assert.equal(task.priority, 5); assert.equal(task.startDate, null);
     const count = writes;
     await assert.rejects(gateway.update('alice', task.id, fields, before, task.projectId), /刚被修改/);
     assert.equal(writes, count, 'readback mismatch must not silently reset the saved version');
+  });
+});
+
+test('write diagnostics distinguish rejected HTTP writes from successful responses with stale readback', async () => {
+  await providerFixture(async gateway => {
+    const task = { id: 'write-diagnostic', projectId: 'saved-list', ...taskFields({ title: 'private title', content: 'private body' }) };
+    const fields = taskFields({ ...task, priority: 5 }); let fail = true, writes = 0, reads = 0;
+    globalThis.fetch = async (url, init) => {
+      if (init.method === 'POST') { writes++; return fail ? new Response('private provider body', { status: 400 }) : Response.json({ ...fields, ...task, priority: 5 }); }
+      reads++; return Response.json(task);
+    };
+    await assert.rejects(gateway.update('alice', task.id, fields, remoteVersion(task), task.projectId, task), error => {
+      const trace = JSON.parse(error.diagnostic);
+      assert.equal(trace.stage, 'write'); assert.equal(JSON.parse(trace.requestFailure).status, 400);
+      assert.equal(trace.readBack, undefined); assert.ok(!error.diagnostic.includes('private')); return true;
+    });
+    assert.equal(reads, 0, 'reuse the version-checked snapshot from main');
+    fail = false;
+    await assert.rejects(gateway.update('alice', task.id, fields, remoteVersion(task), task.projectId, task), error => {
+      const trace = JSON.parse(error.diagnostic);
+      assert.equal(trace.stage, 'read-back'); assert.equal(trace.response.priority, 5); assert.equal(trace.readBack.priority, 0); return true;
+    });
+    assert.equal(writes, 2); assert.equal(reads, 1, 'only one readback after each acknowledged write');
   });
 });
 

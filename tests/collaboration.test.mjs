@@ -1201,7 +1201,84 @@ test('explicit new settings can resolve a detail sync conflict while stale reque
   w = await act(f, w, 'bob', 'retry-workflow'); assert.equal(w.editPending, true); assert.match(w.error, /同步期间被修改/);
   w = await act(f, w, 'bob', 'update-workflow', { fields: { content: '核对后的修改' } }); assert.equal(w.editPending, false);
   assert.equal(f.accounts.alice.get(task.id).content, '核对后的修改'); assert.equal(f.accounts.bob.get(w.targetId).content, '核对后的修改');
-  assert.ok(w.events.some(event => event.type === 'update-replaced'));
+  assert.deepEqual(w.events.filter(event => event.type === 'updated').map(event => event.comment), ['说明：无 → 第一次修改', '说明：第一次修改 → 核对后的修改']);
+});
+
+test('edit history survives failures, restart and retry while diagnostics retain the first failed attempt', async () => {
+  const f = await fixture(), task = await personal(f, { content: 'private task body' });
+  let w = await claim(f, task); const update = f.gateway.update;
+  let attempts = 0;
+  f.gateway.update = async () => { throw new CollaborationError(`write failed ${++attempts}`, 502, JSON.stringify({ stage: 'write', status: 503 })); };
+  w = await act(f, w, 'alice', 'update-workflow', { fields: { startDate: '2026-09-12T16:00:00.000Z' } });
+  const firstHistory = structuredClone(w.events), incident = w.syncIssue.id;
+  assert.equal(w.syncIssue.recipientId, 'alice');
+  assert.equal(w.events.at(-1).type, 'updated'); assert.match(w.events.at(-1).comment, /开始时间：无 →/);
+  assert.equal((await f.store.revision('alice')).notices.filter(item => item.kind === 'sync-error').length, 1);
+  f.store = new CollaborationStore(f.dir, f.gateway);
+  for (let i = 0; i < 7; i++) {
+    w = await act(f, w, 'bob', 'retry-workflow');
+    assert.equal(w.syncIssue.id, incident); assert.equal(w.syncIssue.recipientId, 'alice');
+    assert.deepEqual(w.events, firstHistory);
+  }
+  const report = await f.store.inspectWorkflowSync('alice', w.id);
+  assert.equal(report.attempts.length, 6); assert.equal(report.attempts[0].error, 'write failed 1');
+  assert.equal(report.attempts.at(-1).error, 'write failed 8');
+  assert.equal(report.attempts.at(-1).stage, 'write-linked-task');
+  assert.equal(report.attempts[0].requested.startDate, '2026-09-12T16:00:00.000Z');
+  assert.equal(report.attempts[0].requested.dueDate, null);
+  assert.equal(report.attempts.at(-1).target.expectedVersion, report.attempts.at(-1).target.observedVersion);
+  assert.ok(!JSON.stringify(report).includes('private task body'));
+  const pushed = []; f.gateway.notify = async notice => pushed.push(notice);
+  await f.store.deliverNotices(); await f.store.deliverNotices();
+  assert.equal(pushed.filter(item => item.kind === 'sync-error').length, 1);
+  f.gateway.update = update;
+  w = await act(f, w, 'bob', 'retry-workflow');
+  assert.deepEqual(w.events, firstHistory); assert.equal(w.editPending, false); assert.equal(w.syncIssue, undefined);
+  assert.equal((await f.store.revision('alice')).notices.filter(item => item.kind === 'sync-error').length, 0);
+  f.gateway.update = async () => { throw new Error('new incident'); };
+  w = await act(f, w, 'alice', 'update-workflow', { fields: { priority: 5 } });
+  assert.notEqual(w.syncIssue.id, incident);
+  f.gateway.update = update;
+  w = await act(f, w, 'alice', 'retry-workflow');
+  await f.store.deliverNotices();
+  assert.equal(pushed.filter(item => item.kind === 'sync-error').length, 1, 'resolved before delivery must not send a stale push');
+});
+
+test('targeted diagnostics are member-only local reads and recover only the matching stored edit summary', async () => {
+  const f = await fixture(), task = await personal(f); let w = await claim(f, task);
+  f.gateway.update = async () => { throw new Error('offline'); };
+  w = await act(f, w, 'alice', 'update-workflow', { fields: { priority: 5 } });
+  const file = path.join(f.dir, 'room-collaboration.json'), state = JSON.parse(await readFile(file, 'utf8'));
+  const stored = state.workflows[w.id], edit = stored.events.at(-1), summary = edit.comment;
+  stored.events.push({ id: randomUUID(), actorId: 'alice', type: 'update-replaced', at: 1, comment: '此修改由后续详情设置替代', files: [] });
+  edit.type = 'updating'; edit.comment = '已保存详情修改，正在同步关联任务';
+  await writeFile(file, JSON.stringify(state));
+  const before = await readFile(file, 'utf8');
+  for (const method of ['inbox', 'get', 'locate', 'update']) f.gateway[method] = async () => { throw new Error('unexpected remote I/O'); };
+  f.store = new CollaborationStore(f.dir, f.gateway);
+  await assert.rejects(f.store.inspectWorkflowSync('outsider', w.id), { status: 403 });
+  await assert.rejects(f.store.inspectWorkflowSync('alice', '../invalid'), { status: 400 });
+  await assert.rejects(f.store.inspectWorkflowSync('alice', randomUUID()), { status: 404 });
+  const report = await f.store.inspectWorkflowSync('bob', w.id);
+  assert.equal(report.workflowId, w.id); assert.equal(report.requested.priority, 5);
+  assert.equal(report.workflows, undefined); assert.equal(report.events, undefined);
+  const snapshot = await f.store.snapshot('alice', null), migrated = snapshot.workflows.find(item => item.id === w.id);
+  assert.equal(migrated.events.find(item => item.id === edit.id).comment, summary);
+  assert.equal(migrated.events.at(-1).comment, '');
+  assert.equal(await readFile(file, 'utf8'), before, 'diagnostic and local snapshot do not mutate state');
+});
+
+test('concurrent failed edits retain independent incidents without replacing another workflow or blocking website submission', async () => {
+  const f = await fixture(), one = await f.create('one'), two = await f.create('two');
+  const a = await claim(f, one), b = await claim(f, two);
+  f.gateway.update = async () => { await new Promise(resolve => setTimeout(resolve, 10)); throw new Error('offline'); };
+  const [x, y] = await Promise.all([act(f, a, 'alice', 'update-workflow', { fields: { priority: 5 } }), act(f, b, 'bob', 'update-workflow', { fields: { priority: 1 } })]);
+  assert.notEqual(x.syncIssue.id, y.syncIssue.id);
+  const snapshot = await f.store.snapshot('alice', null);
+  assert.equal(snapshot.workflows.filter(item => item.syncIssue).length, 2);
+  const submitted = await act(f, x, 'bob', 'submit');
+  assert.equal(submitted.status, 'submitted'); assert.equal(submitted.syncIssue.id, x.syncIssue.id);
+  assert.equal(submitted.syncIssue.recipientId, 'alice');
 });
 
 test('explicit rejection requires a new submission and external claimant completion still reopens', async () => {

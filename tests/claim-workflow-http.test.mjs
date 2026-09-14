@@ -46,6 +46,13 @@ test('claim workflow HTTP covers actual routes, sidebar guard, file streaming, r
     const before = await (await call('alice')).json(), sourceTask = before.members.find(member => member.id === 'alice').tasks[0];
     const claim = { id: randomUUID(), action: 'claim', source: { ownerId: 'alice', taskId: sourceTask.id, version: sourceTask.version }, destination: 'bob' };
     let response = await call('bob', '/api/room/tasks', claim); assert.equal(response.status, 200); let w = (await response.json()).workflow; assert.equal(w.status, 'working');
+    const diagnosticUrl = `/api/room/tasks?workflow-diagnostic=${w.id}`;
+    assert.equal((await call('unknown', diagnosticUrl)).status, 401);
+    assert.equal((await call('alice', '/api/room/tasks?workflow-diagnostic=invalid')).status, 400);
+    const diagnostic = await call('alice', diagnosticUrl);
+    assert.equal(diagnostic.status, 200); assert.match(diagnostic.headers.get('cache-control'), /no-store/);
+    const report = await diagnostic.json(); assert.equal(report.workflowId, w.id); assert.deepEqual(report.attempts, []);
+    assert.equal(report.requested.content, undefined); assert.equal(report.workflows, undefined);
     const arrangeCurrent = async () => {
       const snapshot = await (await call('bob', '/api/room/tasks?local=1')).json();
       const response = await call('bob', '/api/room/tasks', { id: randomUUID(), action: 'arrange-execution', version: snapshot.executionVersion, workflowIds: [w.id] });

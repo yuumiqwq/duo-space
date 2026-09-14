@@ -3,6 +3,7 @@ import { decryptToken } from "../../ticktick/crypto";
 import { tickFetch, tickInboxData, resolveTickInbox, TickApiError } from "../../ticktick/client";
 import { CollaborationError, remoteVersion, sameFields, verificationIssue, type Gateway, type RemoteTask } from "./store";
 import type { TaskFields } from "../../../collaboration-types";
+import { taskSyncEvidence } from './sync-diagnostics';
 
 type Context = { token: string; encrypted: string; expires: number; search?: Promise<RemoteTask[]>; projects?: Promise<string[]>; completed?: Map<string, Promise<RemoteTask[]>> };
 type Inbox = { projectId: string; tasks: RemoteTask[] };
@@ -57,7 +58,7 @@ async function request(owner: string, route: string, init?: RequestInit, missing
   try { response = await tickFetch(route, account.token, init); }
   finally { if (mutation) invalidate(); }
   if (missing && response.status === 404) return null;
-  if (!response.ok) throw new CollaborationError(response.status === 429 ? "滴答请求较频繁，请稍后重试" : response.status === 401 || response.status === 403 ? "滴答授权不足或已失效，请该成员重新连接" : "滴答操作暂未完成，请稍后继续处理", response.status >= 500 ? 502 : 422);
+  if (!response.ok) throw new CollaborationError(response.status === 429 ? "滴答请求较频繁，请稍后重试" : response.status === 401 || response.status === 403 ? "滴答授权不足或已失效，请该成员重新连接" : "滴答操作暂未完成，请稍后继续处理", response.status >= 500 ? 502 : 422, JSON.stringify({ path: route, method: init?.method || 'GET', status: response.status }));
   if (response.status === 204) return {};
   const text = await response.text();
   if (!text && init?.method && init.method !== "GET") return {};
@@ -150,15 +151,26 @@ export const gateway: Gateway = {
     return created;
   },
   async update(owner, id, fields, version, projectId, before) {
-    const existing = before || await gateway.get(owner, id, projectId);
-    if (!existing) throw new CollaborationError("任务不存在");
-    if (existing.id !== id || (projectId && existing.projectId !== projectId)) throw new CollaborationError('任务编号无效', 400);
-    if (remoteVersion(existing) !== version) throw new CollaborationError("任务刚被修改，请刷新后重新编辑");
-    // Keep provider-specific task fields while updating only the editor's supported values.
-    await request(owner, `/task/${encodeURIComponent(id)}`, { method: "POST", body: JSON.stringify({ ...existing, ...payload(fields), id, projectId: existing.projectId }) });
-    const saved = await gateway.get(owner, id, existing.projectId);
-    if (!saved || !sameFields(saved, fields)) throw new CollaborationError("关联任务的修改正在自动同步");
-    return saved;
+    const trace: Record<string, unknown> = { stage: 'read-before-write', requested: taskSyncEvidence(fields), expectedVersion: version };
+    try {
+      const existing = before || await gateway.get(owner, id, projectId);
+      trace.before = taskSyncEvidence(existing);
+      if (!existing) throw new CollaborationError("任务不存在");
+      if (existing.id !== id || (projectId && existing.projectId !== projectId)) throw new CollaborationError('任务编号无效', 400);
+      if (remoteVersion(existing) !== version) throw new CollaborationError("任务刚被修改，请刷新后重新编辑");
+      // Keep provider-specific task fields while updating only the editor's supported values.
+      trace.stage = 'write';
+      const response = await request(owner, `/task/${encodeURIComponent(id)}`, { method: "POST", body: JSON.stringify({ ...existing, ...payload(fields), id, projectId: existing.projectId }) });
+      trace.response = taskSyncEvidence(response); trace.stage = 'read-back';
+      const saved = await gateway.get(owner, id, existing.projectId);
+      trace.readBack = taskSyncEvidence(saved);
+      if (!saved || !sameFields(saved, fields)) throw new CollaborationError("关联任务的修改正在自动同步");
+      return saved;
+    } catch (error) {
+      if (error instanceof CollaborationError && error.diagnostic) trace.requestFailure = error.diagnostic;
+      throw new CollaborationError(error instanceof Error ? error.message : "关联任务的修改正在自动同步", error instanceof CollaborationError ? error.status : 502, JSON.stringify(trace));
+    }
+
   },
   async remove(owner, id, projectId) {
     if (!validId(id) || (projectId !== undefined && !validId(projectId))) throw new CollaborationError("任务编号无效", 400);

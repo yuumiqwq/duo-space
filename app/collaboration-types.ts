@@ -8,6 +8,7 @@ export type CollaborationMember = { id: string; name: string; connected: boolean
 export type OperationView = { id: string; actorId: string; title: string; action: string; from: string | null; to: string | null; status: "pending" | "done" | "cancelled"; error: string; createdAt?: number; updatedAt: number };
 export type WorkflowFile = { id: string; name: string; size: number; url: string };
 export type WorkflowEvent = { id: string; actorId: string; type: string; at: number; comment: string; files: WorkflowFile[]; signature?: string; replyTo?: string };
+export type WorkflowSyncIssue = { id: string; at: number; message: string; recipientId: string };
 export type ClaimWorkflow = {
   id: string; title: string; source: TaskSource; reviewerId: string; claimantId: string;
   targetId: string; reviewerTaskId?: string; fields: TaskFields;
@@ -18,6 +19,7 @@ export type ClaimWorkflow = {
   ownerDeletePending?: boolean;
   taskAnomaly?: boolean;
   syncError?: string;
+  syncIssue?: WorkflowSyncIssue;
   reopenPending?: boolean;
   needsSubmission?: boolean;
 };

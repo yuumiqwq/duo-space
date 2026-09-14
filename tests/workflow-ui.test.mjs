@@ -32,6 +32,7 @@ test('workflow detail offers settings to every member and direct completion only
       assert.match(failedEdit, /role="alert">关联任务在同步期间被修改/);
       assert.ok(!failedEdit.includes('aria-label="正在同步任务"'), 'a failed edit must not look like an active request');
       assert.ok(failedEdit.includes('>重试同步</button>'), 'retry is available without saving another edit');
+      assert.ok(failedEdit.includes('>复制错误报告</button>'));
       assert.equal(failedEdit.includes('>提交完成</button>'), member === 'bob');
     }
     delete workflow[failure];
@@ -82,6 +83,14 @@ test('workflow detail offers settings to every member and direct completion only
   const history = render('alice', 'done');
   assert.ok(!history.includes('安排认领')); assert.ok(!history.includes('完成同步')); assert.ok(!history.includes('不可显示的后台完成说明'));
   assert.ok(history.includes('bob · 认领')); assert.ok(history.includes('提交完成')); assert.ok(history.includes('审批通过'));
+  workflow.events.push({ id: 'old-edit', actorId: 'alice', type: 'update-replaced', at: 1700000000000, comment: '此修改由后续详情设置替代', files: [] });
+  workflow.events.push({ id: 'new-edit', actorId: 'alice', type: 'updated', at: 1700000000001, comment: '优先级：无 → 高', files: [] });
+  workflow.error = '写入失败示例'; workflow.syncIssue = { id: 'error', message: workflow.error, at: 1, recipientId: 'alice' };
+  const separated = render('alice', 'working', true), timeline = separated.match(/<ol class="coop-workflow-events">[\s\S]*?<\/ol>/)[0];
+  assert.ok(timeline.includes('优先级：无 → 高'));
+  for (const text of ['详情修改已替代', '此修改由后续详情设置替代', '旧记录未保存具体修改内容', '写入失败示例']) assert.ok(!timeline.includes(text));
+  assert.ok(separated.indexOf('写入失败示例') > separated.indexOf('</ol>'));
+  delete workflow.error; delete workflow.syncIssue;
   assert.ok(render('bob').includes('aria-label="删除任务"')); assert.ok(render('alice').includes('aria-label="删除任务"'));
   assert.ok(render('alice').includes('>催办</button>')); assert.ok(!render('bob').includes('>催办</button>'));
   workflow.fields.content = '前文 [附件：报告.pdf](https://study.11scat.xyz/task-attachment?path=tasks%2Fa%2Fb.pdf) 后文';

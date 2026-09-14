@@ -5,7 +5,8 @@ import { remoteTaskSignatures } from "../../../collaboration-refresh.ts";
 import { workflowSettingChanges } from "../../../workflow-setting-changes.ts";
 import { collaborationDate, collaborationDateAfter } from "../../../collaboration-view.ts";
 import { clearLegacyRecords } from "../../../legacy-record-cleanup.ts";
-import { collectTaskNotices, initializeTaskNotices, receivesTaskNotice, silentWorkflowEvent, unreadTaskNotices, type TaskNotice, type TaskNoticeState } from "../../../collaboration-notifications.ts";
+import { activeTaskNotice, collectTaskNotices, initializeTaskNotices, receivesTaskNotice, silentWorkflowEvent, unreadTaskNotices, workflowEventPresentation, type TaskNotice, type TaskNoticeState } from "../../../collaboration-notifications.ts";
+import { appendSyncAttempt, taskSyncEvidence, type SyncAttempt } from './sync-diagnostics.ts';
 import type { ClaimWorkflow, WorkflowCommand, WorkflowFile, CollaborationCommand, CollaborationSnapshot, ExecutionCommand, OperationView, RoomTask, TaskFields, TaskSource } from "../../../collaboration-types";
 import { EXECUTION_LIMIT, executionEligible, executionReserved, isExecuting } from '../../../workflow-execution.ts';
 import { descriptionAttachments } from "../../../task-description-attachments.ts";
@@ -30,7 +31,7 @@ export type Gateway = {
 type BufferTask = { fields: TaskFields; version: number; stagedBy?: string; publisherId?: string; publishedAt?: number; completedAt?: number };
 type Creation = { state: "new" | "sent" | "received"; beforeIds?: string[] };
 type AttachmentChange = { actor: string; before: string; after: string; publishBefore?: string };
-type WorkflowEdit = { id: string; fields: TaskFields; attachments?: AttachmentChange; summary?: string; targets?: { owner: string; id: string; before: string; done: boolean }[] };
+type WorkflowEdit = { id: string; fields: TaskFields; attachments?: AttachmentChange; summary?: string; diagnostics?: SyncAttempt[]; targets?: { owner: string; id: string; before: string; done: boolean }[] };
 type WorkflowSide = "source" | "target";
 type WorkflowDeletion = { id: string; done?: WorkflowSide[]; acknowledged?: Partial<Record<WorkflowSide, { id: string; projectId: string }>> };
 type ReviewDecision = { comment: string; files: WorkflowFile[] };
@@ -173,6 +174,7 @@ export class CollaborationStore {
       for (const workflow of Object.values(state.workflows) as Workflow[]) {
         // Initialize existing claims once. Pending submissions retain their
         // execution slot and review history; ordinary claims start unarranged.
+        workflow.events = workflow.events.map(event => workflowEventPresentation(event, event.id === workflow.edit?.id ? workflow.edit?.summary : undefined));
         // Public tasks without a claimant have no workflow and are untouched.
         workflow.executing ??= !isPersonalCollection(workflow) && !workflow.ownerDeletion && (workflow.status === 'submitted' || (workflow.status === 'approving' && workflow.events.some(event => event.type === 'submit')));
         const deleting = workflow.ownerDeletion && workflow.events.some(event => event.id === workflow.ownerDeletion?.id && event.type === 'task-delete-requested');
@@ -197,6 +199,18 @@ export class CollaborationStore {
       const latest = await this.read();
       const merged = mergeStateChanges(before, state, latest);
       merged.revision = latest.revision + Math.max(0, state.revision - before.revision);
+      for (const workflow of Object.values(merged.workflows)) {
+        const message = workflow.syncError || workflow.error;
+        if (message && message !== '该任务已被删除' && !isPersonalCollection(workflow)) {
+          if (!workflow.syncIssue) {
+            const actor = workflow.events.find(event => event.id === workflow.edit?.id)?.actorId || workflow.completionRequest?.actor || workflow.events.findLast(event => event.actorId)?.actorId || workflow.reviewerId;
+            workflow.syncIssue = { id: randomUUID(), message, at: Date.now(), recipientId: actor };
+          } else workflow.syncIssue.message = message;
+        } else if (workflow.syncIssue) {
+          delete workflow.syncIssue;
+          const notices = initializeTaskNotices(merged); notices.version = (notices.version || 0) + 1;
+        }
+      }
       collectTaskNotices(merged);
       await mkdir(path.dirname(this.file), { recursive: true, mode: 0o700 });
       const temp = this.file + '.' + randomUUID() + '.tmp';
@@ -208,6 +222,11 @@ export class CollaborationStore {
         }
       } finally { await unlink(temp).catch(() => undefined); }
       state.revision = merged.revision;
+      // Carry generated incident identities into subsequent saves of this command.
+      for (const [id, workflow] of Object.entries(state.workflows)) {
+        if (merged.workflows[id]?.syncIssue) workflow.syncIssue = structuredClone(merged.workflows[id].syncIssue);
+        else delete workflow.syncIssue;
+      }
       this.baselines.set(state, structuredClone(state));
     });
     this.writes = commit.catch(() => undefined); return commit;
@@ -220,6 +239,7 @@ export class CollaborationStore {
     for (const key of keys) this.queues.set(key, pending);
     void pending.finally(() => { for (const key of keys) if (this.queues.get(key) === pending) this.queues.delete(key); });
     return result;
+
   }
   private async source(state: State, source: TaskSource): Promise<{ fields: TaskFields; version: string; remote?: RemoteTask } | null> {
     if (source.ownerId === null) { const task = Object.hasOwn(state.buffer, source.taskId) ? state.buffer[source.taskId] : null; return task && !task.completedAt ? { fields: task.fields, version: String(task.version) } : null; }
@@ -339,13 +359,29 @@ export class CollaborationStore {
     if (!this.gateway.notify) return;
     const items = await this.serial(async () => {
       const state = await this.read(), notices = initializeTaskNotices(state), sent = new Set(notices.attempted);
-      const pending = notices.entries.filter(item => !sent.has(item.id) && !silentWorkflowEvent(item.eventType)).slice(0, 40);
+      const pending = notices.entries.filter(item => !sent.has(item.id) && !silentWorkflowEvent(item.eventType) && activeTaskNotice(state, item)).slice(0, 40);
       if (pending.length) { notices.attempted.push(...pending.map(item => item.id)); await this.write(state); }
       return pending;
     });
     // Persist attempt before network I/O: refreshes and lost provider responses
     // do not repeatedly ring phones. The durable in-app unread record remains.
     for (let start = 0; start < items.length; start += 3) await Promise.allSettled(items.slice(start, start + 3).map(item => this.gateway.notify!(item)));
+  }
+  inspectWorkflowSync(actorId: string, id: string) {
+    return this.serial(async () => {
+      await this.requireMember(actorId);
+      if (!/^[a-f0-9-]{36}$/i.test(id)) throw new CollaborationError("流程参数无效", 400);
+      const workflow = (await this.read()).workflows[id];
+      if (!workflow) throw new CollaborationError("流程不存在", 404);
+      return {
+        version: 1, capturedAt: Date.now(), workflowId: id, title: workflow.edit?.fields.title || workflow.title,
+        workflowVersion: workflow.version, status: workflow.status, editPending: !!workflow.edit,
+        error: workflow.error, syncError: workflow.syncError, issue: workflow.syncIssue,
+        editId: workflow.edit?.id, requested: taskSyncEvidence(workflow.edit?.fields || workflow.fields),
+        source: workflow.source, targetId: workflow.targetId,
+        attempts: workflow.edit?.diagnostics || [],
+      };
+    });
   }
   inspectTransfer(actorId: string, id: string) {
     return this.serial(async () => {
@@ -564,8 +600,8 @@ export class CollaborationStore {
     ));
   }
   private publicWorkflow(workflow: Workflow): ClaimWorkflow {
-    const { id, title, source, reviewerId, claimantId, targetId, reviewerTaskId, fields, status, version, createdAt, updatedAt, error, events } = workflow;
-    return { id, title, source, reviewerId, claimantId, targetId, reviewerTaskId, fields: workflow.edit?.fields || fields, status, version, createdAt, updatedAt, error, executing: !!workflow.executing, editPending: !!workflow.edit, ownerDeletePending: !!workflow.ownerDeletion, taskAnomaly: workflow.taskAnomaly, syncError: workflow.syncError, reopenPending: workflow.reopenPending, needsSubmission: workflow.needsSubmission, events: events.map(({ id, actorId, type, at, comment, files, replyTo }) => ({ id, actorId, type, at, comment, files, replyTo })) };
+    const { id, title, source, reviewerId, claimantId, targetId, reviewerTaskId, fields, status, version, createdAt, updatedAt, error, events, syncIssue } = workflow;
+    return { id, title, source, reviewerId, claimantId, targetId, reviewerTaskId, fields: workflow.edit?.fields || fields, status, version, createdAt, updatedAt, error, syncIssue, executing: !!workflow.executing, editPending: !!workflow.edit, ownerDeletePending: !!workflow.ownerDeletion, taskAnomaly: workflow.taskAnomaly, syncError: workflow.syncError, reopenPending: workflow.reopenPending, needsSubmission: workflow.needsSubmission, events: events.map(({ id, actorId, type, at, comment, files, replyTo }) => ({ id, actorId, type, at, comment, files, replyTo })) };
   }
   private async saveWorkflow(state: State, workflow: Workflow) {
     workflow.executing ??= false;
@@ -698,8 +734,8 @@ export class CollaborationStore {
       const workflow: Workflow = { id: command.id, signature, title: current.fields.title, source: { ...source }, reviewerId: reviewer, claimantId: claimant, targetId: randomBytes(12).toString("hex"), fields: current.fields, status: "creating", version: 0, createdAt: now, updatedAt: now, error: "", targetCreation: { state: "new" }, events: [{ id: command.id, actorId: actor, type: "claimed", at: now, comment: "", files: [] }] };
       if (!sameFields(fields, current.fields)) {
         const editId = randomUUID();
-        workflow.edit = { id: editId, fields };
-        workflow.events.push({ id: editId, actorId: actor, type: "updating", at: now, comment: "", files: [] });
+        workflow.edit = { id: editId, fields, summary: workflowSettingChanges(current.fields, fields) };
+        workflow.events.push({ id: editId, actorId: actor, type: "updated", at: now, comment: workflow.edit.summary!, files: [] });
       }
       workflow.projects = { target: targetInbox.projectId, ...(current.remote ? { source: current.remote.projectId } : {}) };
       this.completedAfter(state, workflow);
@@ -767,11 +803,18 @@ export class CollaborationStore {
   }
   private async finishWorkflowEdit(state: State, workflow: Workflow, completing = false) {
     const edit = workflow.edit!;
+    const attempt: SyncAttempt = { id: randomUUID(), editId: edit.id, at: Date.now(), stage: 'publish-attachments', requested: taskSyncEvidence(edit.fields) };
+    edit.diagnostics = appendSyncAttempt(edit.diagnostics || [], attempt);
+    await this.saveWorkflow(state, workflow);
     try {
       if (edit.attachments) await this.gateway.taskAttachments?.publish(edit.attachments.actor, edit.attachments.publishBefore ?? edit.attachments.before, edit.attachments.after);
+      attempt.stage = 'locate-linked-tasks';
       if (workflow.status === "creating") {
         await this.startWorkflow(state, workflow, completing);
-        if (workflow.status === "creating") return this.publicWorkflow(workflow);
+        if (workflow.status === "creating") {
+          attempt.error = workflow.error; attempt.finishedAt = Date.now();
+          await this.saveWorkflow(state, workflow); return this.publicWorkflow(workflow);
+        }
       }
       const confirmed: Partial<Record<WorkflowSide, RemoteTask | null>> = {};
       if (!edit.targets) {
@@ -788,8 +831,12 @@ export class CollaborationStore {
         const task = !wrote && confirmed[side] || await this.linkedTask(state, workflow, side);
         if (!task && side === "source") { target.done = true; await this.saveWorkflow(state, workflow); continue; }
         if (!task) { await this.markMissingWorkflowTask(state, workflow); throw new CollaborationError("该任务已被删除"); }
+        attempt.stage = 'compare-version';
+        attempt.target = { owner: target.owner, id: target.id, expectedVersion: target.before, observedVersion: remoteVersion(task), differences: fieldDifferences(task, edit.fields), current: taskSyncEvidence(task) };
         if (!sameFields(task, edit.fields)) {
           if (remoteVersion(task) !== target.before) throw new CollaborationError("关联任务在同步期间被修改，已暂停覆盖，请核对后重试");
+          attempt.stage = 'write-linked-task';
+          await this.saveWorkflow(state, workflow);
           confirmed[side] = await this.gateway.update(target.owner, target.id, edit.fields, target.before, workflow.projects?.[side], task) || await this.linkedTask(state, workflow, side);
           wrote = true;
         }
@@ -797,6 +844,7 @@ export class CollaborationStore {
         if (workflow.claimantId === workflow.reviewerId && workflow.targetId === target.id) confirmed.target = confirmed[side];
         target.done = true; await this.saveWorkflow(state, workflow);
       }
+      attempt.stage = 'verify-linked-tasks';
       const sides = {
         source: confirmed.source === undefined ? await this.linkedTask(state, workflow, 'source') : confirmed.source,
         target: confirmed.target || await this.linkedTask(state, workflow, 'target'),
@@ -818,12 +866,15 @@ export class CollaborationStore {
       // Explicit edits during partially completed approval update the expected fields,
       // but preserve acknowledged/sent completion markers, including repeating tasks.
       if (workflow.status === "approving") workflow.submitted = { source: sides.source ? remoteVersion(sides.source) : "", target: remoteVersion(sides.target) };
-      const event = workflow.events.find(item => item.id === edit.id)!;
+      attempt.stage = 'clean-attachments';
       if (edit.attachments) { await this.saveWorkflow(state, workflow); await this.cleanAttachments(state, edit.attachments); }
-      event.type = "updated";
-      event.comment = edit.summary || "旧记录未保存具体修改内容";
       delete workflow.edit; workflow.error = "";
-    } catch (error) { workflow.error = error instanceof Error ? error.message : "任务详情尚未同步完成，请重试"; }
+    } catch (error) {
+      workflow.error = error instanceof Error ? error.message : "任务详情尚未同步完成，请重试";
+      attempt.error = workflow.error;
+      if (error instanceof CollaborationError && error.diagnostic) attempt.provider = error.diagnostic;
+    }
+    attempt.finishedAt = Date.now();
     await this.saveWorkflow(state, workflow); return this.publicWorkflow(workflow);
   }
   private async completeByOwner(state: State, workflow: Workflow, actor: string, id: string, signature: string, review?: ReviewDecision) {
@@ -969,15 +1020,13 @@ export class CollaborationStore {
       }
       if (workflow.recovery && !["submit", "reject"].includes(command.action)) throw new CollaborationError("任务恢复尚未完成，请先继续恢复");
       if (command.action === "update-workflow") {
-        const fields = { ...(workflow.edit?.fields || workflow.fields), ...validateFields(command.fields) };
+        const previousFields = workflow.edit?.fields || workflow.fields;
+        const fields = { ...previousFields, ...validateFields(command.fields) };
         if (fields.startDate && fields.dueDate && Date.parse(fields.startDate) > Date.parse(fields.dueDate)) throw new CollaborationError("截止时间不能早于开始时间", 400);
-        if (workflow.edit) {
-          const replaced = workflow.events.find(item => item.id === workflow.edit!.id);
-          if (replaced) { replaced.type = "update-replaced"; replaced.comment = "此修改由后续详情设置替代"; }
-        }
         const before = [workflow.fields.content, workflow.edit?.attachments?.before || '', workflow.edit?.fields.content || ''].join('\n');
-        workflow.edit = { id: command.id, fields, attachments: { actor, before, publishBefore: workflow.fields.content, after: fields.content }, summary: workflowSettingChanges(workflow.fields, fields) };
-        workflow.events.push({ id: command.id, signature, actorId: actor, type: "updating", at: Date.now(), comment: "已保存详情修改，正在同步关联任务", files: [] });
+        workflow.edit = { id: command.id, fields, attachments: { actor, before, publishBefore: workflow.fields.content, after: fields.content }, summary: workflowSettingChanges(previousFields, fields), diagnostics: workflow.edit?.diagnostics };
+        workflow.events.push({ id: command.id, signature, actorId: actor, type: "updated", at: Date.now(), comment: workflow.edit.summary!, files: [] });
+        workflow.error = "";
         await this.saveWorkflow(state, workflow);
         return this.finishWorkflowEdit(state, workflow);
       }
