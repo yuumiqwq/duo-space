@@ -15,6 +15,13 @@ test('workflow detail offers settings to every member and direct completion only
   const { ClaimWorkflows, WorkflowList } = await import(pathToFileURL(output).href);
   const overviewComponent = props => createElement(WorkflowList, { identityId: 'bob', ...props });
   const workflow = { id: 'workflow', title: '测试', reviewerId: 'alice', claimantId: 'bob', fields: taskFields({ title: '测试' }), status: 'working', executing: true, events: [] };
+  const uncertainProps = { busy: false, retryUncertain() {}, error: '', onClose() {}, perform() {}, snapshot: { identityId: 'alice', members: [], workflows: [{ ...workflow, error: '同步失败', editPending: true }] } };
+  const uncertainList = renderToStaticMarkup(createElement(ClaimWorkflows, { ...uncertainProps, initialId: null }));
+  assert.doesNotMatch(uncertainList, /class="coop-workflow-card"[^>]*disabled/, 'unconfirmed writes must not block opening details');
+  const uncertainDetail = renderToStaticMarkup(createElement(ClaimWorkflows, { ...uncertainProps, initialId: workflow.id }));
+  assert.match(uncertainDetail, /<button type="button">复制错误报告<\/button>/);
+  assert.doesNotMatch(uncertainDetail, /class="coop-workflow-back"[^>]*disabled/);
+  assert.match(uncertainDetail, /<form[^>]+aria-label="详细设置"[\s\S]*disabled/, 'mutation controls stay locked');
   const render = (identityId, status = 'working', editPending = false, error = '') => renderToStaticMarkup(createElement(ClaimWorkflows, { initialId: workflow.id, busy: false, error, onClose() {}, onEdit() {}, perform() {}, snapshot: { identityId, members: ['alice', 'bob', 'charlie'].map(id => ({ id, name: id })), workflows: [{ ...workflow, status, editPending }] } }));
   for (const member of ['alice', 'bob', 'charlie']) for (const status of ['creating', 'working', 'submitted', 'rejected', 'approving', 'done', 'deleted']) {
     const html = render(member, status); assert.match(html, /<form[^>]+aria-label="详细设置"/); assert.ok(!html.includes(">详细设置</button>"));
@@ -43,21 +50,25 @@ test('workflow detail offers settings to every member and direct completion only
   const overview = archived => renderToStaticMarkup(overviewComponent({ workflows, archived, setArchived() {}, select() {}, name: id => id }));
   const active = overview(false); assert.ok(active.includes('我认领的事项')); assert.ok(active.includes('他人认领的事项')); assert.ok(!active.includes('归档事项示例')); assert.ok(active.includes('已归档'));
   assert.ok(!active.includes('已删除归档示例')); const archive = overview(true); assert.ok(archive.includes('已删除归档示例')); assert.ok(archive.includes('归档事项示例')); assert.ok(!archive.includes('我认领的事项')); assert.ok(!archive.includes('他人认领的事项')); assert.ok(archive.includes('未完成流程'));
-  const notices = [{ id: 'nudge-notice', workflowId: 'theirs', eventType: 'nudge' }, { id: 'done-notice', workflowId: 'done', eventType: 'completed' }];
+  const notices = [{ id: 'nudge-notice', kind: 'workflow', workflowId: 'theirs', eventType: 'nudge' }, { id: 'done-notice', kind: 'workflow', workflowId: 'done', eventType: 'task-deleted' }];
   const withNotices = renderToStaticMarkup(overviewComponent({ workflows, notices, archived: false, setArchived() {}, select() {}, name: id => id }));
   assert.ok(withNotices.indexOf('我认领的事项') < withNotices.indexOf('他人认领的事项'), 'unread badges do not reorder equal-priority execution tasks');
   assert.match(withNotices, /1 条归档新记录/); assert.match(withNotices, /task-notice-dot/);
-  assert.match(withNotices, /coop-workflow-status has-update">有更新/);
+  assert.ok(!withNotices.includes('有更新'), 'nudge and deletion notices do not replace workflow status');
   assert.ok(!overview(false).includes('有更新'), 'read workflow returns to its actual status');
   assert.ok(!overview(false).includes('task-notice-dot'), 'read acknowledgements remove dots and unread sorting');
   for (const status of ['creating', 'working', 'submitted', 'rejected', 'approving']) {
     for (const flags of [{}, { taskAnomaly: true }, { reopenPending: true }, { needsSubmission: true }]) {
       for (const updated of [false, true]) {
-        const html = renderToStaticMarkup(overviewComponent({ workflows: [{ ...workflow, ...flags, status }], notices: updated ? [{ id: 'update', workflowId: workflow.id }] : [], archived: false, setArchived() {}, select() {}, name: id => id }));
+        const html = renderToStaticMarkup(overviewComponent({ workflows: [{ ...workflow, ...flags, status }], notices: updated ? [{ id: 'update', kind: 'workflow', eventType: 'updated', workflowId: workflow.id }] : [], archived: false, setArchived() {}, select() {}, name: id => id }));
         const labels = [...html.matchAll(/coop-workflow-status [^"]+">([^<]+)<\/span>/g)].map(match => match[1]);
-        assert.deepEqual(labels, [...(['submitted', 'approving'].includes(status) ? ['待审批'] : []), ...(updated ? ['有更新'] : [])], 'pending approval remains identifiable alongside unread badges within each claimant group');
+        assert.deepEqual(labels, updated ? [...(['submitted', 'approving'].includes(status) ? ['待审批'] : []), '有更新'] : [['submitted', 'approving'].includes(status) ? '待审批' : ['working', 'rejected', 'creating'].includes(status) ? '执行中' : '已认领'], 'reading the settings restores the workflow stage');
       }
     }
+  }
+  for (const eventType of ['claimed', 'task-deleted', 'nudge', 'approve', 'submit']) {
+    const html = renderToStaticMarkup(overviewComponent({ workflows: [{ ...workflow, status: 'deleted', error: '滴答清单中删除失败' }], notices: [{ id: 'event', kind: 'workflow', workflowId: workflow.id, eventType }, { id: 'failure', kind: 'sync-error', workflowId: workflow.id }], archived: true, setArchived() {}, select() {}, name: id => id }));
+    assert.ok(html.includes('>已删除</span>')); assert.ok(!html.includes('有更新'));
   }
   const ordered = renderToStaticMarkup(overviewComponent({ workflows: [...workflows, { ...workflow, id: 'review', title: '优先审批事项', status: 'submitted', createdAt: 1 }, { ...workflow, id: 'claimed', title: '本人未执行事项', executing: false }, { ...workflow, id: 'reviewer-only', title: '由本人审批但对方未执行', claimantId: 'alice', reviewerId: 'bob', executing: false }], notices, archived: false, setArchived() {}, select() {}, name: id => id }));
   assert.ok(ordered.indexOf('优先审批事项') < ordered.indexOf('我认领的事项'), 'pending approval is first within own executing tasks');

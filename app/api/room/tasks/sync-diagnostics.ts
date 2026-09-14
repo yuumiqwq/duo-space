@@ -1,8 +1,21 @@
 export type SyncAttempt = {
   id: string; editId: string; at: number; finishedAt?: number; stage: string; error?: string;
   requested: ReturnType<typeof taskSyncEvidence>;
+  versionRefreshed?: boolean;
   target?: { owner: string; id: string; expectedVersion: string; observedVersion: string; differences: string[]; current: ReturnType<typeof taskSyncEvidence> };
   provider?: string;
+};
+
+export type DeletionSideEvidence = {
+  side: 'source' | 'target'; owner: string; taskId?: string; projectId?: string;
+  role: 'original' | 'legacy-publisher-copy' | 'claimant-copy' | 'no-publisher-copy';
+  outcome: 'skipped' | 'absent' | 'deleted' | 'present' | 'later-occurrence' | 'lookup-failed' | 'delete-failed';
+  current?: ReturnType<typeof taskSyncEvidence>; error?: string; provider?: string;
+};
+export type DeletionDiagnostic = {
+  at: number; origin: 'delete-request' | 'legacy-unverified'; pending?: boolean;
+  sides: DeletionSideEvidence[]; verifiedAt?: number; verification?: DeletionSideEvidence[];
+  checks?: number; nextCheckAt?: number;
 };
 
 // Retain only identifiers and date/priority values needed to diagnose writes.

@@ -7,13 +7,14 @@ import type { TaskNotice } from './collaboration-notifications';
 import { TaskNoticeDot } from './TaskNoticeDot';
 import { executionEligible, executionGroups, executionIds, executionReserved, toggleExecution } from './workflow-execution';
 import { taskErrorMessage } from './task-request';
+import { showCollaborationDialog } from './collaboration-dialog';
 
 export function ExecutionPlanner({ snapshot, notices = [], name, busy, uncertain, error, perform, onClose }: { snapshot: CollaborationSnapshot; notices?: TaskNotice[]; name: (id: string) => string; busy: boolean; uncertain: boolean; error: string; perform: (command: ExecutionCommand) => Promise<boolean>; onClose: () => void }) {
   const dialog = useRef<HTMLDialogElement>(null), saving = useRef(false);
   const [draft, setDraft] = useState(() => ({ ids: executionIds(snapshot.workflows, snapshot.identityId), version: snapshot.executionVersion || 0 }));
   const [limitWarning, setLimitWarning] = useState(0);
   const disabled = busy || uncertain;
-  useEffect(() => { const element = dialog.current, previous = document.activeElement; element?.showModal(); return () => { element?.close(); if (previous instanceof HTMLElement && previous.isConnected) previous.focus(); }; }, []);
+  useEffect(() => { const element = dialog.current, previous = document.activeElement; showCollaborationDialog(element); return () => { element?.close(); if (previous instanceof HTMLElement && previous.isConnected) previous.focus(); }; }, []);
   useEffect(() => { if (!limitWarning) return; const timer = setTimeout(() => setLimitWarning(0), 2200); return () => clearTimeout(timer); }, [limitWarning]);
   function toggle(id: string) {
     const workflow = snapshot.workflows.find(item => item.id === id);

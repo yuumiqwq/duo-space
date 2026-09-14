@@ -6,7 +6,7 @@ import { workflowSettingChanges } from "../../../workflow-setting-changes.ts";
 import { collaborationDate, collaborationDateAfter } from "../../../collaboration-view.ts";
 import { clearLegacyRecords } from "../../../legacy-record-cleanup.ts";
 import { activeTaskNotice, collectTaskNotices, initializeTaskNotices, receivesTaskNotice, silentWorkflowEvent, unreadTaskNotices, workflowEventPresentation, type TaskNotice, type TaskNoticeState } from "../../../collaboration-notifications.ts";
-import { appendSyncAttempt, taskSyncEvidence, type SyncAttempt } from './sync-diagnostics.ts';
+import { appendSyncAttempt, taskSyncEvidence, type DeletionDiagnostic, type DeletionSideEvidence, type SyncAttempt } from './sync-diagnostics.ts';
 import type { ClaimWorkflow, WorkflowCommand, WorkflowFile, CollaborationCommand, CollaborationSnapshot, ExecutionCommand, OperationView, RoomTask, TaskFields, TaskSource } from "../../../collaboration-types";
 import { EXECUTION_LIMIT, executionEligible, executionReserved, isExecuting } from '../../../workflow-execution.ts';
 import { descriptionAttachments } from "../../../task-description-attachments.ts";
@@ -31,12 +31,12 @@ export type Gateway = {
 type BufferTask = { fields: TaskFields; version: number; stagedBy?: string; publisherId?: string; publishedAt?: number; completedAt?: number };
 type Creation = { state: "new" | "sent" | "received"; beforeIds?: string[] };
 type AttachmentChange = { actor: string; before: string; after: string; publishBefore?: string };
-type WorkflowEdit = { id: string; fields: TaskFields; attachments?: AttachmentChange; summary?: string; diagnostics?: SyncAttempt[]; targets?: { owner: string; id: string; before: string; done: boolean }[] };
+type WorkflowEdit = { id: string; fields: TaskFields; attachments?: AttachmentChange; summary?: string; diagnostics?: SyncAttempt[]; targets?: { owner: string; id: string; before: string; baseline?: { fields: TaskFields; status: number; parentId: string }; done: boolean }[] };
 type WorkflowSide = "source" | "target";
 type WorkflowDeletion = { id: string; done?: WorkflowSide[]; acknowledged?: Partial<Record<WorkflowSide, { id: string; projectId: string }>> };
 type ReviewDecision = { comment: string; files: WorkflowFile[] };
 type TaskRecovery = { id: string; creation: Creation; done?: boolean };
-type Workflow = ClaimWorkflow & { completionRequest?: { id: string; actor: string; signature: string; review?: ReviewDecision }; publishedAt?: number; missingGeneration?: number; restoration?: { id: string; generation: number }; ownerDeletion?: WorkflowDeletion; syncRetryAt?: number; syncAttempts?: number; reopenReceipt?: { before: RemoteTask; retryAt: number }; sourceReopenReceipt?: { before: RemoteTask; retryAt: number }; submittedFields?: { source: TaskFields; target: TaskFields }; projects?: Partial<Record<WorkflowSide, string>>; recovery?: Partial<Record<WorkflowSide, TaskRecovery>>; signature: string; targetCreation: Creation; reviewerCreation?: Creation; approval?: { targetDone: boolean; sourceDone: boolean; sourceSent?: boolean; targetSent?: boolean; repeating?: boolean }; submitted?: { source: string; target: string }; edit?: WorkflowEdit };
+type Workflow = ClaimWorkflow & { deletionDiagnostic?: DeletionDiagnostic; completionRequest?: { id: string; actor: string; signature: string; review?: ReviewDecision }; publishedAt?: number; missingGeneration?: number; restoration?: { id: string; generation: number }; ownerDeletion?: WorkflowDeletion; syncRetryAt?: number; syncAttempts?: number; reopenReceipt?: { before: RemoteTask; retryAt: number }; sourceReopenReceipt?: { before: RemoteTask; retryAt: number }; submittedFields?: { source: TaskFields; target: TaskFields }; projects?: Partial<Record<WorkflowSide, string>>; recovery?: Partial<Record<WorkflowSide, TaskRecovery>>; signature: string; targetCreation: Creation; reviewerCreation?: Creation; approval?: { targetDone: boolean; sourceDone: boolean; sourceSent?: boolean; targetSent?: boolean; repeating?: boolean }; submitted?: { source: string; target: string }; edit?: WorkflowEdit };
 type Operation = OperationView & {
   signature: string; source?: TaskSource; fields: TaskFields; targetId: string;
   attachments?: AttachmentChange;
@@ -329,6 +329,7 @@ export class CollaborationStore {
     const work = (async () => {
       // Already accepted user actions must not sit behind unrelated slow checks.
       await this.recoverPendingWorkflows();
+      await this.checkDeletedWorkflows();
       await this.checkWorkflows();
       await this.deliverNotices();
     })();
@@ -379,6 +380,8 @@ export class CollaborationStore {
         error: workflow.error, syncError: workflow.syncError, issue: workflow.syncIssue,
         editId: workflow.edit?.id, requested: taskSyncEvidence(workflow.edit?.fields || workflow.fields),
         source: workflow.source, targetId: workflow.targetId,
+        reviewerTaskId: workflow.reviewerTaskId, projects: workflow.projects,
+        deletion: workflow.deletionDiagnostic,
         attempts: workflow.edit?.diagnostics || [],
       };
     });
@@ -820,8 +823,9 @@ export class CollaborationStore {
       if (!edit.targets) {
         const sides = await this.workflowSides(state, workflow);
         Object.assign(confirmed, sides);
-        edit.targets = sides.source ? [{ owner: workflow.reviewerId, id: sides.source.id, before: remoteVersion(sides.source), done: false }] : [];
-        if (workflow.claimantId !== workflow.reviewerId || workflow.targetId !== edit.targets[0]?.id) edit.targets.push({ owner: workflow.claimantId, id: workflow.targetId, before: remoteVersion(sides.target), done: false });
+        const target = (owner: string, task: RemoteTask) => ({ owner, id: task.id, before: remoteVersion(task), baseline: { fields: taskFields(task), status: task.status || 0, parentId: task.parentId || '' }, done: false });
+        edit.targets = sides.source ? [target(workflow.reviewerId, sides.source)] : [];
+        if (workflow.claimantId !== workflow.reviewerId || workflow.targetId !== edit.targets[0]?.id) edit.targets.push(target(workflow.claimantId, sides.target));
         await this.saveWorkflow(state, workflow);
       }
       let wrote = false;
@@ -834,7 +838,14 @@ export class CollaborationStore {
         attempt.stage = 'compare-version';
         attempt.target = { owner: target.owner, id: target.id, expectedVersion: target.before, observedVersion: remoteVersion(task), differences: fieldDifferences(task, edit.fields), current: taskSyncEvidence(task) };
         if (!sameFields(task, edit.fields)) {
-          if (remoteVersion(task) !== target.before) throw new CollaborationError("关联任务在同步期间被修改，已暂停覆盖，请核对后重试");
+          if (remoteVersion(task) !== target.before) {
+            const before = target.baseline, current = comparableFields(task), desired = comparableFields(edit.fields), original = before && comparableFields(before.fields);
+            // A changed etag or our partially applied write can safely resume
+            // only while every field still equals its saved before/desired value.
+            const compatible = before && original && (task.status || 0) === before.status && (task.parentId || '') === before.parentId && (Object.keys(fieldLabels) as (keyof TaskFields)[]).every(key => fingerprint(current[key]) === fingerprint(original[key]) || fingerprint(current[key]) === fingerprint(desired[key]));
+            if (!compatible) throw new CollaborationError("关联任务在同步期间被修改，已暂停覆盖，请核对后重试");
+            target.before = remoteVersion(task); attempt.versionRefreshed = true;
+          }
           attempt.stage = 'write-linked-task';
           await this.saveWorkflow(state, workflow);
           confirmed[side] = await this.gateway.update(target.owner, target.id, edit.fields, target.before, workflow.projects?.[side], task) || await this.linkedTask(state, workflow, side);
@@ -933,23 +944,54 @@ export class CollaborationStore {
     await this.saveWorkflow(state, workflow);
     return this.publicWorkflow(workflow);
   }
-  private async deleteLinkedTasksOnce(workflow: Workflow, completedAfter: number) {
-    let failed = false;
+  private async inspectDeletedTasks(workflow: Workflow, completedAfter: number, remove: boolean) {
+    const results: DeletionSideEvidence[] = [];
     for (const side of ['source', 'target'] as const) {
       const { owner, id } = this.sideReference(workflow, side);
+      const result: DeletionSideEvidence = { side, owner, taskId: id, projectId: workflow.projects?.[side],
+        role: side === 'target' ? 'claimant-copy' : workflow.source.ownerId ? 'original' : id ? 'legacy-publisher-copy' : 'no-publisher-copy', outcome: 'skipped' };
+      results.push(result);
       if (!id) continue;
+      const confirmed = [...(workflow.deletionDiagnostic?.verification || []), ...(workflow.deletionDiagnostic?.sides || [])].find(item => item.side === side && item.taskId === id && ['deleted', 'absent'].includes(item.outcome));
+      if (!remove && confirmed) { Object.assign(result, confirmed); continue; }
+      let stage: 'lookup' | 'delete' = 'lookup';
       try {
         const task = await (this.gateway.locate
           ? this.gateway.locate(owner, id, workflow.projects?.[side], completedAfter)
           : this.gateway.get(owner, id, workflow.projects?.[side]));
-        if (!task) continue;
+        if (!task) { result.outcome = 'absent'; continue; }
+        result.projectId = task.projectId; result.current = taskSyncEvidence(task);
         // Preserve subsequent recurring occurrences even though the website
         // archive is final. Failure on one account does not skip the other.
-        if (workflow.fields.repeatFlag && (taskFields(task).startDate !== workflow.fields.startDate || taskFields(task).dueDate !== workflow.fields.dueDate)) { failed = true; continue; }
-        if (await this.gateway.remove(owner, task.id, task.projectId) === "missing") failed = true;
-      } catch { failed = true; }
+        if (workflow.fields.repeatFlag && (taskFields(task).startDate !== workflow.fields.startDate || taskFields(task).dueDate !== workflow.fields.dueDate)) { result.outcome = 'later-occurrence'; continue; }
+        if (!remove) { result.outcome = 'present'; continue; }
+        stage = 'delete';
+        if (await this.gateway.remove(owner, task.id, task.projectId) === 'missing') { result.outcome = 'delete-failed'; result.error = '删除接口返回 404，未收到删除成功确认'; }
+        else result.outcome = 'deleted';
+      } catch (error) {
+        result.outcome = stage === 'lookup' ? 'lookup-failed' : 'delete-failed';
+        result.error = error instanceof Error ? error.message : '滴答请求未完成';
+        if (error instanceof CollaborationError) result.provider = error.diagnostic;
+      }
     }
-    return failed ? "滴答清单中删除失败" : "";
+    return results;
+  }
+  async checkDeletedWorkflows() {
+    const eligible = (workflow: Workflow) => workflow.status === 'deleted' && (workflow.error === '滴答清单中删除失败' || workflow.deletionDiagnostic?.pending) && (workflow.deletionDiagnostic?.nextCheckAt || 0) <= Date.now();
+    const candidates = Object.values((await this.read()).workflows).filter(eligible).sort((a, b) => (a.deletionDiagnostic?.nextCheckAt || 0) - (b.deletionDiagnostic?.nextCheckAt || 0)).slice(0, 3);
+    for (const candidate of candidates) await this.serial(async () => {
+      const state = await this.read(), workflow = state.workflows[candidate.id];
+      if (!workflow || !eligible(workflow)) return;
+      const diagnostic = workflow.deletionDiagnostic ||= { at: Date.now(), origin: 'legacy-unverified', sides: [] };
+      diagnostic.checks = (diagnostic.checks || 0) + 1;
+      diagnostic.nextCheckAt = Date.now() + Math.min(300000, 10000 * 2 ** Math.min(diagnostic.checks, 5));
+      await this.write(state);
+      // Reconcile observations only: archived tasks are never deleted again.
+      const results = await this.inspectDeletedTasks(workflow, this.completedAfter(state, workflow), false);
+      diagnostic.verifiedAt = Date.now(); diagnostic.verification = results; diagnostic.pending = false;
+      workflow.error = results.every(item => ['skipped', 'absent', 'deleted'].includes(item.outcome)) ? '' : '滴答清单中删除失败';
+      await this.saveWorkflow(state, workflow);
+    }, ['workflow:' + candidate.id]).catch(() => { /* Concurrent archival results are preserved; the next poll retries this observation. */ });
   }
   async workflowCommand(actor: string, command: WorkflowCommand) {
     let cleanup: { workflow: Workflow; completedAfter: number } | undefined;
@@ -1006,6 +1048,7 @@ export class CollaborationStore {
         const completedAfter = this.completedAfter(state, workflow);
         workflow.events.push(event);
         this.archiveWorkflow(state, workflow, event);
+        workflow.deletionDiagnostic = { at: Date.now(), origin: 'delete-request', pending: true, sides: [], nextCheckAt: Date.now() + 120000 };
         await this.saveWorkflow(state, workflow);
         cleanup = { workflow: structuredClone(workflow), completedAfter };
         return this.publicWorkflow(workflow);
@@ -1079,11 +1122,14 @@ export class CollaborationStore {
     }, [['submit', 'reject', 'nudge', 'reply-nudge', 'delete-owner-task', 'delete-claimed-task'].includes(command.action) ? 'local' : 'workflow:' + command.workflowId]);
     if (!cleanup) return result;
     // This request makes one best-effort attempt after durable local archival.
-    // It runs outside the mutation queue and has no persisted cleanup receipt.
-    const error = await this.deleteLinkedTasksOnce(cleanup.workflow, cleanup.completedAfter);
+    // It runs outside the mutation queue. Retained evidence authorizes later
+    // read-only verification, never another deletion request.
+    const sides = await this.inspectDeletedTasks(cleanup.workflow, cleanup.completedAfter, true);
+    const error = sides.every(item => ['skipped', 'absent', 'deleted'].includes(item.outcome)) ? '' : '滴答清单中删除失败';
     return this.serial(async () => {
       const state = await this.read(), workflow = state.workflows[command.workflowId];
-      if (workflow.error !== error) { workflow.error = error; await this.saveWorkflow(state, workflow); }
+      workflow.deletionDiagnostic = { ...cleanup!.workflow.deletionDiagnostic!, pending: false, sides, nextCheckAt: Date.now() + 15000 };
+      workflow.error = error; await this.saveWorkflow(state, workflow);
       return this.publicWorkflow(workflow);
     });
   }

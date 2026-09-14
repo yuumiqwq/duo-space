@@ -1204,6 +1204,102 @@ test('explicit new settings can resolve a detail sync conflict while stale reque
   assert.deepEqual(w.events.filter(event => event.type === 'updated').map(event => event.comment), ['说明：无 → 第一次修改', '说明：第一次修改 → 核对后的修改']);
 });
 
+test('lost deletion responses are reconciled by read-only lookup without another delete or history update', async () => {
+  const f = await fixture(), task = await f.create('public deletion'); let w = await claim(f, task);
+  f.loseDelete(); w = await act(f, w, 'alice', 'delete-owner-task');
+  assert.equal(w.error, '滴答清单中删除失败'); const events = structuredClone(w.events);
+  let report = await f.store.inspectWorkflowSync('alice', w.id);
+  assert.equal(report.deletion.sides[0].role, 'no-publisher-copy');
+  assert.equal(report.deletion.sides[0].outcome, 'skipped');
+  assert.equal(report.deletion.sides[1].outcome, 'delete-failed');
+  assert.equal(report.deletion.sides[1].error, 'delete response lost');
+  const file = path.join(f.dir, 'room-collaboration.json'), state = JSON.parse(await readFile(file, 'utf8'));
+  state.workflows[w.id].deletionDiagnostic.nextCheckAt = 0; await writeFile(file, JSON.stringify(state));
+  f.gateway.remove = async () => assert.fail('checking an archive never issues DELETE');
+  await f.store.checkDeletedWorkflows();
+  const current = (await f.store.snapshot('alice', null)).workflows.find(item => item.id === w.id);
+  assert.equal(current.status, 'deleted'); assert.equal(current.error, ''); assert.equal(current.syncIssue, undefined); assert.deepEqual(current.events, events);
+  report = await f.store.inspectWorkflowSync('alice', w.id);
+  assert.equal(report.deletion.sides[1].outcome, 'delete-failed', 'retain original failure evidence');
+  assert.equal(report.deletion.verification[1].outcome, 'absent');
+});
+
+test('legacy public deletion checks its saved publisher copy and never treats an empty inbox as proof of deletion', async () => {
+  for (const result of ['absent', 'moved', 'unreadable']) {
+    const f = await fixture(), task = await f.create('legacy public'); let w = await claim(f, task);
+    w = await act(f, w, 'alice', 'delete-owner-task');
+    const file = path.join(f.dir, 'room-collaboration.json'), state = JSON.parse(await readFile(file, 'utf8'));
+    state.workflows[w.id].reviewerTaskId = 'legacy-copy'; state.workflows[w.id].error = '滴答清单中删除失败'; delete state.workflows[w.id].deletionDiagnostic;
+    await writeFile(file, JSON.stringify(state)); const reads = [];
+    f.gateway.locate = async (owner, id) => {
+      reads.push([owner, id]);
+      if (owner === 'alice' && result === 'unreadable') throw new CollaborationError('授权已失效', 422, '{"status":401}');
+      if (owner === 'bob' && result === 'moved') return { id, projectId: 'another-project', ...taskFields({ title: 'private body excluded' }) };
+      return null;
+    };
+    f.gateway.remove = async () => assert.fail('legacy verification cannot issue DELETE');
+    await f.store.checkDeletedWorkflows();
+    const report = await f.store.inspectWorkflowSync('alice', w.id);
+    assert.deepEqual(reads, [['alice', 'legacy-copy'], ['bob', w.targetId]]);
+    assert.equal(report.deletion.origin, 'legacy-unverified');
+    assert.equal(report.deletion.verification[0].role, 'legacy-publisher-copy');
+    assert.equal(report.error, result === 'absent' ? '' : '滴答清单中删除失败');
+    if (result === 'unreadable') { assert.equal(report.deletion.verification[0].outcome, 'lookup-failed'); assert.equal(report.deletion.verification[0].provider, '{"status":401}'); }
+    if (result === 'moved') { assert.equal(report.deletion.verification[1].outcome, 'present'); assert.equal(report.deletion.verification[1].projectId, 'another-project'); }
+    assert.ok(!JSON.stringify(report).includes('private body excluded'));
+    await f.store.checkDeletedWorkflows(); assert.equal(reads.length, 2, 'persisted cooldown prevents repeated scans');
+  }
+});
+
+test('read-only deletion verification preserves concurrent website writes and clears only the resolved error', { timeout: 3000 }, async () => {
+  const f = await fixture(), task = await f.create('verify archive'); let w = await claim(f, task);
+  f.loseDelete(); w = await act(f, w, 'alice', 'delete-owner-task');
+  const file = path.join(f.dir, 'room-collaboration.json'), state = JSON.parse(await readFile(file, 'utf8'));
+  state.workflows[w.id].deletionDiagnostic.nextCheckAt = 0; await writeFile(file, JSON.stringify(state));
+  let release, started;
+  const gate = new Promise(resolve => { release = resolve; }), reading = new Promise(resolve => { started = resolve; });
+  f.gateway.locate = async () => { started(); await gate; return null; };
+  const checking = f.store.checkDeletedWorkflows(); await reading;
+  try {
+    await promptly(f.store.execute('alice', { id: randomUUID(), action: 'create', fields: { title: 'concurrent public task' } }));
+    const snapshot = await promptly(f.store.snapshot('alice', null));
+    assert.ok(snapshot.buffer.some(item => item.title === 'concurrent public task'));
+    assert.equal(snapshot.workflows.find(item => item.id === w.id).status, 'deleted');
+  } finally { release(); await checking; }
+  const snapshot = await f.store.snapshot('alice', null);
+  assert.ok(snapshot.buffer.some(item => item.title === 'concurrent public task'));
+  assert.equal(snapshot.workflows.find(item => item.id === w.id).error, '');
+  assert.deepEqual(snapshot.workflows.find(item => item.id === w.id).events, w.events);
+});
+
+test('metadata-only changes and partially applied settings resume while actual conflicting edits stay protected', async () => {
+  for (const scenario of ['etag', 'partial', 'conflict', 'legacy']) {
+    const f = await fixture(), task = await f.create('resumable settings'); let w = await claim(f, task);
+    const update = f.gateway.update;
+    f.gateway.update = async (owner, id) => {
+      const remote = f.accounts[owner].get(id); remote.etag = 'changed-after-request';
+      if (scenario !== 'etag') remote.priority = scenario === 'conflict' ? 1 : 5;
+      throw new Error('write response lost');
+    };
+    w = await act(f, w, 'alice', 'update-workflow', { fields: { priority: 5, startDate: '2026-09-12T16:00:00.000Z' } });
+    const events = structuredClone(w.events);
+    if (scenario === 'legacy') {
+      const file = path.join(f.dir, 'room-collaboration.json'), state = JSON.parse(await readFile(file, 'utf8'));
+      for (const target of state.workflows[w.id].edit.targets) delete target.baseline;
+      await writeFile(file, JSON.stringify(state));
+    }
+    f.gateway.update = update; f.store = new CollaborationStore(f.dir, f.gateway);
+    w = await act(f, w, 'alice', 'retry-workflow'); assert.deepEqual(w.events, events);
+    if (['etag', 'partial'].includes(scenario)) {
+      assert.equal(w.editPending, false); assert.equal(w.error, '');
+      assert.equal(f.accounts.bob.get(w.targetId).startDate, '2026-09-12T16:00:00.000Z');
+    } else {
+      assert.equal(w.editPending, true); assert.match(w.error, /同步期间被修改/);
+      assert.equal(f.accounts.bob.get(w.targetId).startDate, null);
+    }
+  }
+});
+
 test('edit history survives failures, restart and retry while diagnostics retain the first failed attempt', async () => {
   const f = await fixture(), task = await personal(f, { content: 'private task body' });
   let w = await claim(f, task); const update = f.gateway.update;

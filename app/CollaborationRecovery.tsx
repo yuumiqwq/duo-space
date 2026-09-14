@@ -2,12 +2,13 @@
 
 import { useEffect, useRef, type ReactNode } from "react";
 import { X } from "lucide-react";
+import { showCollaborationDialog } from './collaboration-dialog';
 
 export function CollaborationRecovery({ busy, onClose, children }: { busy: boolean; onClose: () => void; children: ReactNode }) {
   const dialog = useRef<HTMLDialogElement>(null);
   useEffect(() => {
     const element = dialog.current, previous = document.activeElement;
-    element?.showModal();
+    showCollaborationDialog(element);
     return () => { element?.close(); if (previous instanceof HTMLElement && previous.isConnected) previous.focus({ preventScroll: true }); };
   }, []);
   return <dialog ref={dialog} className="coop-recovery-dialog" aria-label="待处理的协作操作" onCancel={event => { event.preventDefault(); if (!busy) onClose(); }} onKeyDown={event => event.stopPropagation()}>

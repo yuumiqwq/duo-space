@@ -2,6 +2,7 @@ import type { ClaimWorkflow, WorkflowEvent } from "./collaboration-types";
 
 export type TaskNotice = { id: string; kind: "public" | "workflow" | "sync-error"; title: string; body: string; at: number; actorId: string; recipients?: string[]; taskId?: string; workflowId?: string; eventId?: string; eventType?: string };
 export type TaskNoticeState = { version?: number; known: string[]; entries: TaskNotice[]; read: Record<string, string[]>; attempted: string[] };
+export const isWorkflowSettingsNotice = (notice: TaskNotice) => notice.kind === 'workflow' && ['updated', 'updating', 'update-replaced'].includes(notice.eventType || '');
 type NoticeSource = { buffer: Record<string, { fields: { title: string }; publisherId?: string; stagedBy?: string; completedAt?: number }>; workflows: Record<string, ClaimWorkflow>; notifications?: TaskNoticeState };
 export const silentWorkflowEvent = (type?: string) => ["external-claimant-check", "external-task-reopened", "task-relocated", "task-anomaly"].includes(type || "");
 export function workflowEventPresentation(event: WorkflowEvent, pendingSummary?: string): WorkflowEvent {

@@ -123,6 +123,19 @@ test('exact linked reads and deletion bypass a stalled or failed inbox and a mov
   });
 });
 
+test('legacy task references without a saved project do not require the publisher empty inbox', async () => {
+  await providerFixture(async gateway => {
+    const routes = [];
+    globalThis.fetch = async url => {
+      const route = new URL(url).pathname.replace('/open/v1', ''); routes.push(route);
+      if (route === '/task/filter' || route === '/task/completed') return Response.json([]);
+      throw new Error(`unnecessary request: ${route}`);
+    };
+    assert.equal(await gateway.locate('alice', 'legacy-copy', undefined, Date.parse('2026-09-09T00:00:00+08:00')), null);
+    assert.deepEqual(routes, ['/task/filter', '/task/completed']);
+  });
+});
+
 test('credential rotation isolates in-flight inbox data, aliases resolve concretely, and disconnect blocks cached access', async () => {
   await providerFixture(async (gateway, saveToken) => {
     const gate = deferred(), entered = deferred(), requests = [];

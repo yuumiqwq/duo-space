@@ -7,10 +7,10 @@ import { TaskDescription } from "./TaskDescription";
 import { TaskSettings } from "./WorkflowSettings";
 import { taskErrorMessage } from "./task-request";
 
-export function UnclaimedTaskDetail({ task, identityId, name, busy, error, perform, back }: { task: RoomTask; identityId: string; name: (id: string) => string; busy: boolean; error: string; perform: (command: CollaborationCommand) => Promise<boolean>; back: () => void }) {
+export function UnclaimedTaskDetail({ task, identityId, name, busy, uncertain = false, error, perform, back }: { task: RoomTask; identityId: string; name: (id: string) => string; busy: boolean; uncertain?: boolean; error: string; perform: (command: CollaborationCommand) => Promise<boolean>; back: () => void }) {
   const [deleteArmed, setDeleteArmed] = useState(false);
   const reviewerId = task.ownerId || task.publisherId;
-  const disabled = busy || !!task.pending;
+  const disabled = busy || uncertain || !!task.pending;
   const source = { ownerId: task.ownerId, taskId: task.id, version: task.version };
   async function remove() {
     if (!deleteArmed) { setDeleteArmed(true); return; }

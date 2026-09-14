@@ -100,7 +100,10 @@ export const gateway: Gateway = {
     return task as RemoteTask | null;
   },
   async locate(owner, id, projectId, completedAfter) {
-    const found = await gateway.get(owner, id, projectId);
+    // Legacy references may have an exact task ID but no saved list ID. Search
+    // that ID directly instead of requiring a now-empty inbox to resolve first.
+    if (!validId(id) || (projectId !== undefined && !validId(projectId))) throw new CollaborationError("任务编号无效", 400);
+    const found = projectId && projectId !== 'inbox' ? await gateway.get(owner, id, projectId) : null;
     if (found && !found.status) return found;
     let completed = found?.status === 2 ? found : null;
     const account = await context(owner);

@@ -7,6 +7,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { loadCollaborationSnapshot, mergeCollaborationSnapshot } from '../app/collaboration-loading.ts';
 import { withoutDeletedWorkflowTasks } from '../app/collaboration-snapshot.ts';
 import { splitCollaborationTasks } from '../app/collaboration-view.ts';
+import { showCollaborationDialog } from '../app/collaboration-dialog.ts';
 
 // Execute the component's actual request callback and effects without adding a
 // browser runtime to the test suite. DOM focus and timers are controlled here.
@@ -37,7 +38,7 @@ test('classroom preload survives board close and reopen, shares pending reads, a
     setLoading: value => { loading = value; }, setError: error => assert.fail(error), acceptNotices() {},
     setSnapshot: update => { current = update(current); }, mergeCollaborationSnapshot, withoutDeletedWorkflowTasks,
     loadCollaborationSnapshot: options => loadCollaborationSnapshot({ ...options, request }), taskErrorMessage: error => String(error),
-    dialog: { current: { showModal() {}, close() {} } }, trigger: { current: { focus() {} } },
+    showCollaborationDialog, dialog: { current: { showModal() {}, close() {} } }, trigger: { current: { focus() {} } },
     document: { hidden: false }, locked: { current: false }, drag: { current: null },
     setTimeout: fn => { const id = ++sequence; scheduled.set(id, fn); return id; }, clearTimeout: id => scheduled.delete(id),
     setInterval: fn => { const id = ++sequence; intervals.set(id, fn); return id; }, clearInterval: id => intervals.delete(id),

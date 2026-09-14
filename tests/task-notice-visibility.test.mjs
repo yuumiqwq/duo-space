@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { watchNoticeVisibility } from '../app/task-notice-visibility.ts';
+import { watchNoticeVisibility, watchWorkflowVisit } from '../app/task-notice-visibility.ts';
 
 test('notice browsing requires full visibility and dwell, stops in background, and acknowledges once', () => {
   const previous = Object.fromEntries(['document', 'IntersectionObserver', 'setTimeout', 'clearTimeout'].map(key => [key, globalThis[key]]));
@@ -21,4 +21,22 @@ test('notice browsing requires full visibility and dwell, stops in background, a
     enter(0); enter(1); elapse(); assert.equal(reads, 1, 'visibility changes do not repeat acknowledgement');
     stop(); assert.equal(disconnected, true); assert.equal(listener, null); assert.equal(timers.size, 0);
   } finally { for (const [key, value] of Object.entries(previous)) { if (value === undefined) delete globalThis[key]; else globalThis[key] = value; } }
+});
+
+test('opening workflow details acknowledges the visit after paint without requiring timeline marker visibility', () => {
+  const keys = ['document', 'requestAnimationFrame', 'cancelAnimationFrame'];
+  const previous = Object.fromEntries(keys.map(key => [key, globalThis[key]]));
+  let listener, frame, reads = 0;
+  globalThis.document = { hidden: true, addEventListener(_name, fn) { listener = fn; }, removeEventListener() { listener = undefined; } };
+  globalThis.requestAnimationFrame = fn => { frame = fn; return 1; };
+  globalThis.cancelAnimationFrame = () => { frame = undefined; };
+  const paint = () => { const callback = frame; frame = undefined; callback(); };
+  try {
+    const stop = watchWorkflowVisit(() => reads++);
+    assert.equal(frame, undefined);
+    document.hidden = false; listener(); assert.equal(reads, 0); paint(); assert.equal(reads, 1);
+    listener(); assert.equal(frame, undefined); stop();
+    const closeBeforePaint = watchWorkflowVisit(() => reads++); closeBeforePaint(); assert.equal(frame, undefined);
+    const retry = watchWorkflowVisit(() => reads++); paint(); retry(); assert.equal(reads, 2, 'an unacknowledged server response can retry on the next snapshot');
+  } finally { for (const key of keys) { if (previous[key] === undefined) delete globalThis[key]; else globalThis[key] = previous[key]; } }
 });
