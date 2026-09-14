@@ -21,10 +21,11 @@ export function mergeCollaborationSnapshot(current: CollaborationSnapshot | null
 
 // Return website records as soon as they arrive. Each inbox updates independently;
 // a slow member must not delay opening a workflow or acknowledging a command.
-export async function loadCollaborationSnapshot({ signal, accept, settled, request = fetch }: {
+export async function loadCollaborationSnapshot({ signal, accept, settled, memberIds, request = fetch }: {
   signal: AbortSignal;
   accept: (snapshot: CollaborationSnapshot, memberId?: string) => void;
   settled: () => void;
+  memberIds?: string[];
   request?: typeof fetch;
 }): Promise<CollaborationSnapshot> {
   async function read(query: string, timeout: number) {
@@ -36,7 +37,7 @@ export async function loadCollaborationSnapshot({ signal, accept, settled, reque
   let local: CollaborationSnapshot;
   try { local = await read('local=1', 8000); signal.throwIfAborted(); accept(local); }
   catch (error) { settled(); throw error; }
-  void Promise.all(local.members.filter(member => member.connected).map(async member => {
+  void Promise.all(local.members.filter(member => member.connected && (!memberIds || memberIds.includes(member.id))).map(async member => {
     try {
       const next = await read(`member=${encodeURIComponent(member.id)}`, 35000);
       if (next.identityId !== local.identityId || next.members.length !== 1 || next.members[0].id !== member.id) throw new Error('协作区读取失败');

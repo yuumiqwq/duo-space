@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { accessToken } from "../store";
+import { tickFetch } from "../client";
 import { currentIdentityId } from "../../identity/session";
 import { store } from "../../room/tasks/service";
 import { CollaborationError } from "../../room/tasks/store";
@@ -18,8 +19,8 @@ export async function POST(request: Request) {
   if (!token) return new NextResponse("Not connected", { status: 401 });
   if (typeof body.projectId !== "string" || typeof body.taskId !== "string") return new NextResponse("Invalid task", { status: 400 });
   try { const result = await store.personalCompletion(identityId, body.taskId, async () => {
-  const response = await fetch(`https://api.dida365.com/open/v1/project/${encodeURIComponent(body.projectId)}/task/${encodeURIComponent(body.taskId)}/complete`, {
-    method: "POST", headers: { Authorization: `Bearer ${token}` }, cache: "no-store",
+  const response = await tickFetch(`/project/${encodeURIComponent(body.projectId)}/task/${encodeURIComponent(body.taskId)}/complete`, token, {
+    method: "POST",
   });
   return new NextResponse(null, { status: response.ok ? 204 : response.status });
   });

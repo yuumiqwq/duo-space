@@ -25,10 +25,12 @@ export function createTodoStore(directory: string) {
     return result;
   }
   return {
-    reconcile(identity: string, incoming: StoredTodoTask[], now = Date.now()) {
+    reconcile(identity: string, incoming: StoredTodoTask[], now = Date.now(), partial?: { failedProjectIds: string[]; incompleteProjects: boolean; inboxFailed: boolean; readProjectIds: string[] }) {
       return update(state => {
         const day = classroomTodoWindow(now).day;
-        const tasks = mergeTodoSnapshot(state.members[identity]?.tasks || [], incoming, now);
+        const previous = state.members[identity]?.tasks || [];
+        const retained = partial ? previous.filter(task => !incoming.some(item => item.id === task.id) && (partial.failedProjectIds.includes(task.projectId || '') || ((partial.incompleteProjects || partial.inboxFailed) && !partial.readProjectIds.includes(task.projectId || '')))) : [];
+        const tasks = mergeTodoSnapshot(previous, [...incoming, ...retained], now);
         state.members[identity] = { day, tasks };
         return tasks;
       });

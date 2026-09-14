@@ -28,7 +28,7 @@ test('todo routes preserve checked tasks for both devices and save only the auth
     laterend: { ...t('laterend','按较晚结束时间'), startDate: oldDate },
     startoutside: { ...t('startoutside','开始时间在窗口外'), startDate: new Date(window.end).toISOString() },
   };
-  await writeFile(path.join(dir,'fake-dida.json'),JSON.stringify({alice:{...oldHistory,...extra,overdue:{...t('overdue','窗口外逾期'),dueDate:oldDate},one:t('one','待勾选'),history:t('history','已在滴答完成',2),future:{...t('future','未来任务'),dueDate:new Date(window.next+86400000).toISOString()}},bob:{}}));
+  await writeFile(path.join(dir,'fake-dida.json'),JSON.stringify({alice:{...extra,overdue:{...t('overdue','窗口外逾期'),dueDate:oldDate},one:t('one','待勾选'),history:t('history','已在滴答完成',2),future:{...t('future','未来任务'),dueDate:new Date(window.next+86400000).toISOString()},...oldHistory},bob:{}}));
   const socket=createServer();await new Promise(resolve=>socket.listen(0,'127.0.0.1',resolve));const port=socket.address().port;await new Promise(resolve=>socket.close(resolve));
   const child=spawn(process.execPath,['--import','./tests/helpers/dida-fixture.mjs','node_modules/next/dist/bin/next','start','--hostname','127.0.0.1','--port',String(port)],{env:{...process.env,DATA_DIR:dir,AUTH_SESSION_SECRET:secret,TICKTICK_STORAGE_SECRET:secret},stdio:'ignore',windowsHide:true});
   const origin=`http://127.0.0.1:${port}`;

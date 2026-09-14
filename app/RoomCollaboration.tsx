@@ -23,6 +23,7 @@ import { applyWorkflowUpdate, removeSnapshotTask, withoutDeletedWorkflowTasks } 
 import { loadCollaborationSnapshot, mergeCollaborationSnapshot } from './collaboration-loading';
 import { inboxClaimant } from './inbox-claim-stamp';
 import { InboxClaimStamp } from './InboxClaimStamp';
+import { refreshMembers, websiteOnlyAction } from "./collaboration-refresh";
 import { readTaskResponse, taskErrorMessage } from './task-request';
 
 type RequestCommand = WorkflowCommand | ExecutionCommand | { id: string; action: "legacy-reset" } | CollaborationCommand | { id: string; action: "resume" | "cancel" } | { id: string; action: "recover"; target: { id: string; version: string } };
@@ -31,7 +32,7 @@ const taskSource = (task: RoomTask) => ({ ownerId: task.ownerId, taskId: task.id
 const priorities = { 0: "无优先级", 1: "低", 3: "中", 5: "高" };
 const operationTime = (value: number) => new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(new Date(value));
 
-export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTasks, triggerContent, previewSnapshot, previewAutoOpen = true }: { identityId: string; onChanged: () => Promise<boolean>; onNotice?: (id: string) => void; onPublicTasks?: (tasks: PublicTaskPreview[]) => void; triggerContent?: ReactNode; previewSnapshot?: CollaborationSnapshot; previewAutoOpen?: boolean }) {
+export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTasks, triggerContent, previewSnapshot, previewAutoOpen = true }: { identityId: string; onChanged: (fresh?: boolean) => Promise<boolean>; onNotice?: (id: string) => void; onPublicTasks?: (tasks: PublicTaskPreview[]) => void; triggerContent?: ReactNode; previewSnapshot?: CollaborationSnapshot; previewAutoOpen?: boolean }) {
   const [stampFontsReady, setStampFontsReady] = useState(false);
   const [open, setOpen] = useState(false);
   const [snapshot, setSnapshot] = useState<CollaborationSnapshot | null>(previewSnapshot || null);
@@ -55,6 +56,7 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
   const [ghost, setGhost] = useState<{ x: number; y: number; task: RoomTask; width: number } | null>(null);
   const dialog = useRef<HTMLDialogElement>(null), trigger = useRef<HTMLButtonElement>(null), membersPane = useRef<HTMLDivElement>(null);
   const locked = useRef(false), fetching = useRef(false), revision = useRef<number | null>(null), generation = useRef(0);
+  const remoteVersions = useRef<Record<string, string> | null>(null);
   const loadController = useRef<AbortController | null>(null);
   const drag = useRef<{ handle: HTMLElement; pointerId: number; stop: () => void; task: RoomTask; x: number; y: number; moved: boolean; offsetX: number; offsetY: number; width: number } | null>(null);
 
@@ -102,18 +104,35 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
     return () => clearTimeout(timer);
   }, [previewSnapshot, previewAutoOpen]);
 
-  const load = useCallback(async (force = false) => {
+  const load = useCallback(async (force = false, memberIds?: string[]) => {
     if (previewSnapshot) return previewSnapshot;
+    if (memberIds?.length === 0) {
+      const id = generation.current;
+      try {
+        return await loadCollaborationSnapshot({ signal: AbortSignal.timeout(8000), memberIds, settled() {}, accept: next => {
+          if (id !== generation.current) return;
+          setSnapshot(current => mergeCollaborationSnapshot(current, next));
+          acceptNotices(next.notices || [], next.noticeVersion);
+          revision.current = Math.max(revision.current ?? 0, next.revision);
+        } });
+      } catch (cause) { if (id === generation.current) setError(taskErrorMessage(cause, '协作区暂时无法读取')); return null; }
+    }
     if (fetching.current && !force) return null;
     if (force) loadController.current?.abort();
     const controller = new AbortController(); loadController.current = controller;
     fetching.current = true; setLoading(true);
     const id = ++generation.current;
     try {
-      const data = await loadCollaborationSnapshot({ signal: controller.signal,
+      const data = await loadCollaborationSnapshot({ signal: controller.signal, memberIds,
         accept: (next, memberId) => {
           if (id !== generation.current) return;
           setSnapshot(current => mergeCollaborationSnapshot(current, next, memberId));
+          if (remoteVersions.current === null) remoteVersions.current = { ...next.remoteVersions };
+          if (memberId) remoteVersions.current[memberId] = next.remoteVersions?.[memberId] || "";
+          else {
+            for (const member of next.members) if (!member.connected) remoteVersions.current[member.id] = next.remoteVersions?.[member.id] || '';
+            for (const member of Object.keys(remoteVersions.current)) if (!next.members.some(item => item.id === member)) delete remoteVersions.current[member];
+          }
           acceptNotices(next.notices || [], next.noticeVersion);
           revision.current = Math.max(revision.current ?? 0, next.revision);
         },
@@ -146,7 +165,12 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
         if (revision.current !== null && data.revision < revision.current) return;
         acceptNotices(data.notices || [], data.noticeVersion);
         if (Array.isArray(data.bufferPreview)) onPublicTasks?.(data.bufferPreview);
-        if (revision.current !== null && revision.current !== data.revision) void onChanged();
+        const versions: Record<string, string> = data.remoteVersions || {};
+        const changed = remoteVersions.current === null ? [] : [...new Set([...Object.keys(versions), ...Object.keys(remoteVersions.current)])].filter(id => (versions[id] || "") !== (remoteVersions.current![id] || ""));
+        if (changed.length && !fetching.current) {
+          void load(false, changed);
+          if (changed.includes(identityId)) void onChanged(true);
+        }
         if (open && Array.isArray(data.buffer) && Array.isArray(data.members) && Array.isArray(data.workflows)) setSnapshot(current => mergeCollaborationSnapshot(current, data));
         revision.current = data.revision;
       } catch { /* Try again on the next poll or focus. */ }
@@ -205,7 +229,8 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
       return true;
     }
     if (locked.current) return false;
-    generation.current++; fetching.current = false; loadController.current?.abort(); setLoading(false);
+    const affectedMembers = refreshMembers(command, snapshot), localAction = websiteOnlyAction(command.action);
+    if (affectedMembers.length) { generation.current++; fetching.current = false; loadController.current?.abort(); setLoading(false); }
     locked.current = true; setBusy(true); setError(""); setNotice(""); setUncertain(command);
     let operation: OperationView | undefined, workflow: ClaimWorkflow | undefined, executionSaved = false;
     try {
@@ -221,14 +246,14 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
       if (operation?.status === 'done' && deletedSource) setSnapshot(current => current ? removeSnapshotTask(current, deletedSource.ownerId, deletedSource.taskId) : current);
       if (workflow && !["update-workflow", "delete-owner-task", "delete-claimed-task"].includes(command.action)) { setWorkflowId(workflow.id); setWorkflowOpen(true); }
       setUncertain(null);
-      if ((workflow?.error || workflow?.syncError) && !workflow?.editPending && !workflow?.ownerDeletePending) setError(workflow.syncError || workflow.error);
+      if (!localAction && (workflow?.error || workflow?.syncError) && !workflow?.editPending && !workflow?.ownerDeletePending) setError(workflow.syncError || workflow.error);
       else if (operation?.status === "pending") setError(operation.error || "操作尚未完成，请在下方继续处理");
-      else if (!workflow?.editPending) setNotice(operation?.status === "cancelled" ? "已取消未完成的操作" : "已保存");
+      else if (localAction || !workflow?.editPending) setNotice(operation?.status === "cancelled" ? "已取消未完成的操作" : "已保存");
     } catch (cause) { setError(taskErrorMessage(cause, '请求结果未确认，请核对并重试')); }
     finally {
       const deletionConfirmed = workflow?.status === 'deleted' || (operation?.status === 'done' && command.action === 'delete');
-      const next = deletionConfirmed ? null : await load(true);
-      if (deletionConfirmed) void load(true);
+      const next = deletionConfirmed ? null : await load(true, affectedMembers);
+      if (deletionConfirmed) void load(true, affectedMembers);
       workflow = next?.workflows.find(item => item.id === workflow?.id || item.id === command.id || item.events.some(event => event.id === command.id) || (command.action === "retry-workflow" && item.id === command.workflowId && item.version !== command.version)) || workflow;
       if (workflow) { setUncertain(null); if (!["update-workflow", "delete-owner-task", "delete-claimed-task"].includes(command.action)) { setWorkflowId(workflow.id); setWorkflowOpen(true); } }
       const known = next?.operations.find(item => item.id === command.id);
@@ -236,10 +261,10 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
       if (workflow && !workflow.error && !workflow.syncError) setError('');
       if (operation?.status === "done") { setError(""); setNotice("已保存"); }
       locked.current = false; setBusy(false);
-      void onChanged();
+      if (affectedMembers.includes(identityId)) void onChanged(true);
     }
     if (operation?.status === "done" || operation?.status === "cancelled") setDraftId(current => current === command.id ? null : current);
-    return executionSaved || (workflow ? workflow.status === 'deleted' || (command.action === 'update-workflow' && workflow.events.some(event => event.id === command.id)) || (!workflow.error && !workflow.syncError) : operation?.status === "done");
+    return executionSaved || (workflow ? (localAction && workflow.events.some(event => event.id === command.id)) || workflow.status === 'deleted' || (command.action === 'update-workflow' && workflow.events.some(event => event.id === command.id)) || (!workflow.error && !workflow.syncError) : operation?.status === "done");
   }
   const unavailable = busy || !!uncertain;
   const ownerName = (owner: string | null) => owner === null ? "任务板" : snapshot?.members.find(member => member.id === owner)?.name || "成员";

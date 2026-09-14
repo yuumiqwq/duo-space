@@ -95,7 +95,7 @@ test('claim workflow HTTP covers actual routes, sidebar guard, file streaming, r
     assert.match((await call('bob', imageFile.url)).headers.get('content-disposition'), /^attachment;/);
     assert.match((await call('bob', file.url + '?preview=1')).headers.get('content-disposition'), /^attachment;/, 'non-image files retain download behavior');
     response = await act('bob', 'submit', { attachments: [file.id, imageFile.id], comment: '已完成 [图1.png]' }); assert.equal(response.status, 200); w = (await response.json()).workflow;
-    assert.equal((JSON.parse(await readFile(path.join(dir, 'fake-dida.json'), 'utf8'))).bob[w.targetId].status, 0, 'dependent commands still verify and restore status before advancing');
+    assert.equal((JSON.parse(await readFile(path.join(dir, 'fake-dida.json'), 'utf8'))).bob[w.targetId].status, 2, 'submission preserves the external state without contacting Dida');
     assert.equal((await call('alice', imageFile.url + '?preview=1')).status, 200, 'submitted images become visible to the reviewer');
     response = await act('alice', 'update-workflow', { fields: { content: '提交后补充任务说明和附件链接' } });
     assert.equal(response.status, 200); w = (await response.json()).workflow;
@@ -112,7 +112,7 @@ test('claim workflow HTTP covers actual routes, sidebar guard, file streaming, r
     response = await upload('alice', '补充证明'); assert.equal(response.status, 200); const reviewFile = (await response.json()).file;
     response = await act('alice', 'reject', { attachments: [reviewFile.id], comment: '请补充证明' }); w = (await response.json()).workflow; assert.equal(w.status, 'rejected');
     assert.equal((await call('bob', reviewFile.url)).status, 200);
-    const state = JSON.parse(await readFile(path.join(dir, 'fake-dida.json'), 'utf8')); assert.ok(!state.alice.original.status); assert.ok(!state.bob[w.targetId].status);
+    const state = JSON.parse(await readFile(path.join(dir, 'fake-dida.json'), 'utf8')); assert.ok(!state.alice.original.status); assert.equal(state.bob[w.targetId].status, 2, 'rejection does not reopen Dida tasks');
     const count = (await readdir(path.join(dir, 'workflow-files'))).length;
     response = await upload('bob', new Uint8Array(20 * 1024 * 1024 + 1)); assert.equal(response.status, 413); assert.equal((await readdir(path.join(dir, 'workflow-files'))).length, count);
     response = await act('bob', 'submit'); w = (await response.json()).workflow;

@@ -18,12 +18,26 @@ export function inboxResponseShape(value: unknown) {
 export type TickProject = { id: string; name: string; closed?: boolean };
 export type TickTask = { id: string; projectId: string; title: string; status?: number; dueDate?: string; startDate?: string; isAllDay?: boolean };
 
+const sharedReads = globalThis as typeof globalThis & { didaReads?: Map<string, Promise<Response>> };
+const reads = sharedReads.didaReads ||= new Map<string, Promise<Response>>();
 export async function tickFetch(path: string, token: string, init?: RequestInit) {
-  return fetch(`https://api.dida365.com/open/v1${path}`, {
+  const read = !init?.method || init.method === 'GET' || ['/task/filter', '/task/completed'].includes(path);
+  const prefix = JSON.stringify(token) + ':';
+  const invalidate = () => { for (const key of reads.keys()) if (key.startsWith(prefix)) reads.delete(key); };
+  if (!read) invalidate();
+  const key = prefix + JSON.stringify([path, init?.body, init?.headers]);
+  const perform = () => fetch(`https://api.dida365.com/open/v1${path}`, {
     ...init,
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", ...(init?.headers || {}) },
     signal: init?.signal || AbortSignal.timeout(15_000), cache: "no-store",
   });
+  if (!read || init?.signal) { try { return await perform(); } finally { if (!read) invalidate(); } }
+  let pending = reads.get(key);
+  if (!pending) {
+    pending = perform(); reads.set(key, pending);
+    void pending.finally(() => { if (reads.get(key) === pending) reads.delete(key); }).catch(() => undefined);
+  }
+  return (await pending).clone();
 }
 
 export class TickApiError extends Error {
@@ -56,19 +70,29 @@ export async function tickInboxData<T extends { id: string; projectId: string } 
   }
   if (!projectId && !data.tasks.length) {
     projectId = knownInboxes.get(token);
-    if (!projectId) {
-      try {
-        const metadata = await tickFetch("/project/inbox", token);
-        const project = metadata.ok ? await metadata.json().catch(() => null) : null;
-        if (concreteProjectId(project?.id)) projectId = project.id;
-      } catch { /* Empty read remains valid even if optional metadata is unavailable. */ }
-    }
     if (!projectId) return { projectId: "inbox", tasks: [] };
   }
   if (!projectId) throw invalid();
   knownInboxes.delete(token); knownInboxes.set(token, projectId);
   if (knownInboxes.size > 100) knownInboxes.delete(knownInboxes.keys().next().value!);
   return { projectId, tasks: data.tasks.filter((task: T | null) => task && typeof task.id === "string" && task.projectId === projectId) };
+}
+
+// Displaying an empty list needs no concrete ID. Only callers that must locate
+// or write a task resolve optional metadata, reusing the already fetched list.
+export async function resolveTickInbox<T extends { id: string; projectId: string } = TickTask>(token: string, inbox?: { projectId: string; tasks: T[] }) {
+  const data = inbox || await tickInboxData<T>(token);
+  if (data.projectId !== 'inbox') return data;
+  const known = knownInboxes.get(token);
+  if (known) return { ...data, projectId: known };
+  const response = await tickFetch('/project/inbox', token);
+  const project = response.ok ? await response.json().catch(() => null) : null;
+  if (concreteProjectId(project?.id)) {
+    knownInboxes.set(token, project.id);
+    if (knownInboxes.size > 100) knownInboxes.delete(knownInboxes.keys().next().value!);
+    return { ...data, projectId: project.id as string };
+  }
+  return data;
 }
 
 export type TaskView = "today" | "week" | "undated";

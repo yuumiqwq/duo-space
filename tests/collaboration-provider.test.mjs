@@ -435,3 +435,29 @@ test('lookup searches open tasks first, limits completion history to publication
     if (previousSecret === undefined) delete process.env.TICKTICK_STORAGE_SECRET; else process.env.TICKTICK_STORAGE_SECRET = previousSecret;
   }
 });
+
+test('a late pre-write inbox response cannot repopulate the provider cache after a mutation', async () => {
+  await providerFixture(async gateway => {
+    const gate = deferred(), entered = deferred(); let inboxReads = 0;
+    const original = { id: 'known', projectId: 'account-inbox', ...taskFields({ title: 'old' }) }; let task = structuredClone(original);
+    globalThis.fetch = async (url, init) => {
+      const route = new URL(url).pathname.replace('/open/v1', '');
+      if (route === '/project/inbox/data') {
+        const snapshot = structuredClone(task); inboxReads++;
+        if (inboxReads === 1) { entered.resolve(); await gate.promise; }
+        return Response.json({ tasks: [snapshot] });
+      }
+      if (route === '/task/known' && init.method === 'POST') { task = { ...task, ...JSON.parse(init.body) }; return Response.json(task); }
+      if (route === '/project/account-inbox/task/known') return Response.json(task);
+      throw new Error('Unexpected request ' + route);
+    };
+    const old = gateway.inbox('alice');
+    try {
+      await entered.promise;
+      const saved = await gateway.update('alice', 'known', taskFields({ title: 'new' }), remoteVersion(original), original.projectId, original);
+      assert.equal(saved.title, 'new');
+    } finally { gate.resolve(); await old; }
+    assert.equal((await gateway.get('alice', 'known')).title, 'new');
+    assert.equal(inboxReads, 2, 'the late response never became the cached inbox');
+  });
+});

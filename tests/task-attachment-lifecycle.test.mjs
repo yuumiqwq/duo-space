@@ -20,7 +20,7 @@ async function fixture() {
     members: async () => ['alice', 'bob'].map(id => ({ id, name: id, connected: true })),
     inbox: async owner => ({ projectId: `inbox-${owner}`, tasks: [...accounts[owner].values()].map(task => structuredClone(task)) }),
     get: async (owner, id) => structuredClone(accounts[owner].get(id) || null),
-    create: async (owner, id, fields) => accounts[owner].set(id, { ...fields, id, projectId: `inbox-${owner}` }),
+    create: async (owner, id, fields) => { accounts[owner].set(id, { ...fields, id, projectId: `inbox-${owner}` }); return structuredClone(accounts[owner].get(id)); },
     update: async (owner, id, fields) => Object.assign(accounts[owner].get(id), fields),
     complete: async (owner, id) => { accounts[owner].get(id).status = 2; },
     checkTransfer: async () => {},

@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { currentIdentityId } from "../../identity/session";
 import { getUser } from "../../identity/store";
 import { decryptToken } from "../crypto";
-import { tickFetch, tickInboxData, TickApiError } from "../client";
+import { tickFetch, resolveTickInbox, TickApiError } from "../client";
 import { createSharedTask, markSharedTasksRead, SharedTaskError, unreadSharedTasks } from "../shared-store";
 
 const noStore = { "Cache-Control": "private, no-store" };
@@ -35,7 +35,7 @@ export async function POST(request: Request) {
   catch { return NextResponse.json({ error: "对方需要重新连接滴答清单。" }, { status: 422 }); }
   try {
     // Reads may be retried freely. Resolve the recipient's inbox before recording a write attempt.
-    const { projectId: inboxId } = await tickInboxData(token);
+    const { projectId: inboxId } = await resolveTickInbox(token);
     if (inboxId === "inbox") return NextResponse.json({ error: "对方收集箱为空且未返回具体编号，请先在其收集箱添加一项后刷新。" }, { status: 422 });
     const record = await createSharedTask({ id: body.id, senderId, recipientId, senderName: sender.nickname || "成员", title }, async () => {
       const response = await tickFetch("/task", token, { method: "POST", body: JSON.stringify({ title, projectId: inboxId, timeZone: "Asia/Shanghai", isAllDay: true }) });

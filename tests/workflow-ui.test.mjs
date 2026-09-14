@@ -23,7 +23,7 @@ test('workflow detail offers settings to every member and direct completion only
     assert.equal(settings.includes('aria-label="删除任务"'), member !== 'charlie' && status !== 'deleted');
     if(status==='deleted') assert.match(settings, /disabled/);
   }
-  assert.ok(render('bob').includes('提交完成')); assert.ok(!render('bob', 'working', true).includes('提交完成'));
+  assert.ok(render('bob').includes('提交完成')); assert.ok(render('bob', 'working', true).includes('提交完成'));
   assert.ok(!render('charlie', 'working', true).includes('核对并继续')); assert.ok(render('charlie', 'working', true).includes('正在同步任务'));
   for (const failure of ['error', 'syncError']) {
     workflow[failure] = '关联任务在同步期间被修改，已暂停覆盖，请核对后重试';
@@ -32,7 +32,7 @@ test('workflow detail offers settings to every member and direct completion only
       assert.match(failedEdit, /role="alert">关联任务在同步期间被修改/);
       assert.ok(!failedEdit.includes('aria-label="正在同步任务"'), 'a failed edit must not look like an active request');
       assert.ok(failedEdit.includes('>重试同步</button>'), 'retry is available without saving another edit');
-      assert.ok(!failedEdit.includes('>提交完成</button>'));
+      assert.equal(failedEdit.includes('>提交完成</button>'), member === 'bob');
     }
     delete workflow[failure];
   }
@@ -141,6 +141,8 @@ test('workflow detail offers settings to every member and direct completion only
     assert.match(html, /<\/ol><p class="coop-feedback error" role="alert"><small>该任务已被删除<\/small><\/p>/);
     assert.equal(html.match(/该任务已被删除/g).length, 1);
     assert.ok(!html.match(/<ol[\s\S]*该任务已被删除[\s\S]*<\/ol>/));
-    assert.ok(!html.includes('>通过</button>')); assert.ok(!html.includes('>提交完成</button>'));
+    if (member === 'alice') { assert.match(html, /<button[^>]+disabled[^>]*>[\s\S]*?>通过<\/button>/); assert.ok(html.includes('>打回</button>')); }
+    else assert.ok(!html.includes('>通过</button>'));
+    assert.ok(!html.includes('>提交完成</button>'));
   }
 });

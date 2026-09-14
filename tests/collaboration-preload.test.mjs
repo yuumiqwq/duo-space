@@ -33,7 +33,7 @@ test('classroom preload survives board close and reopen, shares pending reads, a
   };
   const fixture = {
     useCallback: fn => fn, useEffect: fn => hooks.push(fn), previewSnapshot: undefined, identityId: 'alice', open: false,
-    fetching: { current: false }, generation: { current: 0 }, loadController: { current: null }, revision: { current: null },
+    remoteVersions: { current: null }, fetching: { current: false }, generation: { current: 0 }, loadController: { current: null }, revision: { current: null },
     setLoading: value => { loading = value; }, setError: error => assert.fail(error), acceptNotices() {},
     setSnapshot: update => { current = update(current); }, mergeCollaborationSnapshot, withoutDeletedWorkflowTasks,
     loadCollaborationSnapshot: options => loadCollaborationSnapshot({ ...options, request }), taskErrorMessage: error => String(error),
@@ -51,12 +51,15 @@ test('classroom preload survives board close and reopen, shares pending reads, a
   assert.equal(requests.length, 3, 'opening reuses pending preload');
   close(); assert.ok(requests.every(item => !item.signal.aborted)); assert.equal(intervals.size, 0);
   const closeAgain = hooks[1](); await flush(); assert.equal(requests.length, 3, 'reopening also reuses the same reads');
+  await api.load(true, []);
+  assert.equal(requests.length, 4, 'a website command only refreshes local records');
+  assert.ok(requests.slice(0, 3).every(item => !item.signal.aborted), 'local commands preserve the existing preload');
   alice.resolve(); await tick();
   assert.equal(current.members[0].tasks[0].id, 'alice-task'); assert.ok(current.members[1].loading);
   closeAgain(); unmount();
   const before = structuredClone(current); bob.resolve(); await tick();
   assert.deepEqual(current, before, 'late completion after leaving the room cannot change the snapshot');
-  assert.ok(requests.every(item => item.signal.aborted));
+  assert.ok(requests.slice(0, 3).every(item => item.signal.aborted));
 });
 
 test('member column renders preloaded tasks alongside a refresh error instead of hiding the list', () => {

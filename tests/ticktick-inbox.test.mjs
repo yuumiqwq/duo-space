@@ -5,7 +5,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
 import { build } from 'esbuild';
-import { tickInboxData } from '../app/api/ticktick/client.ts';
+import { tickInboxData, resolveTickInbox } from '../app/api/ticktick/client.ts';
 
 test('reported 24-task response without project metadata resolves its unique account-specific inbox and retains every task', async () => {
   const original = globalThis.fetch;
@@ -21,7 +21,7 @@ test('reported 24-task response without project metadata resolves its unique acc
   } finally { globalThis.fetch = original; }
 });
 
-test('unseen empty inboxes use optional metadata and never reuse another account ID when metadata is unavailable', async () => {
+test('unseen empty inboxes display immediately and resolve optional metadata only for writes and never reuse another account ID when metadata is unavailable', async () => {
   const original = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
     if (url.endsWith('/project/inbox/data')) return Response.json({ tasks: [], columns: [] });
@@ -29,7 +29,9 @@ test('unseen empty inboxes use optional metadata and never reuse another account
     return init.headers.Authorization === 'Bearer empty-metadata-token' ? Response.json({ id: 'empty-metadata-inbox' }) : new Response(null, { status: 404 });
   };
   try {
-    assert.deepEqual(await tickInboxData('empty-metadata-token'), { projectId: 'empty-metadata-inbox', tasks: [] });
+    const inbox = await tickInboxData('empty-metadata-token');
+    assert.deepEqual(inbox, { projectId: 'inbox', tasks: [] });
+    assert.deepEqual(await resolveTickInbox('empty-metadata-token', inbox), { projectId: 'empty-metadata-inbox', tasks: [] });
     assert.deepEqual(await tickInboxData('different-empty-token'), { projectId: 'inbox', tasks: [] });
   } finally { globalThis.fetch = original; }
 });

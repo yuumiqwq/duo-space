@@ -712,8 +712,9 @@ test('deleting a previously linked original task preserves the website stage and
     w = await refreshed(f, w.id); assert.ok(w.taskAnomaly);
     const prior = w.status;
     if (deletionTime === 'direct') assert.match((await act(f, w, 'alice', 'owner-complete')).error, /该任务已被删除/);
-    else await assert.rejects(act(f, w, deletionTime === 'before-submit' ? 'bob' : 'alice', deletionTime === 'before-submit' ? 'submit' : 'approve'), /该任务已被删除/);
-    w = await refreshed(f, w.id); assert.equal(w.status, prior); assert.equal(f.accounts.alice.size, 0);
+    else if (deletionTime === 'before-submit') w = await act(f, w, 'bob', 'submit');
+    else await assert.rejects(act(f, w, 'alice', 'approve'), /该任务已被删除/);
+    w = await refreshed(f, w.id); assert.equal(w.status, deletionTime === 'before-submit' ? 'submitted' : prior); assert.equal(f.accounts.alice.size, 0);
     assert.ok(!f.accounts.bob.get(w.targetId).status); assert.equal(f.counts.creates, 1);
   }
 });
@@ -790,7 +791,7 @@ test('account and detail errors never mark tasks missing or create replacements'
   const f = await fixture(), task = await personal(f); let w = await claim(f, task);
   const inbox = f.gateway.inbox, get = f.gateway.get;
   f.gateway.inbox = async owner => { if (owner === 'bob') throw new Error('authorization expired'); return inbox(owner); };
-  w = await refreshed(f, w.id); assert.ok(w.syncError); assert.ok(!w.taskAnomaly); assert.equal(f.counts.creates, 1);
+  w = await refreshed(f, w.id); assert.ok(!w.syncError, 'exact lookup remains available'); assert.ok(!w.taskAnomaly); assert.equal(f.counts.creates, 1);
   f.gateway.inbox = inbox; f.accounts.bob.delete(w.targetId);
   f.gateway.get = async (owner, id) => { if (owner === 'bob') throw new Error('timeout'); return get(owner, id); };
   w = await refreshed(f, w.id); assert.match(w.syncError, /timeout/); assert.ok(!w.taskAnomaly);
@@ -1113,7 +1114,7 @@ test('lost detail update response resumes after restart without overwriting newe
   f.gateway.update = async (...args) => { writes++; await update(...args); if (fail) { fail = false; throw new Error('lost update response'); } };
   const command = { id: randomUUID(), workflowId: w.id, version: w.version, action: 'update-workflow', fields: { title: '更新' } };
   w = await f.store.workflowCommand('bob', command); assert.equal(w.editPending, true);
-  await assert.rejects(act(f, w, 'bob', 'submit'), /同步/);
+  w = await act(f, w, 'bob', 'submit'); assert.equal(w.status, 'submitted');
   f.store = new CollaborationStore(f.dir, f.gateway);
   w = await f.store.workflowCommand('bob', command); assert.equal(w.editPending, false); assert.equal(writes, 2);
   await f.store.workflowCommand('bob', command); assert.equal(writes, 2);
@@ -1208,7 +1209,8 @@ test('explicit rejection requires a new submission and external claimant complet
   f.accounts.bob.get(w.targetId).title = 'changed externally';
   assert.ok(!f.accounts.alice.get(task.id).status);
   w = await act(f, w, 'alice', 'reject'); f.accounts.bob.get(w.targetId).status = 2;
-  w = await act(f, w, 'bob', 'submit'); assert.equal(w.status, 'submitted'); assert.equal(f.accounts.bob.get(w.targetId).status, 0);
+  w = await act(f, w, 'bob', 'submit'); assert.equal(w.status, 'submitted'); assert.equal(f.accounts.bob.get(w.targetId).status, 2);
+  w = await refreshed(f, w.id); assert.equal(f.accounts.bob.get(w.targetId).status, 0);
   await assert.rejects(act(f, { ...w, version: w.version - 1 }, 'bob', 'submit'), /已更新/);
 });
 
@@ -1480,7 +1482,7 @@ test('deleted claimant markers preserve stages and results, stay outside records
     f.accounts.bob.delete(w.targetId); w = await refreshed(f, w.id);
     assert.ok(w.taskAnomaly); assert.equal(w.status, stage); assert.deepEqual(w.events, before.events);
     assert.deepEqual((await f.store.revision('alice')).notices, notices);
-    await assert.rejects(act(f, w, stage === 'working' ? 'bob' : 'alice', stage === 'working' ? 'submit' : 'approve'), /该任务已被删除/);
+    if (stage === 'submitted') await assert.rejects(act(f, w, 'alice', 'approve'), /该任务已被删除/);
     assert.ok((await f.store.snapshot('alice')).buffer.some(item => item.id === task.id));
     f.accounts.bob.set(w.targetId, { ...target, status: repairedStatus });
     w = await refreshed(f, w.id);
@@ -1547,7 +1549,7 @@ test('submit and review reconcile external owner completion according to the req
     assert.ok(!f.accounts.bob.get(w.targetId).status);
     w = await act(f, w, action === 'submit' ? 'bob' : 'alice', action, { comment: '成果' });
     assert.equal(w.status, action === 'approve' ? 'done' : action === 'submit' ? 'submitted' : 'rejected');
-    assert.equal(f.accounts.alice.get(task.id).status, action === 'approve' ? 2 : 0);
+    assert.equal(f.accounts.alice.get(task.id).status, 2, 'local submit/reject leaves Dida unchanged');
     assert.equal(f.accounts.bob.get(w.targetId).status || 0, action === 'approve' ? 2 : 0);
   }
 });
@@ -1578,5 +1580,108 @@ test('public and personal edits before claiming never enter workflow history', a
     assert.deepEqual(workflow.events.map(event => event.type), ['claimed', 'updated']);
     assert.match(workflow.events[1].comment, /认领前修改说明.*认领后修改说明/);
     await assert.rejects(f.store.execute('bob', { id: randomUUID(), action: 'update', source: source(task), fields: { title: '旧详情页修改' } }), /流程|认领/);
+  }
+});
+
+const waitGate = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
+const promptly = async promise => {
+  let timer;
+  try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Website command waited for unrelated Dida I/O')), 1500); })]); }
+  finally { clearTimeout(timer); }
+};
+
+test('stalled background inboxes do not block website writes and cannot restore an archived workflow', async () => {
+  const f = await fixture(), task = await f.create('stale background'); let w = await claim(f, task);
+  const entered = waitGate(), gate = waitGate(), inbox = f.gateway.inbox;
+  f.gateway.inbox = async owner => { const old = await inbox(owner); entered.resolve(); await gate.promise; return old; };
+  const maintenance = f.store.checkWorkflows();
+  try {
+    await entered.promise;
+    const created = await promptly(f.store.execute('alice', { id: randomUUID(), action: 'create', fields: { title: 'independent' } }));
+    assert.equal(created.status, 'done');
+    w = await promptly(act(f, w, 'alice', 'delete-owner-task'));
+    assert.equal(w.status, 'deleted');
+  } finally { gate.resolve(); await maintenance; f.gateway.inbox = inbox; }
+  const snapshot = await f.store.snapshot('bob', null);
+  assert.equal(snapshot.workflows.find(item => item.id === w.id).status, 'deleted');
+  assert.deepEqual(snapshot.buffer.map(item => item.title), ['independent']);
+});
+
+test('a slow ordinary completion allows concurrent local creates, execution arrangement and notice acknowledgment without lost writes', async () => {
+  const f = await fixture(), task = await personal(f), w = await claim(f, await f.create('other workflow'));
+  const gate = waitGate(), entered = waitGate(), complete = f.gateway.complete;
+  f.gateway.complete = async (...args) => { entered.resolve(); await gate.promise; await complete(...args); };
+  const pending = f.store.execute('alice', { id: randomUUID(), action: 'complete', source: source(task) });
+  try {
+    await entered.promise;
+    const state = await f.store.snapshot('bob', null);
+    await promptly(Promise.all([
+      ...Array.from({ length: 5 }, (_, i) => f.store.execute('alice', { id: randomUUID(), action: 'create', fields: { title: `concurrent-${i}` } })),
+      f.store.arrangeExecution('bob', { id: randomUUID(), action: 'arrange-execution', version: state.executionVersion, workflowIds: [w.id] }),
+      f.store.markNoticesRead('bob', (await f.store.revision('bob')).notices.map(item => item.id)),
+    ]));
+  } finally { gate.resolve(); }
+  assert.equal((await pending).status, 'done');
+  const snapshot = await f.store.snapshot('bob', null);
+  assert.equal(snapshot.buffer.filter(item => item.title.startsWith('concurrent-')).length, 5);
+  assert.ok(snapshot.workflows.find(item => item.id === w.id).executing);
+  assert.equal(snapshot.operations.filter(item => item.status === 'pending').length, 0);
+});
+
+test('submission and rejection with attachments perform zero Dida calls despite pending edits, missing tasks or connection errors, including replay', async () => {
+  const f = await fixture(), task = await personal(f); let w = await claim(f, task);
+  await arrange(f, 'bob', [w.id]); w = (await f.store.snapshot('bob', null)).workflows.find(item => item.id === w.id);
+  const file = path.join(f.dir, 'room-collaboration.json'), state = JSON.parse(await readFile(file, 'utf8'));
+  state.workflows[w.id].edit = { id: randomUUID(), fields: w.fields };
+  state.workflows[w.id].taskAnomaly = true; state.workflows[w.id].syncError = 'unavailable';
+  await writeFile(file, JSON.stringify(state));
+  for (const method of ['inbox', 'get', 'locate', 'update', 'create', 'remove', 'reopen', 'complete']) f.gateway[method] = async () => assert.fail(`Unexpected Dida ${method}`);
+  for (const [actor, action] of [['bob', 'submit'], ['alice', 'reject']]) {
+    assert.equal(await f.store.attachmentAccess(actor, w.id, true), true);
+    const fileId = randomUUID(); await mkdir(path.join(f.dir, 'workflow-files'), { recursive: true });
+    await writeFile(path.join(f.dir, 'workflow-files', `${fileId}.json`), JSON.stringify({ workflowId: w.id, actorId: actor, name: 'result.pdf', size: 30 }));
+    const command = { id: randomUUID(), workflowId: w.id, version: w.version, action, comment: action, attachments: [fileId] };
+    w = await f.store.workflowCommand(actor, command);
+    assert.equal(w.status, action === 'submit' ? 'submitted' : 'rejected');
+    assert.equal(w.events.at(-1).files[0].id, fileId); assert.equal(w.syncError, 'unavailable');
+    const replay = await f.store.workflowCommand(actor, command);
+    assert.equal(replay.events.filter(event => event.id === command.id).length, 1);
+  }
+});
+
+test('a stalled exact background lookup does not delay submission or overwrite the saved local stage', async () => {
+  const f = await fixture(), task = await personal(f); let w = await claim(f, task);
+  const gate = waitGate(), entered = waitGate(), get = f.gateway.get;
+  f.gateway.inbox = async () => { throw new Error('inbox unavailable'); };
+  f.gateway.get = async (...args) => { const result = await get(...args); entered.resolve(); await gate.promise; return result; };
+  const maintenance = f.store.checkWorkflows();
+  try { await entered.promise; w = await promptly(act(f, w, 'bob', 'submit', { comment: 'persist me' })); assert.equal(w.status, 'submitted'); }
+  finally { gate.resolve(); await maintenance.catch(error => assert.match(error.message, /流程已更新/)); }
+  const saved = (await f.store.snapshot('bob', null)).workflows.find(item => item.id === w.id);
+  assert.equal(saved.status, 'submitted'); assert.equal(saved.events.at(-1).comment, 'persist me');
+});
+
+test('execution changes during a remote write cannot resurrect a deleted workflow, and successful remote edits remain recoverable', async () => {
+  for (const action of ['arrange', 'delete']) {
+    const f = await fixture(), task = await personal(f); let w = await claim(f, task);
+    await arrange(f, 'bob', [w.id]); w = (await f.store.snapshot('bob', null)).workflows.find(item => item.id === w.id);
+    const gate = waitGate(), entered = waitGate(), update = f.gateway.update;
+    f.gateway.update = async (...args) => { await update(...args); entered.resolve(); await gate.promise; };
+    const command = { id: randomUUID(), workflowId: w.id, version: w.version, action: 'update-workflow', fields: { title: 'saved externally' } };
+    const pending = f.store.workflowCommand('alice', command).catch(error => error);
+    try {
+      await entered.promise;
+      const current = await f.store.snapshot('bob', null); w = current.workflows.find(item => item.id === w.id);
+      if (action === 'delete') w = await promptly(act(f, w, 'bob', 'delete-claimed-task'));
+      else await promptly(f.store.arrangeExecution('bob', { id: randomUUID(), action: 'arrange-execution', version: current.executionVersion, workflowIds: [] }));
+    } finally { gate.resolve(); }
+    assert.ok((await pending) instanceof CollaborationError);
+    w = (await f.store.snapshot('bob', null)).workflows.find(item => item.id === w.id);
+    assert.equal(w.executing, false);
+    if (action === 'delete') { assert.equal(w.status, 'deleted'); assert.equal(w.editPending, false); }
+    else {
+      w = await f.store.workflowCommand('alice', command);
+      assert.equal(w.editPending, false); assert.equal(w.title, 'saved externally'); assert.equal(w.executing, false);
+    }
   }
 });

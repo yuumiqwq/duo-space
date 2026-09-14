@@ -65,8 +65,8 @@ function WorkflowDetail({ workflow, identityId, name, busy, error, perform, back
   const [replyTo, setReplyTo] = useState<string | null>(null);
   const uploadLock = useRef(false), input = useRef<HTMLInputElement>(null), commentEditor = useRef<HTMLTextAreaElement>(null), active = useRef(true);
   useEffect(() => { active.current = true; return () => { active.current = false; }; }, []);
-  const submit = isExecuting(workflow) && !workflow.taskAnomaly && !workflow.editPending && workflow.claimantId === identityId && ["working", "rejected"].includes(workflow.status);
-  const review = !workflow.taskAnomaly && !workflow.editPending && workflow.reviewerId === identityId && workflow.status === "submitted";
+  const submit = isExecuting(workflow) && workflow.claimantId === identityId && ["working", "rejected"].includes(workflow.status);
+  const review = workflow.reviewerId === identityId && workflow.status === "submitted";
   const synchronizing = workflow.ownerDeletePending || workflow.reopenPending || workflow.editPending || ['creating', 'approving'].includes(workflow.status);
   const editSyncFailed = !!workflow.editPending && !!(error || workflow.syncError || workflow.error);
   const disabled = busy || uploading || !!workflow.ownerDeletePending || workflow.status === 'deleted';
@@ -123,7 +123,7 @@ function WorkflowDetail({ workflow, identityId, name, busy, error, perform, back
       <label htmlFor={`comment-${workflow.id}`}>{review ? "审批评语" : "完成说明"}</label><textarea ref={commentEditor} id={`comment-${workflow.id}`} rows={3} value={comment} maxLength={10000} disabled={disabled} onChange={event => setComment(event.target.value)} onPaste={event => { const pasted = clipboardFiles(event.clipboardData); if (pasted.length) { event.preventDefault(); void upload(pasted); } }} />
       <WorkflowAttachments files={files} disabled={disabled} onRemove={(file, label) => { setFiles(current => current.filter(item => item.id !== file.id)); setComment(current => current.replaceAll(`[${label}]`, '')); }} />
       <input ref={input} className="coop-sr-only" type="file" multiple tabIndex={-1} onChange={event => { void upload(Array.from(event.target.files || [])); event.target.value = ""; }} />
-      <div className="coop-workflow-actions"><button type="button" disabled={disabled} onClick={() => input.current?.click()}><Paperclip size={15} />{uploading ? "上传中…" : "附件"}</button><span />{submit ? <button type="button" className="primary" disabled={disabled} onClick={() => void act("submit")}><Send size={15} />提交完成</button> : <><button type="button" disabled={disabled} onClick={() => void act("reject")}><RotateCcw size={15} />打回</button><button type="button" className="primary" disabled={disabled} onClick={() => void act("approve")}><Check size={15} />通过</button></>}</div>
+      <div className="coop-workflow-actions"><button type="button" disabled={disabled} onClick={() => input.current?.click()}><Paperclip size={15} />{uploading ? "上传中…" : "附件"}</button><span />{submit ? <button type="button" className="primary" disabled={disabled} onClick={() => void act("submit")}><Send size={15} />提交完成</button> : <><button type="button" disabled={disabled} onClick={() => void act("reject")}><RotateCcw size={15} />打回</button><button type="button" className="primary" disabled={disabled || workflow.taskAnomaly || workflow.editPending} onClick={() => void act("approve")}><Check size={15} />通过</button></>}</div>
     </div>}
     {synchronizing && !editSyncFailed && !workflow.reopenPending && !workflow.taskAnomaly && <span className="workflow-sync-spinner" role="status" aria-label="正在同步任务" />}
     {workflow.status === "submitted" && !review && <p className="coop-workflow-people">等待 {name(workflow.reviewerId)} 审批</p>}

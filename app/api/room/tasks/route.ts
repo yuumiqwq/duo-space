@@ -16,7 +16,7 @@ export async function GET(request: NextRequest) {
     const local = request.nextUrl.searchParams.has("local"), member = request.nextUrl.searchParams.get("member");
     const revision = request.nextUrl.searchParams.has("revision");
     if (!local && member === null && !revision) await store.resetLegacy(id);
-    after(async () => { await store.resetLegacy(id).catch(() => undefined); await store.maintainWorkflows().catch(() => undefined); });
+    after(async () => { await store.resetLegacy(id).catch(() => undefined); if (!local) await store.maintainWorkflows().catch(() => undefined); });
     const diagnostic = request.nextUrl.searchParams.get("diagnose");
     return json(diagnostic !== null ? await store.inspectTransfer(id, diagnostic) : revision ? await store.revision(id) : await store.snapshot(id, local ? null : member ?? undefined));
   }
@@ -39,7 +39,7 @@ export async function POST(request: NextRequest) {
     if (command.action === "claim" || ["submit", "approve", "reject", "retry-workflow", "owner-complete", "update-workflow", "restore-workflow", "delete-claimed-task", "delete-owner-task", "nudge", "reply-nudge"].includes(command.action)) {
       const workflow = command.action === "claim" ? await store.claim(actor, command) : await store.workflowCommand(actor, command);
       if (isPersonalCollection(workflow)) return json({ operation: collectionOperation(workflow) }, workflow.error ? 202 : 200);
-      return json({ workflow }, workflow.status !== 'deleted' && (workflow.error || workflow.syncError) ? 202 : 200);
+      return json({ workflow }, !['submit', 'reject', 'nudge', 'reply-nudge'].includes(command.action) && workflow.status !== 'deleted' && (workflow.error || workflow.syncError) ? 202 : 200);
     }
     const result = command.action === "recover" ? await store.recover() : command.action === "resume" || command.action === "cancel"
       ? await store.resume(actor, typeof command.id === "string" ? command.id : "", command.action === "cancel")

@@ -1,5 +1,7 @@
 "use client";
 
+import { taskRefresh } from "./task-refresh";
+
 import { AudioPlayer } from "./AudioPlayer";
 import { RemoteMicrophone } from "./RemoteMicrophone";
 import { prepareClassroomAssets } from './classroom-loading';
@@ -8,7 +10,7 @@ import { createChatSyncRequest } from "./chat-sync-request";
 import { startChatSyncLifecycle } from "./chat-sync-lifecycle";
 import { decodeVapidKey, subscriptionNeedsRenewal } from "./push-subscription";
 
-import { FormEvent, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { FormEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Camera, ChevronLeft, ChevronRight, Volume2, VolumeX, X, Paperclip, File, Download, Undo2, Quote, Copy, Check, PictureInPicture2, MessageCircle, ListTodo } from "lucide-react";
 import { Room, RoomEvent, Track } from "livekit-client";
 import { createMediaRecovery, mediaCallReusable, type MediaSource } from "./media-recovery";
@@ -697,7 +699,7 @@ export default function Home() {
 
 
   const taskLoadVersionRef = useRef(0);
-  const loadTasks = useCallback(async () => {
+  const readTasks = useCallback(async (): Promise<boolean> => {
     const version = ++taskLoadVersionRef.current;
     setSyncing(true);
     setSyncError("");
@@ -726,6 +728,7 @@ export default function Home() {
       if (version === taskLoadVersionRef.current) setSyncing(false);
     }
   }, []);
+  const loadTasks = useMemo(() => taskRefresh(readTasks), [readTasks]);
 
   const loadedDayRef = useRef("");
   useEffect(() => {
@@ -1782,12 +1785,16 @@ export default function Home() {
       return;
     }
     setToken("");
-    const loaded = await loadTasks();
+    taskLoadVersionRef.current++;
+    const loaded = await loadTasks(true);
     if (loaded) setSyncOpen(false);
   };
 
   const disconnectTickTick = async () => {
-    await fetch("/api/ticktick/token", { method: "DELETE" });
+    const response = await fetch("/api/ticktick/token", { method: "DELETE" });
+    if (!response.ok) return;
+    taskLoadVersionRef.current++;
+    setSyncing(false);
     setConnected(false);
     setTasks((current) => current.filter((task) => task.source === "local"));
     setSyncOpen(false);
