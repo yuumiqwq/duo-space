@@ -277,7 +277,8 @@ test('provider date defaults and copied checklist IDs compare by content without
   for (const patch of [{ isAllDay: false }, { repeatFlag: 'RRULE:FREQ=DAILY' }, { reminders: ['TRIGGER:-PT15M'] }]) {
     assert.ok(!sameFields({ ...fields, ...patch }, { ...copy, ...patch }), 'time, recurrence and reminder semantics remain strict');
   }
-  for (const patch of [{ dueDate: '2026-09-12T16:00:00Z' }, { startDate: null }, { title: '改过标题' }, { content: '增加说明' }]) {
+  assert.ok(sameFields(fields, { ...copy, startDate: null }), 'a due-only all-day date is equivalent to the same-day pair');
+  for (const patch of [{ dueDate: '2026-09-12T16:00:00Z' }, { startDate: null, dueDate: null }, { title: '改过标题' }, { content: '增加说明' }]) {
     assert.ok(!sameFields(fields, { ...copy, ...patch }));
   }
   for (const patch of [{ title: '另一项' }, { status: 1 }, { sortOrder: 100 }, { startDate: '2026-09-12T16:00:00Z' }, { isAllDay: true }, { timeZone: 'UTC' }]) {
@@ -1298,6 +1299,99 @@ test('metadata-only changes and partially applied settings resume while actual c
       assert.equal(f.accounts.bob.get(w.targetId).startDate, null);
     }
   }
+});
+
+test('explicit website resync recovers a legacy conflict, preserves history and never rebases replayed requests', async () => {
+  for (const interrupted of [false, true]) {
+    const f = await fixture(); let w = await claim(f, await f.create('旧版本日期修改'));
+    const update = f.gateway.update;
+    f.gateway.update = async () => { throw new Error('write failed'); };
+    w = await act(f, w, 'alice', 'update-workflow', { fields: { priority: 5, startDate: '2026-09-12T16:00:00.000Z' } });
+    const file = path.join(f.dir, 'room-collaboration.json'), state = JSON.parse(await readFile(file, 'utf8'));
+    for (const target of state.workflows[w.id].edit.targets) delete target.baseline;
+    await writeFile(file, JSON.stringify(state));
+    f.accounts.bob.get(w.targetId).etag = 'external-change';
+    f.accounts.bob.get(w.targetId).priority = 5;
+    f.store = new CollaborationStore(f.dir, f.gateway);
+    w = await act(f, w, 'alice', 'retry-workflow'); assert.match(w.error, /同步期间被修改/);
+    const history = structuredClone(w.events);
+    const command = { id: randomUUID(), workflowId: w.id, version: w.version, action: 'resync-settings' };
+    await assert.rejects(f.store.workflowCommand('alice', { ...command, version: w.version - 1 }), /流程已更新/);
+    let writes = 0;
+    f.gateway.update = async (...args) => { writes++; if (interrupted) throw new Error('lost request'); await update(...args); };
+    w = await f.store.workflowCommand('alice', command);
+    assert.deepEqual(w.events, history); assert.equal(writes, 1);
+    if (interrupted) {
+      f.accounts.bob.get(w.targetId).content = 'a newer external description';
+      f.gateway.update = async (...args) => { writes++; await update(...args); };
+      f.store = new CollaborationStore(f.dir, f.gateway);
+      w = await f.store.workflowCommand('alice', command);
+      assert.match(w.error, /同步期间被修改/); assert.equal(w.editPending, true);
+      assert.equal(writes, 1, 'replay retains the captured baseline and protects later external edits');
+    } else {
+      assert.equal(w.editPending, false); assert.equal(w.error, '');
+      assert.equal(f.accounts.bob.get(w.targetId).startDate, '2026-09-12T16:00:00.000Z');
+      f.gateway.update = async () => { throw new Error('later settings pending'); };
+      w = await act(f, w, 'alice', 'update-workflow', { fields: { content: 'another saved edit' } });
+      const latestHistory = structuredClone(w.events), later = (await f.store.inspectWorkflowSync('alice', w.id)).editId;
+      f.gateway.update = async () => assert.fail('an old resync must not run a later edit');
+      f.store = new CollaborationStore(f.dir, f.gateway);
+      w = await f.store.workflowCommand('alice', command);
+      assert.equal((await f.store.inspectWorkflowSync('alice', w.id)).editId, later);
+      assert.deepEqual(w.events, latestHistory);
+    }
+    await assert.rejects(f.store.workflowCommand('bob', command), /操作编号已使用/);
+    const deleted = await act(f, w, 'alice', 'delete-owner-task');
+    assert.equal((await f.store.workflowCommand('alice', command)).status, 'deleted');
+    await assert.rejects(act(f, deleted, 'alice', 'resync-settings'), /已删除/);
+  }
+});
+
+test('pending ordinary updates reconcile matching due-only writes without overwriting differences or trusting residual detail records', async () => {
+  for (const scenario of ['match', 'different', 'deleted', 'completed', 'lookup-error']) {
+    const f = await fixture(), task = await personal(f), id = randomUUID(), date = '2026-09-30T15:59:00.000Z';
+    f.gateway.update = async (owner, taskId, fields) => {
+      Object.assign(f.accounts[owner].get(taskId), fields, { startDate: fields.dueDate, etag: 'new-etag' });
+      throw new Error('关联任务的修改正在自动同步');
+    };
+    assert.equal((await f.store.execute('alice', { id, action: 'update', source: source(task), fields: { dueDate: date } })).status, 'pending');
+    if (scenario === 'different') f.accounts.alice.get(task.id).content = 'private external edit';
+    if (scenario === 'completed') f.accounts.alice.get(task.id).status = 2;
+    let reads = 0;
+    f.gateway.locate = async (owner, taskId) => {
+      reads++;
+      if (scenario === 'lookup-error') throw new Error('read unavailable');
+      return scenario === 'deleted' ? null : structuredClone(f.accounts[owner].get(taskId));
+    };
+    f.gateway.update = async () => assert.fail('maintenance never writes task data');
+    f.store = new CollaborationStore(f.dir, f.gateway);
+    await f.store.reconcilePendingUpdates();
+    const report = await f.store.inspectOperationSync('alice', id);
+    assert.equal(report.status, scenario === 'match' ? 'done' : 'pending');
+    assert.equal(report.requested.startDate, null); assert.equal(report.requested.dueDate, date);
+    assert.equal(report.verification.outcome, { match: 'matched', different: 'different', deleted: 'missing', completed: 'different', 'lookup-error': 'error' }[scenario]);
+    assert.ok(!JSON.stringify(report).includes('private external edit'));
+    const before = await readFile(path.join(f.dir, 'room-collaboration.json'), 'utf8');
+    await f.store.inspectOperationSync('bob', id);
+    assert.equal(await readFile(path.join(f.dir, 'room-collaboration.json'), 'utf8'), before, 'copying the report is a local read');
+    await f.store.reconcilePendingUpdates(); assert.equal(reads, 1, 'unresolved reads have a persisted cooldown');
+    await assert.rejects(f.store.inspectOperationSync('intruder', id), /成员/);
+  }
+});
+
+test('unresolved ordinary updates do not starve later pending operations', async () => {
+  const f = await fixture(), ids = [];
+  f.gateway.update = async () => { throw new Error('temporarily unavailable'); };
+  for (let index = 0; index < 4; index++) {
+    const taskId = `pending-${index}`, fields = taskFields({ title: `pending ${index}` });
+    f.accounts.alice.set(taskId, { id: taskId, projectId: 'inbox-alice', ...fields });
+    const id = randomUUID(); ids.push(id);
+    await f.store.execute('alice', { id, action: 'update', source: { ownerId: 'alice', taskId, version: remoteVersion(f.accounts.alice.get(taskId)) }, fields: { priority: 5 } });
+  }
+  await f.store.reconcilePendingUpdates();
+  assert.equal((await f.store.inspectOperationSync('alice', ids[3])).verification, undefined);
+  await f.store.reconcilePendingUpdates();
+  assert.equal((await f.store.inspectOperationSync('alice', ids[3])).verification.outcome, 'different');
 });
 
 test('edit history survives failures, restart and retry while diagnostics retain the first failed attempt', async () => {

@@ -53,6 +53,10 @@ test('claim workflow HTTP covers actual routes, sidebar guard, file streaming, r
     assert.equal(diagnostic.status, 200); assert.match(diagnostic.headers.get('cache-control'), /no-store/);
     const report = await diagnostic.json(); assert.equal(report.workflowId, w.id); assert.deepEqual(report.attempts, []);
     assert.equal(report.requested.content, undefined); assert.equal(report.workflows, undefined);
+    const unnecessaryResync = { id: randomUUID(), workflowId: w.id, version: w.version, action: 'resync-settings' };
+    assert.equal((await call('alice', '/api/room/tasks', unnecessaryResync, { Origin: 'https://foreign.example' })).status, 403);
+    const resyncResponse = await call('alice', '/api/room/tasks', unnecessaryResync);
+    assert.equal(resyncResponse.status, 409); assert.match((await resyncResponse.json()).error, /无需重新同步|流程已更新/);
     const arrangeCurrent = async () => {
       const snapshot = await (await call('bob', '/api/room/tasks?local=1')).json();
       const response = await call('bob', '/api/room/tasks', { id: randomUUID(), action: 'arrange-execution', version: snapshot.executionVersion, workflowIds: [w.id] });
@@ -80,6 +84,7 @@ test('claim workflow HTTP covers actual routes, sidebar guard, file streaming, r
     response = await act('bob', 'update-workflow', { fields: { content: 'HTTP 修改详情\n[附件：测试.pdf](https://study.11scat.xyz/task-attachment?path=tasks%2Ftest%2Ftest.pdf)' } }); assert.equal(response.status, 200); w = (await response.json()).workflow;
     const edited = JSON.parse(await readFile(path.join(dir, 'fake-dida.json'), 'utf8')); assert.equal(edited.alice.original.content, 'HTTP 修改详情\n[附件：测试.pdf](https://study.11scat.xyz/task-attachment?path=tasks%2Ftest%2Ftest.pdf)'); assert.equal(edited.bob[w.targetId].content, 'HTTP 修改详情\n[附件：测试.pdf](https://study.11scat.xyz/task-attachment?path=tasks%2Ftest%2Ftest.pdf)');
     edited.bob[w.targetId].status = 2;
+    edited.bob[w.targetId].completedTime = new Date().toISOString();
     await writeFile(path.join(dir, 'fake-dida.json'), JSON.stringify(edited));
     const externallyChecked = await (await call('bob')).json(); w = externallyChecked.workflows.find(item => item.id === w.id);
     assert.ok(!w.needsSubmission); assert.ok(!w.reopenPending);
@@ -111,6 +116,7 @@ test('claim workflow HTTP covers actual routes, sidebar guard, file streaming, r
     assert.ok(w.events.find(event => event.type === 'submit').files.some(item => item.id === file.id));
     const submittedExternal = JSON.parse(await readFile(path.join(dir, 'fake-dida.json'), 'utf8'));
     submittedExternal.bob[w.targetId].status = 2;
+    submittedExternal.bob[w.targetId].completedTime = new Date().toISOString();
     await writeFile(path.join(dir, 'fake-dida.json'), JSON.stringify(submittedExternal));
     w = (await (await call('alice')).json()).workflows.find(item => item.id === w.id);
     assert.equal(w.status, 'submitted'); assert.ok(w.events.find(item => item.type === 'submit').files.some(item => item.id === file.id));

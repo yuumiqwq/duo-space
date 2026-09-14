@@ -13,6 +13,8 @@ export async function GET(request: NextRequest) {
   try {
     const workflowDiagnostic = request.nextUrl.searchParams.get('workflow-diagnostic');
     if (workflowDiagnostic !== null) return json(await store.inspectWorkflowSync(id, workflowDiagnostic));
+    const operationDiagnostic = request.nextUrl.searchParams.get('operation-diagnostic');
+    if (operationDiagnostic !== null) return json(await store.inspectOperationSync(id, operationDiagnostic));
     // Migrate when the active server receives member traffic. Deployment candidates
     // share the data mount, so startup/health checks must never mutate this store.
     const local = request.nextUrl.searchParams.has("local"), member = request.nextUrl.searchParams.get("member");
@@ -38,7 +40,7 @@ export async function POST(request: NextRequest) {
     if (command.action === "arrange-execution") return json(await store.arrangeExecution(actor, command));
     after(() => store.deliverNotices().catch(() => undefined));
     if (command.action === "legacy-reset") return json(await store.resetLegacy(actor));
-    if (command.action === "claim" || ["submit", "approve", "reject", "retry-workflow", "owner-complete", "update-workflow", "restore-workflow", "delete-claimed-task", "delete-owner-task", "nudge", "reply-nudge"].includes(command.action)) {
+    if (command.action === "claim" || ["submit", "approve", "reject", "retry-workflow", "resync-settings", "owner-complete", "update-workflow", "restore-workflow", "delete-claimed-task", "delete-owner-task", "nudge", "reply-nudge"].includes(command.action)) {
       const workflow = command.action === "claim" ? await store.claim(actor, command) : await store.workflowCommand(actor, command);
       if (isPersonalCollection(workflow)) return json({ operation: collectionOperation(workflow) }, workflow.error ? 202 : 200);
       return json({ workflow }, !['submit', 'reject', 'nudge', 'reply-nudge'].includes(command.action) && workflow.status !== 'deleted' && (workflow.error || workflow.syncError) ? 202 : 200);

@@ -23,7 +23,7 @@ export type ClaimWorkflow = {
   reopenPending?: boolean;
   needsSubmission?: boolean;
 };
-export type WorkflowCommand = { id: string; workflowId: string; version: number; action: "submit" | "approve" | "reject" | "retry-workflow" | "owner-complete" | "update-workflow" | "restore-workflow" | "delete-claimed-task" | "delete-owner-task" | "nudge" | "reply-nudge"; comment?: string; replyTo?: string; attachments?: string[]; fields?: Partial<TaskFields> };
+export type WorkflowCommand = { id: string; workflowId: string; version: number; action: "submit" | "approve" | "reject" | "retry-workflow" | "resync-settings" | "owner-complete" | "update-workflow" | "restore-workflow" | "delete-claimed-task" | "delete-owner-task" | "nudge" | "reply-nudge"; comment?: string; replyTo?: string; attachments?: string[]; fields?: Partial<TaskFields> };
 export type ExecutionCommand = { id: string; action: "arrange-execution"; version: number; workflowIds: string[] };
 export type CollaborationSnapshot = { identityId: string; revision: number; remoteVersions?: Record<string, string>; executionVersion?: number; noticeVersion?: number; buffer: RoomTask[]; members: CollaborationMember[]; operations: OperationView[]; workflows: ClaimWorkflow[]; legacyCleanup?: { title: string; message: string }[]; notices?: import("./collaboration-notifications").TaskNotice[] };
 export type TaskSource = { ownerId: string | null; taskId: string; version: string };

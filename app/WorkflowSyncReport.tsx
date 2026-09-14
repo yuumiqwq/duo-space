@@ -11,7 +11,7 @@ export function WorkflowSyncAlert({ notice, open, dismiss, fixed = false }: { no
   </div>;
 }
 
-export function WorkflowSyncReport({ workflowId, disabled }: { workflowId: string; disabled?: boolean }) {
+export function WorkflowSyncReport({ workflowId, operationId, disabled }: { workflowId?: string; operationId?: string; disabled?: boolean }) {
   const [busy, setBusy] = useState(false), [copied, setCopied] = useState(false);
   const [report, setReport] = useState(''), [error, setError] = useState('');
   const locked = useRef(false), output = useRef<HTMLTextAreaElement>(null);
@@ -19,9 +19,9 @@ export function WorkflowSyncReport({ workflowId, disabled }: { workflowId: strin
     if (locked.current || disabled) return;
     locked.current = true; setBusy(true); setCopied(false); setError(''); setReport('');
     try {
-      const response = await fetch(`/api/room/tasks?workflow-diagnostic=${encodeURIComponent(workflowId)}`, { cache: 'no-store', signal: AbortSignal.timeout(15000) });
+      const response = await fetch(operationId ? `/api/room/tasks?operation-diagnostic=${encodeURIComponent(operationId)}` : `/api/room/tasks?workflow-diagnostic=${encodeURIComponent(workflowId!)}`, { cache: 'no-store', signal: AbortSignal.timeout(15000) });
       const data = await readTaskResponse(response, '错误报告暂时无法读取');
-      if (data.workflowId !== workflowId) throw new Error('错误报告与任务不符');
+      if (operationId ? data.operationId !== operationId : data.workflowId !== workflowId) throw new Error('错误报告与任务不符');
       const text = JSON.stringify(data, null, 2);
       try { await navigator.clipboard.writeText(text); setCopied(true); }
       catch { setReport(text); requestAnimationFrame(() => { output.current?.focus(); output.current?.select(); }); }

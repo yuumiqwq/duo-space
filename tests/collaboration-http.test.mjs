@@ -108,6 +108,14 @@ test('room collaboration HTTP authenticates members, shares the buffer and rejec
     assert.equal((await call('alice', create, { Origin: 'https://foreign.example' })).status, 403);
     assert.equal((await call('alice', create)).status, 200);
     assert.equal((await call('alice', create)).status, 200);
+    const operationReportUrl = `${origin}/api/room/tasks?operation-diagnostic=${create.id}`;
+    assert.equal((await fetch(operationReportUrl, { headers: { Cookie: cookie('unknown') }, redirect: 'manual' })).status, 401);
+    assert.equal((await fetch(`${origin}/api/room/tasks?operation-diagnostic=invalid`, { headers: { Cookie: cookie('alice') } })).status, 400);
+    const operationReport = await fetch(operationReportUrl, { headers: { Cookie: cookie('bob') } });
+    assert.equal(operationReport.status, 200); assert.match(operationReport.headers.get('cache-control'), /no-store/);
+    const operationData = await operationReport.json();
+    assert.equal(operationData.operationId, create.id); assert.equal(operationData.requested.content, undefined);
+    assert.ok(!JSON.stringify(operationData).includes(attachmentContent));
     const result = await call('bob'), snapshot = await result.json();
     assert.equal(result.headers.get('cache-control'), 'private, no-store');
     assert.deepEqual(snapshot.members.map(member => member.id).sort(), ['alice', 'bob', 'legacy', 'offline']);

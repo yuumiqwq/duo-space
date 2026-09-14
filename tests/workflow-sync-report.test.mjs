@@ -8,10 +8,10 @@ const source = ts.createSourceFile('WorkflowSyncReport.tsx', readFileSync(new UR
 const component = source.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'WorkflowSyncReport');
 const callback = component.body.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'copyReport');
 const code = ts.transpileModule(callback.getText(source), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
-function fixture(data, clipboardFails = false) {
+function fixture(data, clipboardFails = false, operationId) {
   const state = {}, copied = [], requests = [], locked = { current: false };
   const variables = {
-    workflowId: 'selected', disabled: false, locked, AbortSignal, readTaskResponse, taskErrorMessage,
+    workflowId: 'selected', operationId, disabled: false, locked, AbortSignal, readTaskResponse, taskErrorMessage,
     setBusy: value => { state.busy = value; }, setCopied: value => { state.copied = value; },
     setError: value => { state.error = value; }, setReport: value => { state.report = value; },
     output: { current: { focus() { state.focused = true; }, select() { state.selected = true; } } },
@@ -41,4 +41,13 @@ test('mismatched reports are never copied and concurrent clicks do not duplicate
   await Promise.all([f.copy(), f.copy()]);
   assert.equal(f.requests.length, 1); assert.equal(f.copied.length, 0); assert.equal(f.state.report, '');
   assert.equal(f.state.error, '错误报告与任务不符'); assert.equal(f.locked.current, false);
+});
+
+test('ordinary update errors copy only the selected operation report', async () => {
+  const data = { operationId: 'ordinary', requested: { dueDate: '2026-09-30T15:59:00.000Z' }, verification: { outcome: 'different' } };
+  const f = fixture(data, false, 'ordinary'); await f.copy();
+  assert.equal(f.requests[0].url, '/api/room/tasks?operation-diagnostic=ordinary');
+  assert.deepEqual(JSON.parse(f.copied[0]), data);
+  const wrong = fixture({ operationId: 'different' }, false, 'ordinary'); await wrong.copy();
+  assert.equal(wrong.copied.length, 0); assert.equal(wrong.state.error, '错误报告与任务不符');
 });

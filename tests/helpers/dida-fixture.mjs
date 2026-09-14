@@ -36,7 +36,9 @@ globalThis.fetch = async (input, init = {}) => {
   if (route.startsWith('/task/') && method === 'POST') {
     const id = route.slice('/task/'.length);
     if (!tasks[id]) return new Response(null, { status: 404 });
-    tasks[id] = { ...tasks[id], ...JSON.parse(init.body) }; save(); return Response.json(tasks[id]);
+    tasks[id] = { ...tasks[id], ...JSON.parse(init.body) };
+    for (const key of ['startDate', 'dueDate']) if (tasks[id][key]?.startsWith('1970-01-01T00:00:00')) tasks[id][key] = null;
+    save(); return Response.json(tasks[id]);
   }
   const match = route.match(/^\/project\/([^/]+)\/task\/([^/]+)(\/complete)?$/);
   if (match && match[1] === `inbox-${owner}`) {

@@ -37,7 +37,7 @@ test('single-date edits preserve the selected field and a partial write cannot c
       if (route === '/project/saved-list/task/single-date') return Response.json(task);
       if (route === '/task/single-date' && init.method === 'POST') {
         const body = JSON.parse(init.body); requests.push(body); writes++;
-        task = { ...body, ...(omitDate ? { startDate: null, dueDate: null } : {}), etag: `saved-${writes}` };
+        task = { ...body, ...Object.fromEntries(['startDate', 'dueDate'].map(key => [key, body[key]?.startsWith('1970-01-01T00:00:00') ? null : body[key]])), ...(omitDate ? { startDate: null, dueDate: null } : {}), etag: `saved-${writes}` };
         return Response.json(task);
       }
       throw new Error(`Unexpected request: ${route}`);
@@ -48,7 +48,7 @@ test('single-date edits preserve the selected field and a partial write cannot c
       await gateway.update('alice', task.id, fields, remoteVersion(task), task.projectId);
       const written = requests.at(-1);
       assert.equal(Date.parse(written[key]), Date.parse(date));
-      assert.equal(written[key === 'startDate' ? 'dueDate' : 'startDate'], null, 'do not invent a second date');
+      assert.equal(written[key === 'startDate' ? 'dueDate' : 'startDate'], key === 'startDate' ? null : '1970-01-01T00:00:00.000+0000', 'clear a prior date explicitly without inventing a second date');
       assert.deepEqual(taskFields(await gateway.get('alice', task.id, task.projectId)), fields);
     }
     omitDate = true;
@@ -66,6 +66,70 @@ test('single-date edits preserve the selected field and a partial write cannot c
     const count = writes;
     await assert.rejects(gateway.update('alice', task.id, fields, before, task.projectId), /刚被修改/);
     assert.equal(writes, count, 'readback mismatch must not silently reset the saved version');
+  });
+});
+
+test('updating dates uses the clear sentinel and accepts either single-date form returned as a pair', async () => {
+  await providerFixture(async gateway => {
+    let task = { id: 'clear-date', projectId: 'saved-list', ...taskFields({ title: '日期写入', startDate: '2026-09-01T16:00:00.000Z', dueDate: '2026-09-02T16:00:00.000Z' }) };
+    const writes = [];
+    globalThis.fetch = async (url, init) => {
+      const route = new URL(url).pathname.replace('/open/v1', '');
+      if (route === '/project/saved-list/task/clear-date') return Response.json(task);
+      if (route === '/task/clear-date' && init.method === 'POST') {
+        const body = JSON.parse(init.body); writes.push(body);
+        const dates = Object.fromEntries(['startDate', 'dueDate'].map(key => [key, body[key]?.startsWith('1970-01-01T00:00:00') ? null : body[key] || task[key]]));
+        task = { ...task, ...body, startDate: dates.startDate ?? dates.dueDate, dueDate: dates.dueDate ?? dates.startDate, etag: String(writes.length) };
+        return Response.json(task);
+      }
+      throw new Error(`Unexpected request: ${route}`);
+    };
+    const date = '2026-09-12T16:00:00.000Z';
+    for (const patch of [{ startDate: null, dueDate: null }, { startDate: date, dueDate: null }, { startDate: null, dueDate: '2026-09-30T15:59:00.000Z' }, { startDate: null, dueDate: null }]) {
+      const before = structuredClone(task), desired = taskFields({ ...task, ...patch });
+      const saved = await gateway.update('alice', task.id, desired, remoteVersion(task), task.projectId);
+      for (const key of ['startDate', 'dueDate']) if (!desired[key] && before[key]) assert.equal(writes.at(-1)[key], '1970-01-01T00:00:00.000+0000');
+      assert.equal(taskFields(saved).startDate, desired.startDate ?? desired.dueDate);
+      assert.equal(taskFields(saved).dueDate, desired.dueDate ?? desired.startDate);
+      assert.deepEqual({ startDate: desired.startDate, dueDate: desired.dueDate }, patch, 'website values retain the chosen single-date or null form');
+    }
+  });
+});
+
+test('deleted residual detail records cannot prove presence in either uncapped or capped active searches', async () => {
+  for (const capped of [false, true]) await providerFixture(async gateway => {
+    const ghost = { id: 'deleted-copy', projectId: 'saved-list', title: '已删除', status: 0 }, routes = [];
+    globalThis.fetch = async (url, init) => {
+      const route = new URL(url).pathname.replace('/open/v1', ''); routes.push(route);
+      assert.notEqual(init.method, 'DELETE', 'verification is read-only');
+      if (route === '/project/saved-list/task/deleted-copy') return Response.json(ghost);
+      if (route === '/task/filter') return Response.json(capped ? Array.from({ length: 200 }, (_, index) => ({ id: `other-${index}`, projectId: 'saved-list', status: 0 })) : []);
+      if (route === '/task/completed') return Response.json([]);
+      if (route === '/project') return Response.json([{ id: 'saved-list' }]);
+      if (route === '/project/inbox/data') return Response.json({ project: { id: 'actual-inbox' }, tasks: [] });
+      if (['/project/actual-inbox/data', '/project/saved-list/data'].includes(route)) return Response.json({ tasks: [] });
+      throw new Error(`Unexpected request: ${route}`);
+    };
+    assert.deepEqual(await gateway.get('alice', ghost.id, ghost.projectId), ghost, 'the provider still serves the stale record');
+    routes.length = 0;
+    assert.equal(await gateway.locate('alice', ghost.id, ghost.projectId, Date.parse('2026-09-01T00:00:00Z')), null);
+    assert.ok(!routes.some(route => route.includes('/task/deleted-copy')));
+    if (capped) assert.ok(routes.includes('/project/saved-list/data'));
+  });
+});
+
+test('capped lookup keeps absence unknown if a project list cannot be verified', async () => {
+  for (const result of [null, { tasks: [{ id: 'wrong-list', projectId: 'other', status: 0 }] }]) await providerFixture(async gateway => {
+    globalThis.fetch = async url => {
+      const route = new URL(url).pathname.replace('/open/v1', '');
+      if (route === '/task/filter') return Response.json(Array.from({ length: 200 }, (_, index) => ({ id: `other-${index}`, projectId: 'saved-list', status: 0 })));
+      if (route === '/project') return Response.json([{ id: 'saved-list' }]);
+      if (route === '/project/inbox/data') return Response.json({ project: { id: 'actual-inbox' }, tasks: [] });
+      if (route === '/project/actual-inbox/data') return Response.json({ tasks: [] });
+      if (route === '/project/saved-list/data') return result ? Response.json(result) : new Response(null, { status: 503 });
+      assert.fail(`cannot infer absence or read stale detail: ${route}`);
+    };
+    await assert.rejects(gateway.locate('alice', 'missing-id', 'saved-list'), /不完整|暂未完成/);
   });
 });
 
@@ -177,6 +241,8 @@ test('a capped account search still finds an exact task moved into an initially 
       if (route === '/project') return Response.json([{ id: 'old-list' }]);
       if (route === '/project/inbox/data') return Response.json({ tasks: [task] });
       if (route === '/project/actual-inbox/task/moved-to-inbox') return Response.json(task);
+      if (route === '/project/actual-inbox/data') return Response.json({ tasks: [task] });
+      if (route === '/project/old-list/data') return Response.json({ tasks: [] });
       throw new Error(`Unexpected request: ${route}`);
     };
     assert.deepEqual(await gateway.locate('alice', task.id, 'old-list'), task);
@@ -198,7 +264,10 @@ test('Dida provider works with Open API credentials despite V2 rejection and sco
     const { gateway } = await import(pathToFileURL(output).href);
     const accounts = { alice: new Map(), bob: new Map() }, requests = [];
     let comments = [], wrongProject = false, allocatedId = null, omitReceipt = false, normalizeWrites = false, inboxGate = null;
-    const providerFields = task => normalizeWrites ? { ...task, dueDate: task.dueDate ?? task.startDate, items: task.items.map((item, index) => ({ ...item, id: `allocated-item-${index}` })) } : task;
+    const providerFields = task => {
+      task = { ...task, ...Object.fromEntries(['startDate', 'dueDate'].map(key => [key, task[key]?.startsWith('1970-01-01T00:00:00') ? null : task[key]])) };
+      return normalizeWrites ? { ...task, dueDate: task.dueDate ?? task.startDate, items: task.items.map((item, index) => ({ ...item, id: `allocated-item-${index}` })) } : task;
+    };
     globalThis.fetch = async (url, init) => {
       const owner = String(init.headers.Authorization).replace('Bearer token-', '');
       assert.ok(Object.hasOwn(accounts, owner), 'request uses the selected owner token');
@@ -388,6 +457,9 @@ test('workflow lookup repairs exact moved IDs, bounds account searches and rejec
       if (route === '/project') return Response.json([{ id: 'other-list' }, { id: 'outside-filter' }]);
       if (route === '/task/completed') return Response.json([{ id: 'history-only', projectId: 'inbox-alice', status: 2, title: '历史完成' }]);
       if (route === '/project/outside-filter/task/older-moved') return Response.json({ ...task, id: 'older-moved', projectId: 'outside-filter' });
+      if (route === '/project/inbox-alice/data') return Response.json({ tasks: [] });
+      if (route === '/project/other-list/data') return Response.json({ tasks: [task] });
+      if (route === '/project/outside-filter/data') return Response.json({ tasks: [{ ...task, id: 'older-moved', projectId: 'outside-filter' }] });
       if (route === '/project/other-list/task/moved/complete') { task.status = 2; return new Response(null, { status: 204 }); }
       if (route === '/project/other-list/task/moved') {
         if (init.method === 'DELETE') { removed = true; return new Response(null, { status: 204 }); }

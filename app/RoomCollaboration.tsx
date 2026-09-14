@@ -25,7 +25,7 @@ import { inboxClaimant } from './inbox-claim-stamp';
 import { InboxClaimStamp } from './InboxClaimStamp';
 import { refreshMembers, websiteOnlyAction } from "./collaboration-refresh";
 import { readTaskResponse, taskErrorMessage } from './task-request';
-import { WorkflowSyncAlert } from './WorkflowSyncReport';
+import { WorkflowSyncAlert, WorkflowSyncReport } from './WorkflowSyncReport';
 import { showCollaborationDialog } from './collaboration-dialog';
 
 type RequestCommand = WorkflowCommand | ExecutionCommand | { id: string; action: "legacy-reset" } | CollaborationCommand | { id: string; action: "resume" | "cancel" } | { id: string; action: "recover"; target: { id: string; version: string } };
@@ -421,7 +421,7 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
         {uncertain && !busy && <div className="coop-recovery">上次提交结果未确认。<button type="button" onClick={() => void perform(uncertain)}>核对并重试</button></div>}
         {snapshot?.legacyCleanup?.map((issue, index) => <div className="coop-recovery" key={index}><span><strong>{issue.title}</strong><small>{issue.message}</small></span></div>)}
         {syncProblems.map(workflow => <div className="coop-recovery" key={workflow.id}><span><strong>{workflow.title}</strong><small className="coop-feedback error">{workflow.syncError || workflow.error}</small></span><button type="button" disabled={busy} onClick={() => openIssue(workflow.id)}>查看错误</button></div>)}
-        {pending.map(operation => <div className="coop-recovery" key={operation.id}><span><strong>{operation.title}</strong><small>{operation.error || "等待继续"}</small><small>发起账号：{ownerName(operation.actorId)} · {operation.createdAt ? operationTime(operation.createdAt) : "首次时间未记录"}</small></span><div className="coop-recovery-actions">{operation.action === "move" ? <button type="button" disabled={unavailable} onClick={() => void perform({ id: crypto.randomUUID(), action: "legacy-reset" })}>重试旧记录回退</button> : <><button type="button" disabled={unavailable} onClick={() => void perform({ id: operation.id, action: "resume" })}>继续</button>{operation.action !== "collect" && <button type="button" disabled={unavailable} onClick={() => void perform({ id: operation.id, action: "cancel" })}>停止重试</button>}</>}</div></div>)}
+        {pending.map(operation => <div className="coop-recovery" key={operation.id}><span><strong>{operation.title}</strong><small>{operation.error || "等待继续"}</small><small>发起账号：{ownerName(operation.actorId)} · {operation.createdAt ? operationTime(operation.createdAt) : "首次时间未记录"}</small></span><div className="coop-recovery-actions">{operation.action === "move" ? <button type="button" disabled={unavailable} onClick={() => void perform({ id: crypto.randomUUID(), action: "legacy-reset" })}>重试旧记录回退</button> : <><button type="button" disabled={unavailable} onClick={() => void perform({ id: operation.id, action: "resume" })}>继续</button>{operation.action !== "collect" && <button type="button" disabled={unavailable} onClick={() => void perform({ id: operation.id, action: "cancel" })}>停止重试</button>}</>}{operation.action === "update" && operation.error && <WorkflowSyncReport operationId={operation.id} />}</div></div>)}
 
         {!pending.length && !syncProblems.length && !uncertain && !snapshot?.legacyCleanup?.length && <p className="coop-empty">没有待处理的操作</p>}
       </CollaborationRecovery>}

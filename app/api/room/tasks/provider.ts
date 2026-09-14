@@ -70,6 +70,11 @@ async function resolvedInbox(owner: string) {
 }
 const validId = (id: string) => /^[A-Za-z0-9_-]{1,100}$/.test(id);
 const payload = (fields: TaskFields) => ({ ...fields, startDate: fields.startDate?.replace(/\.\d{3}Z$/, "+0000") ?? null, dueDate: fields.dueDate?.replace(/\.\d{3}Z$/, "+0000") ?? null });
+const updatePayload = (fields: TaskFields, before: RemoteTask) => {
+  const result = payload(fields);
+  for (const key of ['startDate', 'dueDate'] as const) if (!fields[key] && before[key]) result[key] = '1970-01-01T00:00:00.000+0000';
+  return result;
+};
 async function completedTask(owner: string, account: Context, id: string, completedAfter?: number) {
   if (completedAfter !== undefined && (!Number.isFinite(completedAfter) || completedAfter < 0)) throw new CollaborationError("任务发布日期无效", 400);
   const queries = account.completed ||= new Map<string, Promise<RemoteTask[]>>();
@@ -103,9 +108,8 @@ export const gateway: Gateway = {
     // Legacy references may have an exact task ID but no saved list ID. Search
     // that ID directly instead of requiring a now-empty inbox to resolve first.
     if (!validId(id) || (projectId !== undefined && !validId(projectId))) throw new CollaborationError("任务编号无效", 400);
-    const found = projectId && projectId !== 'inbox' ? await gateway.get(owner, id, projectId) : null;
-    if (found && !found.status) return found;
-    let completed = found?.status === 2 ? found : null;
+    // The project/task endpoint can still return status=0 after deletion.
+    // Membership in current task lists, not that stale record, establishes life.
     const account = await context(owner);
     account.search ||= request(owner, "/task/filter", { method: "POST", body: JSON.stringify({ status: [0] }) }).then(data => {
       if (!Array.isArray(data) || data.some(task => !task || typeof task.id !== "string" || !validId(task.id) || typeof task.projectId !== "string" || !validId(task.projectId) || task.status)) throw new CollaborationError("滴答状态查询返回的数据不完整，请稍后重试", 502);
@@ -116,11 +120,10 @@ export const gateway: Gateway = {
     if (candidate) {
       const detail = await gateway.get(owner, id, candidate.projectId);
       if (detail && !detail.status) return detail;
-      if (detail?.status === 2) completed = detail;
     }
     // An uncapped account-wide result exhausts unfinished tasks. Only a full
     // page needs per-project fallback before querying completed history.
-    if (unfinished.length < 200) return completed || await completedTask(owner, account, id, completedAfter);
+    if (unfinished.length < 200) return completedTask(owner, account, id, completedAfter);
     account.projects ||= request(owner, "/project").then(async data => {
       if (!Array.isArray(data) || data.some(project => !project || typeof project.id !== "string" || !validId(project.id))) throw new CollaborationError("滴答清单列表不完整，请稍后重试", 502);
       // A capped search can omit a task moved into the inbox, which may not
@@ -128,13 +131,16 @@ export const gateway: Gateway = {
       const inbox = await resolvedInbox(owner);
       return [...new Set([inbox.projectId, ...data.map(project => project.id as string)])];
     });
-    const projects = (await account.projects).filter(project => project !== (projectId || "inbox") && project !== "inbox");
+    const projects = [...new Set([...(projectId && projectId !== 'inbox' ? [projectId] : []), ...await account.projects])];
     for (let index = 0; index < projects.length; index += 3) {
-      const tasks = await Promise.all(projects.slice(index, index + 3).map(project => gateway.get(owner, id, project)));
-      const open = tasks.find(task => task && !task.status); if (open) return open;
-      completed ||= tasks.find(task => task?.status === 2) || null;
+      const tasks = await Promise.all(projects.slice(index, index + 3).map(async project => {
+        const data = await request(owner, `/project/${encodeURIComponent(project)}/data`);
+        if (!Array.isArray(data?.tasks) || data.tasks.some((task: RemoteTask) => !task || typeof task.id !== 'string' || !validId(task.id) || task.projectId !== project || task.status)) throw new CollaborationError('滴答清单数据不完整，请稍后重试', 502);
+        return data.tasks.find((task: RemoteTask) => task.id === id) as RemoteTask | undefined;
+      }));
+      const open = tasks.find(task => task); if (open) return open;
     }
-    return completed || await completedTask(owner, account, id, completedAfter);
+    return completedTask(owner, account, id, completedAfter);
   },
   async create(owner, id, fields, receipt, prepared) {
     const existing = prepared ? null : await gateway.get(owner, id);
@@ -163,7 +169,7 @@ export const gateway: Gateway = {
       if (remoteVersion(existing) !== version) throw new CollaborationError("任务刚被修改，请刷新后重新编辑");
       // Keep provider-specific task fields while updating only the editor's supported values.
       trace.stage = 'write';
-      const response = await request(owner, `/task/${encodeURIComponent(id)}`, { method: "POST", body: JSON.stringify({ ...existing, ...payload(fields), id, projectId: existing.projectId }) });
+      const response = await request(owner, `/task/${encodeURIComponent(id)}`, { method: "POST", body: JSON.stringify({ ...existing, ...updatePayload(fields, existing), id, projectId: existing.projectId }) });
       trace.response = taskSyncEvidence(response); trace.stage = 'read-back';
       const saved = await gateway.get(owner, id, existing.projectId);
       trace.readBack = taskSyncEvidence(saved);
