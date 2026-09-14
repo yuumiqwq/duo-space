@@ -1,4 +1,5 @@
 import type { ClaimWorkflow } from './collaboration-types';
+import { isWorkflowSettingsNotice, type TaskNotice } from './collaboration-notifications.ts';
 
 export const EXECUTION_LIMIT = 3;
 export const executionEligible = (workflow: ClaimWorkflow) => ['creating', 'working', 'rejected'].includes(workflow.status) && !workflow.ownerDeletePending;
@@ -11,6 +12,10 @@ export function toggleExecution(ids: string[], id: string): string[] {
   return ids.length >= EXECUTION_LIMIT ? ids : [...ids, id];
 }
 const byPriority = (a: ClaimWorkflow, b: ClaimWorkflow) => (b.fields.priority || 0) - (a.fields.priority || 0) || b.createdAt - a.createdAt || a.id.localeCompare(b.id);
+export function workflowAttentionCount(workflows: ClaimWorkflow[], notices: TaskNotice[]): number {
+  const updated = new Set(notices.filter(isWorkflowSettingsNotice).map(notice => notice.workflowId));
+  return workflows.filter(workflow => executionReserved(workflow) || (isExecuting(workflow) && updated.has(workflow.id))).length;
+}
 const byReviewThenPriority = (a: ClaimWorkflow, b: ClaimWorkflow) => Number(executionReserved(b)) - Number(executionReserved(a)) || byPriority(a, b);
 export function workflowGroups(workflows: ClaimWorkflow[], identityId: string) {
   const executing = workflows.filter(workflow => isExecuting(workflow) || executionReserved(workflow));

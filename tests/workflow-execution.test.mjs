@@ -1,9 +1,26 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { executionGroups, executionIds, toggleExecution, workflowGroups } from '../app/workflow-execution.ts';
+import { executionGroups, executionIds, toggleExecution, workflowGroups, workflowAttentionCount } from '../app/workflow-execution.ts';
 
 const workflow = (id, claimantId, status, executing = false, priority = 0, createdAt = 1) => ({ id, claimantId, reviewerId: claimantId === 'alice' ? 'bob' : 'alice', status, executing, fields: { priority }, createdAt });
 const ids = group => group.workflows.map(item => item.id);
+
+test('entry badge counts both execution groups once per updated or review task and drops read updates', () => {
+  const workflows = [
+    workflow('own-updated', 'alice', 'working', true), workflow('other-review', 'bob', 'submitted', true),
+    workflow('own-review', 'alice', 'approving', true), workflow('own-idle', 'alice', 'working'),
+    workflow('other-idle', 'bob', 'working'), workflow('archived', 'bob', 'deleted', true),
+    workflow('done', 'alice', 'done', true), workflow('only-nudge', 'bob', 'working', true),
+    workflow('only-error', 'alice', 'working', true), workflow('no-slot-completing', 'bob', 'approving'),
+    { ...workflow('deleting', 'bob', 'submitted', true), ownerDeletePending: true },
+  ];
+  const settings = ['own-updated', 'own-updated', 'other-review', 'own-idle', 'other-idle', 'archived', 'done', 'no-slot-completing', 'deleting'].map((workflowId, index) => ({ id: String(index), workflowId, kind: 'workflow', eventType: 'updated' }));
+  const other = [{ workflowId: 'only-nudge', kind: 'workflow', eventType: 'nudge' }, { workflowId: 'only-error', kind: 'sync-error' }];
+  assert.equal(workflowAttentionCount(workflows, [...settings, ...other]), 3);
+  assert.equal(workflowAttentionCount(workflows, other), 2, 'reading the settings removes its count while pending reviews remain');
+  assert.equal(workflowAttentionCount(workflows.map(item => ({ ...item, status: 'done' })), settings), 0);
+  assert.equal(workflowAttentionCount([], settings), 0, 'old notices without a visible workflow do not count');
+});
 
 test('workflow overview shows only execution slots by claimant, pinning review before priority and recency', () => {
   const workflows = [
