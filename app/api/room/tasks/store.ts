@@ -905,8 +905,8 @@ export class CollaborationStore {
       }
       if (command.action === "owner-complete") return this.completeByOwner(state, workflow, actor, command.id, signature);
       if (command.action === "retry-workflow") {
-        if (workflow.completionRequest) return this.completeByOwner(state, workflow, actor, workflow.completionRequest.id, workflow.completionRequest.signature);
         if (workflow.edit) return this.finishWorkflowEdit(state, workflow);
+        if (workflow.completionRequest) return this.completeByOwner(state, workflow, actor, workflow.completionRequest.id, workflow.completionRequest.signature);
         if (![workflow.claimantId, workflow.reviewerId].includes(actor)) throw new CollaborationError("只有流程参与者能重试", 403);
         if (workflow.reopenReceipt || workflow.sourceReopenReceipt) {
           const sides = await this.workflowSides(state, workflow);

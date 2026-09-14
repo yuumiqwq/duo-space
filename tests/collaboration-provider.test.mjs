@@ -27,6 +27,40 @@ async function providerFixture(run) {
   }
 }
 
+test('single-date edits preserve the selected field and a partial write cannot confirm a missing date', async () => {
+  await providerFixture(async gateway => {
+    let task = { id: 'single-date', projectId: 'saved-list', ...taskFields({ title: '日期核对' }), etag: 'initial' };
+    let omitDate = false, writes = 0;
+    const requests = [];
+    globalThis.fetch = async (url, init) => {
+      const route = new URL(url).pathname.replace('/open/v1', '');
+      if (route === '/project/saved-list/task/single-date') return Response.json(task);
+      if (route === '/task/single-date' && init.method === 'POST') {
+        const body = JSON.parse(init.body); requests.push(body); writes++;
+        task = { ...body, ...(omitDate ? { startDate: null, dueDate: null } : {}), etag: `saved-${writes}` };
+        return Response.json(task);
+      }
+      throw new Error(`Unexpected request: ${route}`);
+    };
+    const date = '2026-09-12T16:00:00.000Z';
+    for (const key of ['startDate', 'dueDate']) {
+      const fields = taskFields({ title: task.title, [key]: date });
+      await gateway.update('alice', task.id, fields, remoteVersion(task), task.projectId);
+      const written = requests.at(-1);
+      assert.equal(Date.parse(written[key]), Date.parse(date));
+      assert.equal(written[key === 'startDate' ? 'dueDate' : 'startDate'], null, 'do not invent a second date');
+      assert.deepEqual(taskFields(await gateway.get('alice', task.id, task.projectId)), fields);
+    }
+    omitDate = true;
+    const fields = taskFields({ title: task.title, priority: 5, startDate: date }), before = remoteVersion(task);
+    await assert.rejects(gateway.update('alice', task.id, fields, before, task.projectId), /正在自动同步/);
+    assert.equal(task.priority, 5); assert.equal(task.startDate, null);
+    const count = writes;
+    await assert.rejects(gateway.update('alice', task.id, fields, before, task.projectId), /刚被修改/);
+    assert.equal(writes, count, 'readback mismatch must not silently reset the saved version');
+  });
+});
+
 test('exact linked reads and deletion bypass a stalled or failed inbox and a moved ID uses account search directly', async () => {
   await providerFixture(async gateway => {
     const gate = deferred(), entered = deferred(), requests = [];

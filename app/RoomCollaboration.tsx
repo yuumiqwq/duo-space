@@ -223,7 +223,7 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
       setUncertain(null);
       if ((workflow?.error || workflow?.syncError) && !workflow?.editPending && !workflow?.ownerDeletePending) setError(workflow.syncError || workflow.error);
       else if (operation?.status === "pending") setError(operation.error || "操作尚未完成，请在下方继续处理");
-      else setNotice(operation?.status === "cancelled" ? "已取消未完成的操作" : "已保存");
+      else if (!workflow?.editPending) setNotice(operation?.status === "cancelled" ? "已取消未完成的操作" : "已保存");
     } catch (cause) { setError(taskErrorMessage(cause, '请求结果未确认，请核对并重试')); }
     finally {
       const deletionConfirmed = workflow?.status === 'deleted' || (operation?.status === 'done' && command.action === 'delete');

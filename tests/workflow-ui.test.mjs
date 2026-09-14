@@ -25,6 +25,19 @@ test('workflow detail offers settings to every member and direct completion only
   }
   assert.ok(render('bob').includes('提交完成')); assert.ok(!render('bob', 'working', true).includes('提交完成'));
   assert.ok(!render('charlie', 'working', true).includes('核对并继续')); assert.ok(render('charlie', 'working', true).includes('正在同步任务'));
+  for (const failure of ['error', 'syncError']) {
+    workflow[failure] = '关联任务在同步期间被修改，已暂停覆盖，请核对后重试';
+    for (const member of ['alice', 'bob', 'charlie']) {
+      const failedEdit = render(member, 'working', true);
+      assert.match(failedEdit, /role="alert">关联任务在同步期间被修改/);
+      assert.ok(!failedEdit.includes('aria-label="正在同步任务"'), 'a failed edit must not look like an active request');
+      assert.ok(failedEdit.includes('>重试同步</button>'), 'retry is available without saving another edit');
+      assert.ok(!failedEdit.includes('>提交完成</button>'));
+    }
+    delete workflow[failure];
+  }
+  assert.ok(render('alice', 'working', true).includes('aria-label="正在同步任务"'));
+  assert.ok(!render('alice', 'working', true).includes('>重试同步</button>'));
   const workflows = [{ ...workflow, id: 'mine', title: '我认领的事项' }, { ...workflow, id: 'theirs', title: '他人认领的事项', claimantId: 'alice', reviewerId: 'bob' }, { ...workflow, id: 'done', title: '归档事项示例', status: 'done' }, { ...workflow, id:'deleted',title:'已删除归档示例',status:'deleted' }];
   const overview = archived => renderToStaticMarkup(overviewComponent({ workflows, archived, setArchived() {}, select() {}, name: id => id }));
   const active = overview(false); assert.ok(active.includes('我认领的事项')); assert.ok(active.includes('他人认领的事项')); assert.ok(!active.includes('归档事项示例')); assert.ok(active.includes('已归档'));

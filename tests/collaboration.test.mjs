@@ -1129,6 +1129,53 @@ test('details can be saved while creation is uncertain and retried by any member
   assert.equal(w.status, 'working'); assert.equal(w.editPending, false); assert.equal(f.counts.creates, 1); assert.equal(f.accounts.bob.get(w.targetId).content, '新的说明');
 });
 
+test('retrying a failed detail sync resumes the original event and preserves external conflicts', async () => {
+  const f = await fixture(), task = await f.create('public'); let w = await claim(f, task);
+  const update = f.gateway.update;
+  f.gateway.update = async () => { throw new Error('write unavailable'); };
+  w = await act(f, w, 'alice', 'update-workflow', { fields: { priority: 5 } });
+  const history = structuredClone(w.events);
+  assert.equal(w.editPending, true);
+  f.store = new CollaborationStore(f.dir, f.gateway);
+  w = await act(f, w, 'offline', 'retry-workflow');
+  assert.equal(w.editPending, true);
+  assert.deepEqual(w.events, history);
+  f.accounts.bob.get(w.targetId).content = 'other member changed the content';
+  f.gateway.update = update;
+  w = await act(f, w, 'alice', 'retry-workflow');
+  assert.match(w.error, /同步期间被修改/);
+  assert.deepEqual(w.events, history);
+  assert.equal(f.accounts.bob.get(w.targetId).content, 'other member changed the content');
+  assert.equal(f.accounts.bob.get(w.targetId).priority, task.priority);
+  f.accounts.bob.get(w.targetId).content = task.content;
+  w = await act(f, w, 'offline', 'retry-workflow');
+  assert.equal(w.error, ''); assert.equal(w.editPending, false);
+  assert.equal(w.events.length, history.length);
+  assert.equal(w.events.at(-1).id, history.at(-1).id);
+  assert.equal(w.events.at(-1).type, 'updated');
+  assert.equal(f.accounts.bob.get(w.targetId).priority, 5);
+});
+
+test('detail retry remains available to members while preserving a separate owner completion request', async () => {
+  const f = await fixture(), task = await f.create('public'); let w = await claim(f, task);
+  const update = f.gateway.update;
+  f.gateway.update = async () => { throw new Error('write unavailable'); };
+  w = await act(f, w, 'alice', 'update-workflow', { fields: { priority: 5 } });
+  w = await act(f, w, 'alice', 'owner-complete');
+  assert.equal(w.editPending, true);
+  const history = structuredClone(w.events);
+  f.gateway.update = update;
+  w = await act(f, w, 'offline', 'retry-workflow');
+  assert.equal(w.editPending, false); assert.equal(w.status, 'working');
+  assert.equal(w.events.length, history.length);
+  assert.equal(w.events.at(-1).id, history.at(-1).id);
+  assert.equal(w.events.at(-1).type, 'updated');
+  assert.equal(f.accounts.bob.get(w.targetId).priority, 5);
+  await assert.rejects(act(f, w, 'offline', 'retry-workflow'), /只有原任务/);
+  w = await act(f, w, 'alice', 'retry-workflow');
+  assert.equal(w.status, 'done');
+});
+
 test('partial completion can be edited and resumed without completing the acknowledged side twice', async () => {
   const f = await fixture(), task = await personal(f); let w = await claim(f, task); const complete = f.gateway.complete;
   let failed = false, sourceCalls = 0;
