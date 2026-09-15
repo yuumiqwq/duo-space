@@ -8,6 +8,7 @@ import { loadCollaborationSnapshot, mergeCollaborationSnapshot } from '../app/co
 import { withoutDeletedWorkflowTasks } from '../app/collaboration-snapshot.ts';
 import { splitCollaborationTasks } from '../app/collaboration-view.ts';
 import { showCollaborationDialog } from '../app/collaboration-dialog.ts';
+import { taskboardAttentionCount, workflowAttentionCount } from '../app/workflow-execution.ts';
 
 // Execute the component's actual request callback and effects without adding a
 // browser runtime to the test suite. DOM focus and timers are controlled here.
@@ -70,4 +71,43 @@ test('member column renders preloaded tasks alongside a refresh error instead of
   const html = renderToStaticMarkup(render('alice', 'Alice', [{ id: 'cached', title: '上次成功读取的任务' }], '收集箱暂时无法读取'));
   assert.ok(html.includes('上次成功读取的任务')); assert.ok(html.includes('收集箱暂时无法读取'));
   assert.ok(!html.includes('正在读取…')); assert.ok(html.includes('coop-member-lanes'));
+});
+
+test('closed taskboard polls update review badges without inbox reloads and stale summaries cannot replace newer state', async () => {
+  const pollEffect = component.body.statements.find(node => ts.isExpressionStatement(node) && ts.isCallExpression(node.expression) && node.expression.expression.getText(source) === 'useEffect' && node.expression.arguments[1]?.elements?.some(item => item.getText(source) === 'onChanged'));
+  const badgeDeclarations = component.body.statements.filter(node => ts.isVariableStatement(node) && node.declarationList.declarations.some(item => ['badgeWorkflows', 'unseenCount', 'workflowCount'].includes(item.name.getText(source))));
+  const counts = new Function('attention', 'snapshot', 'taskNotices', 'taskboardAttentionCount', 'workflowAttentionCount', transpile(`${badgeDeclarations.map(node => node.getText(source)).join('\n')}\nreturn { main: unseenCount, workflow: workflowCount };`));
+  let attention = null, notices = [], snapshot = { revision: 1, workflows: [] }, interval, first, cleanup;
+  const submitted = { id: 'review', status: 'submitted', executing: true, source: { ownerId: null, taskId: 'shared' } };
+  let response = { revision: 2, attentionWorkflows: [submitted], notices: [], remoteVersions: { bob: 'unchanged' } };
+  const requests = [], revision = { current: 1 };
+  const events = { addEventListener() {}, removeEventListener() {} };
+  const fixture = {
+    useEffect: fn => { cleanup = fn(); }, identityId: 'alice', previewSnapshot: undefined, open: false,
+    document: { ...events, hidden: false }, window: events, locked: { current: false }, generation: { current: 0 }, revision,
+    remoteVersions: { current: { bob: 'unchanged' } }, fetching: { current: false },
+    acceptNotices: incoming => { notices = incoming; }, setAttention: update => { attention = update(attention); },
+    onPublicTasks() {}, load: () => assert.fail('local review changes do not reload inboxes'), onChanged: () => assert.fail('no external tasks changed'),
+    setSnapshot: () => assert.fail('closed polls retain the full snapshot'), mergeCollaborationSnapshot,
+    fetch: async url => { requests.push(url); return Response.json(response); },
+    setTimeout: fn => { first = fn; return 1; }, clearTimeout() {},
+    setInterval: (fn, delay) => { interval = fn; assert.equal(delay, 5000); return 2; }, clearInterval() {},
+  };
+  new Function(...Object.keys(fixture), transpile(pollEffect.getText(source)))(...Object.values(fixture));
+  const currentCounts = () => counts(attention, snapshot, notices, taskboardAttentionCount, workflowAttentionCount);
+  try {
+    first(); await tick();
+    assert.deepEqual(currentCounts(), { main: 1, workflow: 1 });
+    assert.deepEqual(counts(attention, null, notices, taskboardAttentionCount, workflowAttentionCount), { main: 1, workflow: 1 }, 'first lightweight response can show reviews before preload completes');
+    response = { ...response, revision: 1, attentionWorkflows: [] }; interval(); await tick();
+    assert.equal(attention.revision, 2); assert.deepEqual(currentCounts(), { main: 1, workflow: 1 });
+    snapshot = { revision: 4, workflows: [{ ...submitted, status: 'done' }] }; revision.current = 4;
+    assert.deepEqual(currentCounts(), { main: 0, workflow: 0 }, 'a newer successful command takes effect immediately');
+    response = { ...response, revision: 3, attentionWorkflows: [submitted] }; interval(); await tick();
+    assert.deepEqual(currentCounts(), { main: 0, workflow: 0 });
+    response = { ...response, revision: 5, attentionWorkflows: [], notices: [{ kind: 'public', taskId: 'new' }] }; interval(); await tick();
+    assert.deepEqual(currentCounts(), { main: 1, workflow: 0 });
+    notices = []; assert.deepEqual(currentCounts(), { main: 0, workflow: 0 }, 'read acknowledgement updates the count without a new summary');
+    assert.ok(requests.every(url => url === '/api/room/tasks?revision=1'));
+  } finally { cleanup(); }
 });

@@ -27,7 +27,7 @@ import { refreshMembers, websiteOnlyAction } from "./collaboration-refresh";
 import { readTaskResponse, taskErrorMessage } from './task-request';
 import { WorkflowSyncAlert, WorkflowSyncReport } from './WorkflowSyncReport';
 import { showCollaborationDialog } from './collaboration-dialog';
-import { workflowAttentionCount } from './workflow-execution';
+import { taskboardAttentionCount, workflowAttentionCount, type WorkflowAttention } from './workflow-execution';
 
 type RequestCommand = WorkflowCommand | ExecutionCommand | { id: string; action: "legacy-reset" } | CollaborationCommand | { id: string; action: "resume" | "cancel" } | { id: string; action: "recover"; target: { id: string; version: string } };
 const taskKey = (task: RoomTask) => `${task.ownerId || "buffer"}:${task.id}`;
@@ -40,11 +40,13 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
   const [open, setOpen] = useState(false);
   const [snapshot, setSnapshot] = useState<CollaborationSnapshot | null>(previewSnapshot || null);
   const [taskNotices, setTaskNotices] = useState<TaskNotice[]>([]);
+  const [attention, setAttention] = useState<{ revision: number; workflows: WorkflowAttention[] } | null>(null);
   const [nudge, setNudge] = useState<TaskNotice | null>(null);
   const readIds = useRef(new Set<string>()), sounded = useRef(new Set<string>());
   const noticeVersion = useRef(0);
-  const unseenCount = taskNotices.length;
-  const workflowCount = workflowAttentionCount(snapshot?.workflows || [], taskNotices);
+  const badgeWorkflows = attention && attention.revision > (snapshot?.revision ?? -1) ? attention.workflows : snapshot?.workflows || [];
+  const unseenCount = taskboardAttentionCount(badgeWorkflows, taskNotices);
+  const workflowCount = workflowAttentionCount(badgeWorkflows, taskNotices);
   const issueNotice = taskNotices.find(item => item.kind === 'sync-error');
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -169,6 +171,7 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
         if (stopped || locked.current || startedGeneration !== generation.current) return;
         if (revision.current !== null && data.revision < revision.current) return;
         acceptNotices(data.notices || [], data.noticeVersion);
+        if (Array.isArray(data.attentionWorkflows)) setAttention(current => current && current.revision > data.revision ? current : { revision: data.revision, workflows: data.attentionWorkflows });
         if (Array.isArray(data.bufferPreview)) onPublicTasks?.(data.bufferPreview);
         const versions: Record<string, string> = data.remoteVersions || {};
         const changed = remoteVersions.current === null ? [] : [...new Set([...Object.keys(versions), ...Object.keys(remoteVersions.current)])].filter(id => (versions[id] || "") !== (remoteVersions.current![id] || ""));
@@ -409,7 +412,7 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
   const pending = snapshot?.operations.filter(operation => operation.status === "pending") || [];
   const syncProblems = snapshot?.workflows.filter(workflow => workflow.error || workflow.syncError) || [];
   return <>
-    <button ref={trigger} className="room-collaboration-trigger" type="button" disabled={!identityId}  aria-label={unseenCount ? `任务板，${unseenCount} 条新动态` : "任务板"} aria-haspopup="dialog" aria-expanded={open} onClick={() => { setOpen(true); setError(""); }}>{triggerContent || <><ClipboardList size={18} aria-hidden="true" /><span>任务板</span></>}{unseenCount > 0 && <i aria-hidden="true">{unseenCount > 99 ? "99+" : unseenCount}</i>}</button>
+    <button ref={trigger} className="room-collaboration-trigger" type="button" disabled={!identityId}  aria-label={unseenCount ? `任务板，${unseenCount} 项提醒` : "任务板"} aria-haspopup="dialog" aria-expanded={open} onClick={() => { setOpen(true); setError(""); }}>{triggerContent || <><ClipboardList size={18} aria-hidden="true" /><span>任务板</span></>}{unseenCount > 0 && <i aria-hidden="true">{unseenCount > 99 ? "99+" : unseenCount}</i>}</button>
     {open && createPortal(<dialog ref={dialog} tabIndex={-1} className="room-collaboration-dialog" aria-label="自习室任务协作" onCancel={event => { event.preventDefault(); close(); }} onKeyDown={event => event.stopPropagation()}>
       <div className="coop-surface">
       {!snapshot && <div className="coop-loading-toolbar"><button type="button" className="coop-icon coop-close" disabled={busy || !!editor}  aria-label="关闭协作区" onClick={close}><X size={21} /></button></div>}

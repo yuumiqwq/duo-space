@@ -290,9 +290,10 @@ export class CollaborationStore {
     const state = await this.read();
     const bufferIds = Object.entries(state.buffer).filter(([, task]) => !task.stagedBy && !task.completedAt).map(([id]) => id);
     // Reuse the existing revision request for the idle classroom board. This
-    // reads local public tasks only; it never fetches a member's TickTick inbox.
+    // reads website task records only; it never fetches a member's TickTick inbox.
     const bufferPreview = bufferIds.slice(0, 6).map(id => ({ id, title: state.buffer[id].fields.title }));
-    return { revision: state.revision, remoteVersions: this.remoteVersions(state), bufferCount: bufferIds.length, bufferIds, bufferPreview, ...(actor ? { notices: unreadTaskNotices(state, actor), noticeVersion: state.notifications?.version || 0 } : {}) };
+    const attentionWorkflows = Object.values(state.workflows).filter(workflow => !isPersonalCollection(workflow) && (isExecuting(workflow) || executionReserved(workflow))).map(({ id, source, status, executing, ownerDeletePending }) => ({ id, source, status, executing, ownerDeletePending }));
+    return { revision: state.revision, remoteVersions: this.remoteVersions(state), bufferCount: bufferIds.length, bufferIds, bufferPreview, attentionWorkflows, ...(actor ? { notices: unreadTaskNotices(state, actor), noticeVersion: state.notifications?.version || 0 } : {}) };
   }
   async recoverPendingWorkflows() {
     await this.serial(async () => {

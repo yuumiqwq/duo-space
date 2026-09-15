@@ -107,6 +107,10 @@ test('claim workflow HTTP covers actual routes, sidebar guard, file streaming, r
     assert.match((await call('bob', imageFile.url)).headers.get('content-disposition'), /^attachment;/);
     assert.match((await call('bob', file.url + '?preview=1')).headers.get('content-disposition'), /^attachment;/, 'non-image files retain download behavior');
     response = await act('bob', 'submit', { attachments: [file.id, imageFile.id], comment: '已完成 [图1.png]' }); assert.equal(response.status, 200); w = (await response.json()).workflow;
+    const attentionRevision = await (await call('alice', '/api/room/tasks?revision=1')).json();
+    const attentionItem = attentionRevision.attentionWorkflows.find(item => item.id === w.id);
+    assert.equal(attentionItem.status, 'submitted'); assert.equal(attentionItem.executing, true);
+    assert.equal(attentionItem.events, undefined); assert.equal(attentionItem.fields, undefined);
     assert.equal((JSON.parse(await readFile(path.join(dir, 'fake-dida.json'), 'utf8'))).bob[w.targetId].status, 2, 'submission preserves the external state without contacting Dida');
     assert.equal((await call('alice', imageFile.url + '?preview=1')).status, 200, 'submitted images become visible to the reviewer');
     response = await act('alice', 'update-workflow', { fields: { content: '提交后补充任务说明和附件链接' } });

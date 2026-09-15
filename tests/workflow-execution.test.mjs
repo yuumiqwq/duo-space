@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { executionGroups, executionIds, toggleExecution, workflowGroups, workflowAttentionCount } from '../app/workflow-execution.ts';
+import { executionGroups, executionIds, toggleExecution, workflowGroups, workflowAttentionCount, taskboardAttentionCount } from '../app/workflow-execution.ts';
 
 const workflow = (id, claimantId, status, executing = false, priority = 0, createdAt = 1) => ({ id, claimantId, reviewerId: claimantId === 'alice' ? 'bob' : 'alice', status, executing, fields: { priority }, createdAt });
 const ids = group => group.workflows.map(item => item.id);
@@ -58,4 +58,19 @@ test('empty execution sections stay available and selection changes do not regro
   assert.deepEqual(workflowGroups(workflows, 'alice').map(ids), [['claimed'], []]);
   assert.deepEqual(toggleExecution(['a', 'b', 'c'], 'd'), ['a', 'b', 'c']);
   assert.deepEqual(toggleExecution(['a', 'b', 'c'], 'b'), ['a', 'c']);
+});
+
+test('main taskboard counts unread public tasks and execution attention without counting other notices or duplicate tasks', () => {
+  const linked = (id, status, executing, sourceId = id) => ({ ...workflow(id, 'bob', status, executing), source: { ownerId: null, taskId: sourceId } });
+  const workflows = [linked('updated', 'working', true, 'public-updated'), linked('review', 'submitted', true), linked('idle', 'working', false), linked('deleted', 'deleted', true), linked('only-error', 'working', true)];
+  const notices = [
+    { kind: 'public', taskId: 'new-public' }, { kind: 'public', taskId: 'new-public' }, { kind: 'public', taskId: 'public-updated' },
+    ...['updated', 'updated', 'review', 'idle', 'deleted'].map(workflowId => ({ kind: 'workflow', workflowId, eventType: 'updated' })),
+    { kind: 'workflow', workflowId: 'only-error', eventType: 'nudge' }, { kind: 'sync-error', workflowId: 'only-error' },
+  ];
+  assert.equal(taskboardAttentionCount(workflows, notices), 3, 'one new task, one updated task and one review; shared public source counted once');
+  assert.equal(taskboardAttentionCount(workflows, notices.filter(item => item.kind !== 'public')), 2);
+  assert.equal(taskboardAttentionCount(workflows, []), 1, 'a viewed task remains counted while awaiting review');
+  assert.equal(taskboardAttentionCount(workflows.map(item => ({ ...item, status: 'done' })), []), 0);
+  assert.equal(taskboardAttentionCount([], notices), 2, 'unarranged and archived workflows cannot inflate the main count');
 });

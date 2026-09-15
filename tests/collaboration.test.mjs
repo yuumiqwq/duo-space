@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { CollaborationError, CollaborationStore, fieldDifferences, remoteVersion, sameFields, taskFields } from '../app/api/room/tasks/store.ts';
-import { executionIds } from '../app/workflow-execution.ts';
+import { executionIds, taskboardAttentionCount } from '../app/workflow-execution.ts';
 
 async function fixture() {
   await mkdir('codex-generated/test-data', { recursive: true });
@@ -156,6 +156,36 @@ const act = async (f, workflow, actor, action, extra = {}) => {
   return f.store.workflowCommand(actor, { id: randomUUID(), workflowId: workflow.id, version: workflow.version, action, ...extra });
 };
 const refreshed = async (f, id) => { await f.store.checkWorkflows(); return (await f.store.snapshot('alice')).workflows.find(workflow => workflow.id === id); };
+
+test('lightweight revisions expose current execution attention without reading Dida or returning full workflow history', async () => {
+  const f = await fixture(); await f.create('initialize');
+  for (const actor of ['alice', 'bob']) await f.store.markNoticesRead(actor, (await f.store.revision(actor)).notices.map(notice => notice.id));
+  const task = await f.create('new shared task');
+  let view = await f.store.revision('bob');
+  assert.equal(taskboardAttentionCount(view.attentionWorkflows, view.notices), 1);
+  assert.equal(taskboardAttentionCount((await f.store.revision('alice')).attentionWorkflows, (await f.store.revision('alice')).notices), 0, 'publisher receives no new-public reminder');
+  let w = await claim(f, task);
+  assert.deepEqual((await f.store.revision('bob')).attentionWorkflows, []);
+  const arranged = await arrange(f, 'bob', [w.id]); w = arranged.workflows.find(item => item.id === w.id);
+  w = await act(f, w, 'alice', 'update-workflow', { fields: { priority: 5 } });
+  view = await f.store.revision('bob');
+  assert.equal(taskboardAttentionCount(view.attentionWorkflows, view.notices), 1, 'new public and updated linked workflow count as one task');
+  await f.store.markNoticesRead('bob', view.notices.map(notice => notice.id));
+  view = await f.store.revision('bob'); assert.equal(taskboardAttentionCount(view.attentionWorkflows, view.notices), 0);
+  f.gateway.inbox = f.gateway.get = f.gateway.locate = async () => assert.fail('website-only stages and badge reads must not access Dida');
+  w = await act(f, w, 'bob', 'submit');
+  for (const actor of ['alice', 'bob']) {
+    view = await f.store.revision(actor);
+    assert.equal(taskboardAttentionCount(view.attentionWorkflows, view.notices), 1, 'both members see the pending review');
+    assert.deepEqual(Object.keys(view.attentionWorkflows[0]).sort(), ['executing', 'id', 'ownerDeletePending', 'source', 'status']);
+    await f.store.markNoticesRead(actor, view.notices.map(notice => notice.id));
+    view = await f.store.revision(actor); assert.equal(taskboardAttentionCount(view.attentionWorkflows, view.notices), 1);
+  }
+  w = await act(f, w, 'alice', 'reject', { comment: 'needs revision' });
+  view = await f.store.revision('bob'); assert.equal(taskboardAttentionCount(view.attentionWorkflows, view.notices), 0);
+  await arrange(f, 'bob', []);
+  assert.deepEqual((await f.store.revision('bob')).attentionWorkflows, []);
+});
 
 test('claiming allocates a copy without execution; only the claimant can atomically arrange up to three tasks', async () => {
   const f = await fixture(), workflows = [];
