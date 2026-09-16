@@ -13,7 +13,7 @@ npm run dev
 
 `npm run build` 生成生产构建，`npm test` 先构建再执行测试；音频集成检查需要 FFmpeg 与 FFprobe。部署沿用 GitHub Actions 构建镜像后发布到现有服务器的方式，数据目录和回滚操作见[部署说明](deploy/README.md)。
 
-功能规则变化时更新同一份功能说明，简短更新描述保留在 Git 提交中。当前待办以[剩余需求执行表](docs/remaining-priority-requirements.md)为准，历史方案与早期测试记录通过[归档目录](docs/archive/README.md)查阅。
+功能规则变化时更新同一份功能说明，并在[功能变更日志](docs/functionality-changelog.md)中追加记录，简短更新描述继续保留在 Git 提交中。当前待办以[剩余需求执行表](docs/remaining-priority-requirements.md)为准，历史方案与早期测试记录通过[归档目录](docs/archive/README.md)查阅。
 
 ## 美术与素材
 
