@@ -1377,6 +1377,137 @@ test('explicit website resync recovers a legacy conflict, preserves history and 
   }
 });
 
+test('opening the board imports current claimant settings without rewriting pending edits or archived history', async () => {
+  const f = await fixture(), task = await f.create('原说明'); let w = await claim(f, task);
+  const events = structuredClone(w.events), remote = f.accounts.bob.get(w.targetId);
+  Object.assign(remote, { title: '滴答新说明', priority: 5 });
+  let snapshot = await f.store.snapshot('alice', 'bob');
+  w = snapshot.workflows.find(item => item.id === w.id);
+  assert.equal(w.title, remote.title); assert.equal(w.fields.priority, 5);
+  assert.equal(snapshot.buffer.find(item => item.id === task.id).title, remote.title);
+  assert.deepEqual(w.events, events, 'reading Dida does not invent a website edit event');
+  assert.equal((await f.store.snapshot('alice', null)).workflows.find(item => item.id === w.id).title, remote.title, 'local polls retain freshly pulled settings');
+  f.gateway.update = async () => { throw new Error('temporarily offline'); };
+  w = await act(f, w, 'alice', 'update-workflow', { fields: { priority: 1 } });
+  snapshot = await f.store.snapshot('alice', 'bob');
+  assert.equal(snapshot.workflows.find(item => item.id === w.id).fields.priority, 1, 'refresh retains accepted unsynced intent');
+  w = await act(f, w, 'alice', 'delete-owner-task');
+  f.accounts.bob.set(w.targetId, { ...remote, title: 'residual record' });
+  assert.equal((await f.store.snapshot('alice', 'bob')).workflows.find(item => item.id === w.id).title, w.title, 'archived history is fixed');
+});
+
+test('a slow inbox refresh cannot roll back settings saved while the read was in flight', async () => {
+  const f = await fixture(); let w = await claim(f, await f.create('fresh settings'));
+  const inbox = f.gateway.inbox; let release, entered;
+  const gate = new Promise(resolve => { release = resolve; }), reading = new Promise(resolve => { entered = resolve; });
+  f.gateway.inbox = async owner => { const result = await inbox(owner); if (owner === 'bob') { entered(); await gate; } return result; };
+  const staleRead = f.store.snapshot('alice', 'bob');
+  await reading;
+  try { w = await act(f, w, 'alice', 'update-workflow', { fields: { priority: 5 } }); }
+  finally { release(); }
+  assert.equal((await staleRead).workflows.find(item => item.id === w.id).fields.priority, 5);
+  assert.equal((await f.store.snapshot('alice', null)).workflows.find(item => item.id === w.id).fields.priority, 5);
+});
+
+test('ordinary save ignores etag-only changes while actual details and lifecycle changes remain protected', async () => {
+  for (const scenario of ['etag', 'normalized-date', 'content', 'completed', 'parent']) {
+    const f = await fixture(); await personal(f, { startDate: '2026-09-12T16:00:00.000Z' });
+    const task = (await f.store.snapshot('alice', 'alice')).members[0].tasks[0];
+    const remote = f.accounts.alice.get(task.id); remote.etag = 'new-provider-token';
+    if (scenario === 'normalized-date') remote.dueDate = remote.startDate;
+    if (scenario === 'content') remote.content = 'later content';
+    if (scenario === 'completed') remote.status = 2;
+    if (scenario === 'parent') remote.parentId = 'new-parent';
+    const command = { id: randomUUID(), action: 'update', source: { ...source(task), settingsVersion: task.settingsVersion }, fields: { priority: 5 } };
+    if (['etag', 'normalized-date'].includes(scenario)) {
+      assert.equal((await f.store.execute('alice', command)).status, 'done');
+      assert.equal(remote.priority, 5);
+      assert.equal((await f.store.execute('alice', command)).status, 'done');
+    } else {
+      await assert.rejects(f.store.execute('alice', command), /已被修改|已完成/);
+      assert.equal(remote.priority, task.priority);
+    }
+  }
+});
+
+test('workflow settings save tolerates unrelated workflow events but not changed fields or status', async () => {
+  const f = await fixture(), w = await claim(f, await f.create('settings token'));
+  const nudged = await act(f, w, 'alice', 'nudge');
+  assert.notEqual(nudged.version, w.version);
+  assert.equal(nudged.settingsVersion, w.settingsVersion);
+  const command = { id: randomUUID(), action: 'update-workflow', workflowId: w.id, version: w.version, settingsVersion: w.settingsVersion, fields: { priority: 5 } };
+  const saved = await f.store.workflowCommand('alice', command);
+  assert.equal(saved.editPending, false); assert.equal(f.accounts.bob.get(w.targetId).priority, 5);
+  await assert.rejects(f.store.workflowCommand('alice', { ...command, id: randomUUID(), fields: { priority: 1 } }), /流程已更新/);
+});
+
+test('ordinary settings saved before a failed write resume automatically and manually without overwriting later edits', async () => {
+  for (const mode of ['background', 'manual']) for (const scenario of ['transient', 'etag', 'partial', 'conflict', 'completed', 'completed-matched', 'reparented', 'deleted', 'legacy']) {
+    const f = await fixture(), task = await personal(f), id = randomUUID();
+    const date = '2026-09-12T16:00:00.000Z';
+    const command = { id, action: 'update', source: source(task), fields: { priority: 5, startDate: date } };
+    let writes = 0;
+    f.gateway.update = async (owner, taskId) => {
+      writes++;
+      const remote = f.accounts[owner].get(taskId);
+      if (scenario !== 'transient') remote.etag = 'provider-revision';
+      if (scenario === 'partial') remote.priority = 5;
+      if (scenario === 'conflict') remote.startDate = '2026-09-24T16:00:00.000Z';
+      if (scenario === 'completed') remote.status = 2;
+      if (scenario === 'completed-matched') Object.assign(remote, command.fields, { status: 2 });
+      if (scenario === 'reparented') remote.parentId = 'another-parent';
+      throw new Error('write interrupted');
+    };
+    assert.equal((await f.store.execute('alice', command)).status, 'pending');
+    assert.equal(writes, 1, 'save attempts Dida immediately');
+    const file = path.join(f.dir, 'room-collaboration.json'), state = JSON.parse(await readFile(file, 'utf8'));
+    if (scenario === 'legacy') { delete state.operations[id].updateBaseline; await writeFile(file, JSON.stringify(state)); }
+    f.gateway.locate = scenario === 'deleted' ? async () => null : f.gateway.get;
+    f.gateway.update = async (owner, taskId, fields, version) => {
+      writes++;
+      assert.equal(version, remoteVersion(f.accounts[owner].get(taskId)));
+      Object.assign(f.accounts[owner].get(taskId), structuredClone(fields));
+    };
+    f.store = new CollaborationStore(f.dir, f.gateway);
+    if (mode === 'background') await f.store.reconcilePendingUpdates();
+    else await f.store.resume('alice', id);
+    const recovered = ['transient', 'etag', 'partial'].includes(scenario);
+    const report = await f.store.inspectOperationSync('alice', id);
+    assert.equal(report.status, recovered ? 'done' : 'pending', `${mode}/${scenario}`);
+    assert.equal(writes, recovered ? 2 : 1, `${mode}/${scenario}: conflicting data is never written`);
+    if (recovered) {
+      assert.equal(f.accounts.alice.get(task.id).startDate, date);
+      assert.equal(f.accounts.alice.get(task.id).priority, 5);
+      assert.equal((await f.store.execute('alice', command)).status, 'done', 'original command replay remains idempotent');
+      assert.equal(writes, 2);
+    }
+  }
+});
+
+test('ordinary automatic write retries keep their original baseline and persisted cooldown after another failure', async () => {
+  const f = await fixture(), task = await personal(f), id = randomUUID();
+  const file = path.join(f.dir, 'room-collaboration.json'); let writes = 0;
+  f.gateway.update = async () => {
+    writes++;
+    const state = JSON.parse(await readFile(file, 'utf8'));
+    assert.deepEqual(state.operations[id].updateBaseline.fields, taskFields(task), 'baseline is durable before any write');
+    throw new Error('offline');
+  };
+  await f.store.execute('alice', { id, action: 'update', source: source(task), fields: { priority: 5 } });
+  f.gateway.locate = f.gateway.get;
+  await f.store.reconcilePendingUpdates();
+  assert.equal(writes, 2);
+  f.store = new CollaborationStore(f.dir, f.gateway);
+  await f.store.reconcilePendingUpdates();
+  assert.equal(writes, 2, 'a restart does not reset the retry cooldown');
+  const state = JSON.parse(await readFile(file, 'utf8'));
+  state.operations[id].syncCheck.at = Date.now() - 61000; await writeFile(file, JSON.stringify(state));
+  f.gateway.update = async (owner, taskId, fields) => { writes++; Object.assign(f.accounts[owner].get(taskId), fields); };
+  await f.store.reconcilePendingUpdates();
+  assert.equal(writes, 3);
+  assert.equal((await f.store.inspectOperationSync('alice', id)).status, 'done');
+});
+
 test('pending ordinary updates reconcile matching due-only writes without overwriting differences or trusting residual detail records', async () => {
   for (const scenario of ['match', 'different', 'deleted', 'completed', 'lookup-error']) {
     const f = await fixture(), task = await personal(f), id = randomUUID(), date = '2026-09-30T15:59:00.000Z';

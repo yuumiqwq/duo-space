@@ -1,7 +1,7 @@
 import { getUser, listRoomMembers } from "../../identity/store";
 import { decryptToken } from "../../ticktick/crypto";
 import { tickFetch, tickInboxData, resolveTickInbox, TickApiError } from "../../ticktick/client";
-import { CollaborationError, remoteVersion, sameFields, verificationIssue, type Gateway, type RemoteTask } from "./store";
+import { canResumeSettings, CollaborationError, remoteVersion, sameFields, taskFields, verificationIssue, type Gateway, type RemoteTask } from "./store";
 import type { TaskFields } from "../../../collaboration-types";
 import { taskSyncEvidence } from './sync-diagnostics';
 
@@ -75,6 +75,14 @@ const updatePayload = (fields: TaskFields, before: RemoteTask) => {
   for (const key of ['startDate', 'dueDate'] as const) if (!fields[key] && before[key]) result[key] = '1970-01-01T00:00:00.000+0000';
   return result;
 };
+const waitForReadback = () => new Promise(resolve => setTimeout(resolve, 250));
+function retryableUpdate(error: unknown) {
+  if (error instanceof CollaborationError) {
+    if (error.status === 502) return true;
+    try { return [408, 409, 412].includes(JSON.parse(error.diagnostic || '{}').status); } catch { return false; }
+  }
+  return error instanceof Error && ['TypeError', 'AbortError', 'TimeoutError'].includes(error.name);
+}
 async function completedTask(owner: string, account: Context, id: string, completedAfter?: number) {
   if (completedAfter !== undefined && (!Number.isFinite(completedAfter) || completedAfter < 0)) throw new CollaborationError("任务发布日期无效", 400);
   const queries = account.completed ||= new Map<string, Promise<RemoteTask[]>>();
@@ -167,12 +175,35 @@ export const gateway: Gateway = {
       if (!existing) throw new CollaborationError("任务不存在");
       if (existing.id !== id || (projectId && existing.projectId !== projectId)) throw new CollaborationError('任务编号无效', 400);
       if (remoteVersion(existing) !== version) throw new CollaborationError("任务刚被修改，请刷新后重新编辑");
-      // Keep provider-specific task fields while updating only the editor's supported values.
-      trace.stage = 'write';
-      const response = await request(owner, `/task/${encodeURIComponent(id)}`, { method: "POST", body: JSON.stringify({ ...existing, ...updatePayload(fields, existing), id, projectId: existing.projectId }) });
+      // An uncertain update is re-read before one bounded retry. Never repeat
+      // creation/deletion here, or overwrite later edits to the same task.
+      let current = existing, response;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        trace.stage = 'write';
+        try {
+          response = await request(owner, `/task/${encodeURIComponent(id)}`, { method: "POST", body: JSON.stringify({ ...current, ...updatePayload(fields, current), id, projectId: current.projectId }) });
+          break;
+        } catch (error) {
+          if (attempt || !retryableUpdate(error)) throw error;
+          trace.firstFailure = error instanceof CollaborationError ? error.diagnostic : (error as Error).name;
+          trace.stage = 'verify-before-retry';
+          await waitForReadback();
+          const observed = await gateway.locate!(owner, id, current.projectId);
+          trace.retryReadBack = taskSyncEvidence(observed);
+          if (!observed || !canResumeSettings(observed, fields, { fields: taskFields(existing), status: existing.status || 0, parentId: existing.parentId || '' })) throw new CollaborationError('任务刚被修改，请刷新后重新编辑');
+          if (sameFields(observed, fields)) return observed;
+          current = observed; trace.retryCount = 1;
+        }
+      }
       trace.response = taskSyncEvidence(response); trace.stage = 'read-back';
-      const saved = await gateway.get(owner, id, existing.projectId);
+      let saved = await gateway.get(owner, id, current.projectId);
       trace.readBack = taskSyncEvidence(saved);
+      if (saved && !sameFields(saved, fields)) {
+        await waitForReadback();
+        saved = await gateway.get(owner, id, current.projectId);
+        trace.readBack = taskSyncEvidence(saved);
+      }
+      if (saved && ((saved.status || 0) !== (existing.status || 0) || (saved.parentId || '') !== (existing.parentId || ''))) throw new CollaborationError('任务刚被修改，请刷新后重新编辑');
       if (!saved || !sameFields(saved, fields)) throw new CollaborationError("关联任务的修改正在自动同步");
       return saved;
     } catch (error) {

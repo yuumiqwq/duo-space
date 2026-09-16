@@ -152,7 +152,47 @@ test('write diagnostics distinguish rejected HTTP writes from successful respons
       const trace = JSON.parse(error.diagnostic);
       assert.equal(trace.stage, 'read-back'); assert.equal(trace.response.priority, 5); assert.equal(trace.readBack.priority, 0); return true;
     });
-    assert.equal(writes, 2); assert.equal(reads, 1, 'only one readback after each acknowledged write');
+    assert.equal(writes, 2); assert.equal(reads, 2, 'an inconsistent readback is checked again without repeating the write');
+  });
+});
+
+test('task updates absorb transient failures and delayed readback without repeating acknowledged writes or overwriting changes', async () => {
+  for (const scenario of ['transient', 'lost-response', 'partial', 'delayed-readback', 'conflict', 'deleted', 'auth', 'rate-limit', 'still-offline']) await providerFixture(async gateway => {
+    let task = { id: 'recover-update', projectId: 'saved-list', ...taskFields({ title: 'sync task' }) };
+    const before = structuredClone(task), desired = taskFields({ ...task, priority: 5, startDate: '2026-09-12T16:00:00.000Z' });
+    let writes = 0, reads = 0, lookups = 0;
+    globalThis.fetch = async (url, init) => {
+      const route = new URL(url).pathname.replace('/open/v1', '');
+      if (route === '/task/recover-update' && init.method === 'POST') {
+        writes++;
+        if (scenario === 'auth') return new Response(null, { status: 403 });
+        if (scenario === 'rate-limit') return new Response(null, { status: 429 });
+        if (scenario === 'still-offline') return new Response(null, { status: 503 });
+        if (writes === 1 && !['lost-response', 'delayed-readback'].includes(scenario)) {
+          if (scenario === 'partial') Object.assign(task, { priority: 5, etag: 'partial' });
+          if (scenario === 'conflict') Object.assign(task, { priority: 1, etag: 'later-edit' });
+          return new Response(null, { status: 503 });
+        }
+        task = { ...JSON.parse(init.body), etag: 'saved' };
+        if (scenario === 'lost-response') throw new TypeError('fetch failed');
+        return Response.json(task);
+      }
+      if (route === '/task/filter') { lookups++; return Response.json(scenario === 'deleted' ? [] : [task]); }
+      if (route === '/task/completed') return Response.json([]);
+      if (route === '/project/saved-list/task/recover-update') {
+        reads++;
+        return Response.json(scenario === 'delayed-readback' && reads === 1 ? before : task);
+      }
+      throw new Error(`Unexpected request: ${route}`);
+    };
+    if (['transient', 'lost-response', 'partial', 'delayed-readback'].includes(scenario)) {
+      const saved = await gateway.update('alice', task.id, desired, remoteVersion(before), task.projectId, before);
+      assert.equal(taskFields(saved).priority, 5, scenario);
+      assert.equal(taskFields(saved).startDate, desired.startDate, scenario);
+    } else await assert.rejects(gateway.update('alice', task.id, desired, remoteVersion(before), task.projectId, before));
+    assert.equal(writes, ['transient', 'partial', 'still-offline'].includes(scenario) ? 2 : 1, scenario);
+    if (['auth', 'rate-limit'].includes(scenario)) assert.equal(lookups, 0, 'permanent rejection and rate limits do not trigger immediate retries');
+    if (scenario === 'conflict') assert.equal(task.priority, 1);
   });
 });
 

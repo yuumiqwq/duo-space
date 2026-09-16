@@ -11,7 +11,7 @@ export function UnclaimedTaskDetail({ task, identityId, name, busy, uncertain = 
   const [deleteArmed, setDeleteArmed] = useState(false);
   const reviewerId = task.ownerId || task.publisherId;
   const disabled = busy || uncertain || !!task.pending;
-  const source = { ownerId: task.ownerId, taskId: task.id, version: task.version };
+  const source = { ownerId: task.ownerId, taskId: task.id, version: task.version, settingsVersion: task.settingsVersion };
   async function remove() {
     if (!deleteArmed) { setDeleteArmed(true); return; }
     if (await perform({ id: crypto.randomUUID(), action: "delete", source })) back();

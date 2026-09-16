@@ -31,7 +31,8 @@ export type Gateway = {
 type BufferTask = { fields: TaskFields; version: number; stagedBy?: string; publisherId?: string; publishedAt?: number; completedAt?: number };
 type Creation = { state: "new" | "sent" | "received"; beforeIds?: string[] };
 type AttachmentChange = { actor: string; before: string; after: string; publishBefore?: string };
-type WorkflowEdit = { id: string; fields: TaskFields; attachments?: AttachmentChange; summary?: string; diagnostics?: SyncAttempt[]; targets?: { owner: string; id: string; before: string; baseline?: { fields: TaskFields; status: number; parentId: string }; done: boolean }[] };
+type SettingsBaseline = { fields: TaskFields; status: number; parentId: string };
+type WorkflowEdit = { id: string; fields: TaskFields; attachments?: AttachmentChange; summary?: string; diagnostics?: SyncAttempt[]; targets?: { owner: string; id: string; before: string; baseline?: SettingsBaseline; done: boolean }[] };
 type WorkflowSide = "source" | "target";
 type WorkflowDeletion = { id: string; done?: WorkflowSide[]; acknowledged?: Partial<Record<WorkflowSide, { id: string; projectId: string }>> };
 type ReviewDecision = { comment: string; files: WorkflowFile[] };
@@ -39,7 +40,8 @@ type TaskRecovery = { id: string; creation: Creation; done?: boolean };
 type Workflow = ClaimWorkflow & { settingsResyncReceipts?: { id: string; signature: string; editId: string }[]; deletionDiagnostic?: DeletionDiagnostic; completionRequest?: { id: string; actor: string; signature: string; review?: ReviewDecision }; publishedAt?: number; missingGeneration?: number; restoration?: { id: string; generation: number }; ownerDeletion?: WorkflowDeletion; syncRetryAt?: number; syncAttempts?: number; reopenReceipt?: { before: RemoteTask; retryAt: number }; sourceReopenReceipt?: { before: RemoteTask; retryAt: number }; submittedFields?: { source: TaskFields; target: TaskFields }; projects?: Partial<Record<WorkflowSide, string>>; recovery?: Partial<Record<WorkflowSide, TaskRecovery>>; signature: string; targetCreation: Creation; reviewerCreation?: Creation; approval?: { targetDone: boolean; sourceDone: boolean; sourceSent?: boolean; targetSent?: boolean; repeating?: boolean }; submitted?: { source: string; target: string }; edit?: WorkflowEdit };
 type Operation = OperationView & {
   signature: string; source?: TaskSource; fields: TaskFields; targetId: string;
-  syncCheck?: { at: number; current?: ReturnType<typeof taskSyncEvidence>; observedVersion?: string; differences?: string[]; outcome: 'matched' | 'different' | 'missing' | 'error'; error?: string };
+  updateBaseline?: SettingsBaseline;
+  syncCheck?: { at: number; current?: ReturnType<typeof taskSyncEvidence>; observedVersion?: string; differences?: string[]; outcome: 'matched' | 'different' | 'missing' | 'error'; error?: string; retry?: { at: number; status: OperationView['status']; error: string } };
   attachments?: AttachmentChange;
   phase: "prepared" | "destination-ready" | "source-removed";
   creation?: { state: "new" | "sent" | "received"; beforeIds?: string[] };
@@ -122,7 +124,13 @@ function comparableFields(task: Partial<TaskFields>) {
   return { ...fields, startDate, dueDate, items, tags: [...new Set(fields.tags)].sort(), reminders: [...new Set(fields.reminders)].sort(), repeatFrom: fields.repeatFlag ? fields.repeatFrom : '' };
 }
 export const sameFields = (a: Partial<TaskFields>, b: Partial<TaskFields>) => fingerprint(comparableFields(a)) === fingerprint(comparableFields(b));
+export const taskSettingsVersion = (task: RemoteTask) => fingerprint({ fields: comparableFields(task), status: task.status || 0, parentId: task.parentId || '' });
 const fieldLabels: Record<keyof TaskFields, string> = { title: "标题", content: "说明", priority: "优先级", startDate: "开始时间", dueDate: "截止时间", isAllDay: "全天设置", timeZone: "时区", tags: "标签", reminders: "提醒", repeatFlag: "重复规则", repeatFrom: "重复计算方式", desc: "检查项说明", kind: "任务类型", items: "检查项" };
+export function canResumeSettings(task: RemoteTask, fields: TaskFields, before?: SettingsBaseline): boolean {
+  if (!before || (task.status || 0) !== before.status || (task.parentId || '') !== before.parentId) return false;
+  const current = comparableFields(task), desired = comparableFields(fields), original = comparableFields(before.fields);
+  return (Object.keys(fieldLabels) as (keyof TaskFields)[]).every(key => fingerprint(current[key]) === fingerprint(original[key]) || fingerprint(current[key]) === fingerprint(desired[key]));
+}
 export function fieldDifferences(a: Partial<TaskFields>, b: Partial<TaskFields>): string[] {
   const left = comparableFields(a), right = comparableFields(b);
   return (Object.keys(fieldLabels) as (keyof TaskFields)[]).filter(key => fingerprint(left[key]) !== fingerprint(right[key])).map(key => fieldLabels[key]);
@@ -392,8 +400,8 @@ export class CollaborationStore {
     });
   }
   async reconcilePendingUpdates() {
-    // A legacy update may already be applied using Dida's single-date form.
-    // Acknowledge matching content only; this maintenance path never writes Dida.
+    // Legacy requests can only acknowledge matching content. New requests save
+    // their before state so interrupted writes can resume without user action.
     const state = await this.read();
     const candidates = Object.values(state.operations).filter(op => op.action === 'update' && op.status === 'pending' && op.source && !this.taskWorkflow(state, op.source.ownerId, op.source.taskId) && (!op.syncCheck || op.syncCheck.at + 60000 <= Date.now())).sort((a, b) => (a.syncCheck?.at || 0) - (b.syncCheck?.at || 0) || a.updatedAt - b.updatedAt).slice(0, 3);
     for (const candidate of candidates) await this.serial(async () => {
@@ -402,9 +410,18 @@ export class CollaborationStore {
       try {
         const remote = op.source.ownerId && this.gateway.locate ? await this.gateway.locate(op.source.ownerId, op.source.taskId) : undefined;
         const source = remote === undefined ? await this.source(current, op.source) : remote ? { fields: taskFields(remote), version: remoteVersion(remote), remote } : null;
-        const matched = !!source && !source.remote?.status && sameFields(source.fields, op.fields);
+        const sameContext = !!source && !source.remote?.status && (!op.updateBaseline || (source.remote?.parentId || '') === op.updateBaseline.parentId);
+        const matched = sameContext && sameFields(source.fields, op.fields);
         op.syncCheck = { at: Date.now(), outcome: matched ? 'matched' : source ? 'different' : 'missing', ...(source ? { current: taskSyncEvidence(source.remote || source.fields), observedVersion: source.version, differences: fieldDifferences(source.fields, op.fields) } : {}) };
         if (matched) await this.finish(current, op);
+        else if (source?.remote && canResumeSettings(source.remote, op.fields, op.updateBaseline)) {
+          // Persist the cooldown before network I/O, including failed retries.
+          await this.checkpoint(current, op);
+          const at = Date.now();
+          await this.run(current, op, source);
+          op.syncCheck.retry = { at, status: op.status, error: op.error };
+          await this.checkpoint(current, op);
+        }
         else await this.checkpoint(current, op);
       } catch (error) {
         op.syncCheck = { at: Date.now(), outcome: 'error', error: error instanceof Error ? error.message : '任务状态暂时无法读取' };
@@ -455,7 +472,7 @@ export class CollaborationStore {
         inboxes.set(member.id, inbox.tasks);
         inboxProjects.set(member.id, inbox.projectId);
         const parents = new Set(inbox.tasks.map(task => task.parentId).filter(Boolean));
-        return { ...member, tasks: inbox.tasks.filter(task => !task.status).map(task => ({ ...taskFields(task), id: task.id, ownerId: member.id, version: remoteVersion(task), transferBlocked: task.parentId || parents.has(task.id) ? "含父子任务关系，请先在滴答中整理关系后认领" : undefined })) };
+        return { ...member, tasks: inbox.tasks.filter(task => !task.status).map(task => ({ ...taskFields(task), id: task.id, ownerId: member.id, version: remoteVersion(task), settingsVersion: taskSettingsVersion(task), transferBlocked: task.parentId || parents.has(task.id) ? "含父子任务关系，请先在滴答中整理关系后认领" : undefined })) };
       } catch (error) { return { ...member, tasks: [], error: error instanceof Error ? error.message : "收集箱暂时无法读取", ...(error instanceof CollaborationError && error.diagnostic ? { diagnostic: error.diagnostic } : {}) }; }
     })));
     return { results, inboxes, inboxProjects };
@@ -463,7 +480,21 @@ export class CollaborationStore {
   async snapshot(identityId: string, memberId?: string | null): Promise<CollaborationSnapshot> {
     // Atomic state reads and inbox display must not wait behind remote writes
     // or workflow searches. Reconciliation runs after the HTTP response.
+    const before = await this.read();
     const { results, inboxes } = await this.readInboxes(memberId);
+    if (inboxes.size) await this.serial(async () => {
+      const latest = await this.read();
+      let changed = false;
+      for (const workflow of Object.values(latest.workflows)) {
+        // A slow inbox response cannot undo a website edit accepted during it.
+        if (workflow.version !== before.workflows[workflow.id]?.version) continue;
+        const task = inboxes.get(workflow.claimantId)?.find(task => task.id === workflow.targetId);
+        if (task && this.adoptWorkflowSettings(latest, workflow, task)) {
+          workflow.version++; workflow.updatedAt = Date.now(); changed = true;
+        }
+      }
+      if (changed) { latest.revision++; await this.write(latest); }
+    }).catch(error => { if (!(error instanceof CollaborationError) || error.status !== 409) throw error; });
     const state = await this.read();
     const pending = Object.values(state.operations).filter(op => op.status === "pending");
     const lock = (task: RoomTask) => {
@@ -475,7 +506,7 @@ export class CollaborationStore {
       notices: unreadTaskNotices(state, identityId),
       noticeVersion: state.notifications?.version || 0,
       buffer: Object.entries(state.buffer).filter(([, task]) => !task.completedAt).map(([id, task]) => lock({ ...task.fields, id, ownerId: null, version: String(task.version), publisherId: task.publisherId })),
-      members: results.map(member => ({ ...member, tasks: (inboxes.get(member.id) || []).filter(task => !task.status).map(task => lock({ ...taskFields(task), id: task.id, ownerId: member.id, version: remoteVersion(task), transferBlocked: member.tasks.find(item => item.id === task.id)?.transferBlocked })) })),
+      members: results.map(member => ({ ...member, tasks: (inboxes.get(member.id) || []).filter(task => !task.status).map(task => lock({ ...taskFields(task), id: task.id, ownerId: member.id, version: remoteVersion(task), settingsVersion: taskSettingsVersion(task), transferBlocked: member.tasks.find(item => item.id === task.id)?.transferBlocked })) })),
       operations: [...Object.values(state.operations).map(op => this.publicOperation(op)), ...Object.values(state.workflows).filter(isPersonalCollection).map(workflow => collectionOperation(this.publicWorkflow(workflow)))].sort((a, b) => b.updatedAt - a.updatedAt).filter((op, index) => op.status === "pending" || index < 30),
       workflows: Object.values(state.workflows).filter(workflow => !isPersonalCollection(workflow)).sort((a, b) => b.updatedAt - a.updatedAt).map(workflow => this.publicWorkflow(workflow)),
       legacyCleanup: state.legacyCleanup || [],
@@ -506,6 +537,17 @@ export class CollaborationStore {
     const day = 86400000, shanghaiOffset = 8 * 3600000;
     return Math.floor((workflow.publishedAt + shanghaiOffset) / day) * day - shanghaiOffset;
   }
+  private adoptWorkflowSettings(state: State, workflow: Workflow, task: RemoteTask) {
+    if (!['working', 'submitted', 'rejected'].includes(workflow.status) || workflow.edit || workflow.ownerDeletion || workflow.completionRequest || workflow.recovery || workflow.reopenPending || task.status || task.id !== workflow.targetId) return false;
+    // Do not import a subsequent recurring occurrence into this workflow.
+    const fields = taskFields(task);
+    if ((workflow.fields.repeatFlag || fields.repeatFlag) && (fields.startDate !== workflow.fields.startDate || fields.dueDate !== workflow.fields.dueDate)) return false;
+    if (sameFields(workflow.fields, fields)) return false;
+    workflow.fields = fields; workflow.title = fields.title;
+    const publicTask = workflow.source.ownerId === null && state.buffer[workflow.source.taskId];
+    if (publicTask) { publicTask.fields = fields; publicTask.version++; }
+    return true;
+  }
   private async checkWorkflowTasks(state: State, inboxes: Map<string, RemoteTask[]>, inboxProjects: Map<string, string>, selected?: Workflow) {
     for (const workflow of selected ? [selected] : Object.values(state.workflows)) {
       if (isPersonalCollection(workflow) || workflow.ownerDeletion || !["working", "submitted", "rejected", "approving"].includes(workflow.status)) continue;
@@ -516,6 +558,7 @@ export class CollaborationStore {
         if (!target || (workflow.source.ownerId && !source)) await this.markMissingWorkflowTask(state, workflow);
         else {
           const synced = await this.syncExternalCompletion(state, workflow, source, target);
+          if (this.adoptWorkflowSettings(state, workflow, synced.target)) await this.saveWorkflow(state, workflow);
           if (workflow.taskAnomaly && !workflow.recovery) { workflow.taskAnomaly = false; workflow.error = ""; await this.saveWorkflow(state, workflow); }
           // Reflect this refresh's writes without another full inbox request.
           for (const side of ["source", "target"] as const) {
@@ -639,7 +682,8 @@ export class CollaborationStore {
   }
   private publicWorkflow(workflow: Workflow): ClaimWorkflow {
     const { id, title, source, reviewerId, claimantId, targetId, reviewerTaskId, fields, status, version, createdAt, updatedAt, error, events, syncIssue } = workflow;
-    return { id, title, source, reviewerId, claimantId, targetId, reviewerTaskId, fields: workflow.edit?.fields || fields, status, version, createdAt, updatedAt, error, syncIssue, executing: !!workflow.executing, editPending: !!workflow.edit, ownerDeletePending: !!workflow.ownerDeletion, taskAnomaly: workflow.taskAnomaly, syncError: workflow.syncError, reopenPending: workflow.reopenPending, needsSubmission: workflow.needsSubmission, events: events.map(({ id, actorId, type, at, comment, files, replyTo }) => ({ id, actorId, type, at, comment, files, replyTo })) };
+    const currentFields = workflow.edit?.fields || fields;
+    return { id, title, source, reviewerId, claimantId, targetId, reviewerTaskId, fields: currentFields, settingsVersion: fingerprint({ fields: comparableFields(currentFields), status }), status, version, createdAt, updatedAt, error, syncIssue, executing: !!workflow.executing, editPending: !!workflow.edit, ownerDeletePending: !!workflow.ownerDeletion, taskAnomaly: workflow.taskAnomaly, syncError: workflow.syncError, reopenPending: workflow.reopenPending, needsSubmission: workflow.needsSubmission, events: events.map(({ id, actorId, type, at, comment, files, replyTo }) => ({ id, actorId, type, at, comment, files, replyTo })) };
   }
   private async saveWorkflow(state: State, workflow: Workflow) {
     workflow.executing ??= false;
@@ -874,11 +918,9 @@ export class CollaborationStore {
         attempt.target = { owner: target.owner, id: target.id, expectedVersion: target.before, observedVersion: remoteVersion(task), differences: fieldDifferences(task, edit.fields), current: taskSyncEvidence(task) };
         if (!sameFields(task, edit.fields)) {
           if (remoteVersion(task) !== target.before) {
-            const before = target.baseline, current = comparableFields(task), desired = comparableFields(edit.fields), original = before && comparableFields(before.fields);
             // A changed etag or our partially applied write can safely resume
             // only while every field still equals its saved before/desired value.
-            const compatible = before && original && (task.status || 0) === before.status && (task.parentId || '') === before.parentId && (Object.keys(fieldLabels) as (keyof TaskFields)[]).every(key => fingerprint(current[key]) === fingerprint(original[key]) || fingerprint(current[key]) === fingerprint(desired[key]));
-            if (!compatible) throw new CollaborationError("关联任务在同步期间被修改，已暂停覆盖，请核对后重试");
+            if (!canResumeSettings(task, edit.fields, target.baseline)) throw new CollaborationError("关联任务在同步期间被修改，已暂停覆盖，请核对后重试");
             target.before = remoteVersion(task); attempt.versionRefreshed = true;
           }
           attempt.stage = 'write-linked-task';
@@ -1079,7 +1121,7 @@ export class CollaborationStore {
         workflow.events.push({ id: command.id, signature, actorId: actor, type: command.action, at: Date.now(), comment: reply ? comment : comment || "请查看任务进展，有空回复一下", files: [], ...(reply ? { replyTo: command.replyTo } : {}) });
         await this.saveWorkflow(state, workflow); return this.publicWorkflow(workflow);
       }
-      if (workflow.version !== command.version) throw new CollaborationError("流程已更新，请刷新后操作");
+      if (workflow.version !== command.version && !(command.action === 'update-workflow' && command.settingsVersion && command.settingsVersion === this.publicWorkflow(workflow).settingsVersion)) throw new CollaborationError("流程已更新，请刷新后操作");
       if (["delete-owner-task", "delete-claimed-task"].includes(command.action) || (command.action === "retry-workflow" && workflow.ownerDeletion)) {
         const permitted = command.action === 'delete-owner-task' ? actor === workflow.reviewerId : command.action === 'delete-claimed-task' ? actor === workflow.claimantId : [workflow.reviewerId, workflow.claimantId].includes(actor);
         if (!permitted) throw new CollaborationError("只有任务发起者或认领者能删除对应任务", 403);
@@ -1261,7 +1303,7 @@ export class CollaborationStore {
           if (Object.values(state.operations).some(item => item.status === "pending" && ((item.source?.ownerId === source!.ownerId && item.source.taskId === source!.taskId) || (item.to === source!.ownerId && item.targetId === source!.taskId)))) throw new CollaborationError("任务正在处理中，请先完成或取消之前的操作");
           const current = initialSource = await this.source(state, source);
           if (!current || current.remote?.status) throw new CollaborationError("任务已完成或已移走，请刷新");
-          if (current.version !== source.version) throw new CollaborationError("任务已被修改，请刷新后重新操作");
+          if (current.version !== source.version && !(command.action === 'update' && current.remote && source.settingsVersion && source.settingsVersion === taskSettingsVersion(current.remote))) throw new CollaborationError("任务已被修改，请刷新后重新操作");
           fields = current.fields;
           beforeContent = fields.content;
           if (command.action === "update") fields = await this.fieldsAfterTask(state, { ...fields, ...validateFields(command.fields) }, command.dateAfter, source.ownerId, source);
@@ -1269,6 +1311,8 @@ export class CollaborationStore {
         }
         if (fields.startDate && fields.dueDate && Date.parse(fields.startDate) > Date.parse(fields.dueDate)) throw new CollaborationError("截止时间不能早于开始时间", 400);
         op = { id: command.id, signature, actorId, action: command.action, title: fields.title, from: source?.ownerId ?? null, to: null, source, fields, targetId: randomUUID(), creation: { state: "new" }, status: "pending", phase: "prepared", error: "", createdAt: Date.now(), updatedAt: Date.now() };
+        if (command.action === 'update' && source && initialSource) op.source = { ...source, version: initialSource.version };
+        if (command.action === 'update' && initialSource?.remote) op.updateBaseline = { fields: initialSource.fields, status: initialSource.remote.status || 0, parentId: initialSource.remote.parentId || '' };
         if (['create', 'update'].includes(command.action)) op.attachments = { actor: actorId, before: beforeContent, after: fields.content };
         state.operations[op.id] = op; await this.checkpoint(state, op);
       }
@@ -1311,11 +1355,15 @@ export class CollaborationStore {
       if (op.action === "create") state.buffer[op.targetId] = { fields: op.fields, version: 1, publisherId: op.actorId, publishedAt: op.createdAt };
       else if (op.action === "move") throw new CollaborationError("旧转移已停用，请重新认领");
       else {
-        const source = initialSource || await this.source(state, op.source!);
+        // Retry lookups must exclude deleted residual project/task records.
+        const located = !initialSource && op.action === 'update' && op.source?.ownerId && this.gateway.locate
+          ? await this.gateway.locate(op.source.ownerId, op.source.taskId) : undefined;
+        const source = initialSource || (located === undefined ? await this.source(state, op.source!) : located ? { fields: taskFields(located), version: remoteVersion(located), remote: located } : null);
         if (op.action === "delete" && !source) { await this.finish(state, op); return this.publicOperation(op); }
         if (!source) throw new CollaborationError("任务已移走，请取消此次操作并刷新");
+        if (op.action === 'update' && (source.remote?.status || (op.updateBaseline && (source.remote?.parentId || '') !== op.updateBaseline.parentId))) throw new CollaborationError("任务已被修改，请取消此次操作并刷新");
         if ((op.action === "update" && sameFields(source.fields, op.fields)) || (op.action === "complete" && source.remote?.status === 2)) { await this.finish(state, op); return this.publicOperation(op); }
-        if (source.version !== op.source!.version) throw new CollaborationError("任务已被修改，请取消此次操作并刷新");
+        if (source.version !== op.source!.version && !(op.action === 'update' && source.remote && canResumeSettings(source.remote, op.fields, op.updateBaseline))) throw new CollaborationError("任务已被修改，请取消此次操作并刷新");
         if (op.source!.ownerId) {
           if (op.action === "update") await this.gateway.update(op.source!.ownerId, op.source!.taskId, op.fields, source.version, source.remote?.projectId, source.remote);
           else if (op.action === "complete") await this.gateway.complete(op.source!.ownerId, op.source!.taskId, source.remote?.projectId);

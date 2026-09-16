@@ -25,7 +25,7 @@ function Choices({ label, value, options, disabled, change }: { label: string; v
 export function WorkflowSettings({ workflow, identityId, disabled, perform, onDeleted }: { workflow: ClaimWorkflow; identityId: string; disabled: boolean; perform: (command: WorkflowCommand) => Promise<boolean>; onDeleted?: () => void }) {
   disabled ||= workflow.status === 'deleted' || !!workflow.ownerDeletePending;
   return <TaskSettings taskKey={workflow.id} currentFields={workflow.fields} disabled={disabled}
-    save={fields => perform({ id: crypto.randomUUID(), workflowId: workflow.id, version: workflow.version, action: "update-workflow", fields })}
+    save={fields => perform({ id: crypto.randomUUID(), workflowId: workflow.id, version: workflow.version, settingsVersion: workflow.settingsVersion, action: "update-workflow", fields })}
     deletion={locked => <WorkflowTaskDeletion workflow={workflow} identityId={identityId} disabled={locked} perform={perform} onDeleted={onDeleted} />} />;
 }
 

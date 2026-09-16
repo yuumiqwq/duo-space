@@ -31,7 +31,7 @@ import { taskboardAttentionCount, workflowAttentionCount, type WorkflowAttention
 
 type RequestCommand = WorkflowCommand | ExecutionCommand | { id: string; action: "legacy-reset" } | CollaborationCommand | { id: string; action: "resume" | "cancel" } | { id: string; action: "recover"; target: { id: string; version: string } };
 const taskKey = (task: RoomTask) => `${task.ownerId || "buffer"}:${task.id}`;
-const taskSource = (task: RoomTask) => ({ ownerId: task.ownerId, taskId: task.id, version: task.version });
+const taskSource = (task: RoomTask) => ({ ownerId: task.ownerId, taskId: task.id, version: task.version, settingsVersion: task.settingsVersion });
 const priorities = { 0: "无优先级", 1: "低", 3: "中", 5: "高" };
 const operationTime = (value: number) => new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(new Date(value));
 
