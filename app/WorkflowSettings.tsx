@@ -1,6 +1,6 @@
 "use client";
 
-import { dateInput, apiDate } from "./task-date-input";
+import { taskDateInputs, taskDateSelection } from "./task-date-input";
 import { useRef, useState, type ReactNode } from "react";
 import { TaskDescriptionEditor } from "./TaskDescription";
 import { WorkflowTaskDeletion } from "./WorkflowTaskDeletion";
@@ -33,12 +33,12 @@ export function TaskSettings({ taskKey, currentFields, disabled, save, deletion 
   const [uploading, setUploading] = useState(false);
   const [draft, setDraft] = useState<{ fields: TaskFields; base: TaskFields; start: string; due: string; tags: string } | null>(null);
   const fields = draft?.fields || currentFields;
-  const start = draft?.start ?? dateInput(fields.startDate, fields.isAllDay), due = draft?.due ?? dateInput(fields.dueDate, fields.isAllDay);
+  const dates = taskDateInputs(fields);
+  const start = draft?.start ?? dates.start, due = draft?.due ?? dates.due;
   const tags = draft?.tags ?? fields.tags.join(", ");
   const change = (patch: Partial<TaskFields>, inputs: Partial<{ start: string; due: string; tags: string }> = {}) => setDraft({ base: draft?.base ?? currentFields, fields: { ...fields, ...patch }, start, due, tags, ...inputs });
   const editedFields = { ...fields,
-    startDate: start === dateInput(fields.startDate, fields.isAllDay) ? fields.startDate : apiDate(start, fields.isAllDay),
-    dueDate: due === dateInput(fields.dueDate, fields.isAllDay) ? fields.dueDate : apiDate(due, fields.isAllDay, true),
+    ...taskDateSelection(fields, start, due),
     tags: tags.split(/[,，]/).map(tag => tag.trim()).filter(Boolean),
   };
   const rebased = rebaseWorkflowDraft(draft?.base || currentFields, editedFields, currentFields);
@@ -48,7 +48,7 @@ export function TaskSettings({ taskKey, currentFields, disabled, save, deletion 
     void save(rebased.patch).then(done => { if (done) setDraft(null); });
   }}>
     <h4>详细设置</h4>
-    {draft && rebased.conflicts.length > 0 && <div className="coop-feedback" role="status"><p>其他成员修改了你正在编辑的内容，你的输入已保留。</p><button type="button" disabled={disabled} onClick={() => setDraft(null)}>采用最新内容</button><button type="button" disabled={disabled} onClick={() => { const merged = { ...currentFields, ...rebased.patch }; setDraft({ fields: merged, base: currentFields, start: dateInput(merged.startDate, merged.isAllDay), due: dateInput(merged.dueDate, merged.isAllDay), tags: merged.tags.join(', ') }); }}>保留我的修改</button></div>}
+    {draft && rebased.conflicts.length > 0 && <div className="coop-feedback" role="status"><p>其他成员修改了你正在编辑的内容，你的输入已保留。</p><button type="button" disabled={disabled} onClick={() => setDraft(null)}>采用最新内容</button><button type="button" disabled={disabled} onClick={() => { const merged = { ...currentFields, ...rebased.patch }; setDraft({ fields: merged, base: currentFields, ...taskDateInputs(merged), tags: merged.tags.join(', ') }); }}>保留我的修改</button></div>}
     <label>任务标题<input required maxLength={500} value={fields.title} disabled={disabled} onChange={event => change({ title: event.target.value })} /></label>
     <TaskDescriptionEditor value={fields.content} disabled={disabled} taskKey={taskKey} onChange={content => change({ content })} onUploading={setUploading} />
     <Choices label="优先级" value={String(fields.priority)} options={[["1", "低"], ["3", "中"], ["5", "高"]]} disabled={disabled} change={value => change({ priority: fields.priority === Number(value) ? 0 : Number(value) as TaskFields["priority"] })} />

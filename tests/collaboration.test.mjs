@@ -343,7 +343,7 @@ test('persisted all-day claim verification resumes with a provider-filled deadli
     await f.store.recoverPendingWorkflows();
     w = (await f.store.snapshot('alice')).workflows.find(item => item.id === w.id);
     assert.equal(w.status, completing ? 'done' : 'working'); assert.equal(w.error, '');
-    assert.equal(w.fields.dueDate, null); assert.equal(w.targetId, 'actual-all-day');
+    assert.equal(w.fields.dueDate, task.startDate); assert.equal(w.targetId, 'actual-all-day');
     assert.equal(f.accounts.bob.get(w.targetId).dueDate, task.startDate);
     assert.equal(f.accounts.bob.get(w.targetId).status, completing ? 2 : 0);
     assert.equal(f.accounts.alice.size, 0); assert.equal(f.counts.creates, 1);
@@ -1605,7 +1605,35 @@ test('ordinary automatic write retries keep their original baseline and persiste
   assert.equal((await f.store.inspectOperationSync('alice', id)).status, 'done');
 });
 
-test('pending ordinary updates reconcile matching due-only writes without overwriting differences or trusting residual detail records', async () => {
+test('new all-day edits persist and send the selected day immediately, including reminder and recurring tasks', async () => {
+  const date = '2026-09-12T16:00:00.000Z';
+  for (const settings of [{}, { reminders: ['TRIGGER:PT0S'] }, { repeatFlag: 'RRULE:FREQ=DAILY' }]) {
+    const f = await fixture(), task = await personal(f), update = f.gateway.update, writes = [];
+    f.gateway.update = async (...args) => { writes.push(structuredClone(args[2])); await update(...args); };
+    const command = { id: randomUUID(), action: 'update', source: source(task), fields: { ...settings, startDate: date } };
+    assert.equal((await f.store.execute('alice', command)).status, 'done');
+    assert.equal(writes.length, 1); assert.equal(writes[0].startDate, date); assert.equal(writes[0].dueDate, date);
+    const w = await claim(f, await f.create('single day workflow'));
+    const changed = await act(f, w, 'alice', 'update-workflow', { fields: { ...settings, startDate: date } });
+    assert.equal(changed.editPending, false); assert.equal(changed.fields.startDate, date); assert.equal(changed.fields.dueDate, date);
+    assert.equal(writes.length, 2); assert.equal(f.accounts.bob.get(w.targetId).dueDate, date);
+  }
+});
+
+test('new all-day normalization leaves unrelated legacy dates and timed single fields intact', async () => {
+  for (const isAllDay of [true, false]) {
+    const f = await fixture(), task = await personal(f, { startDate: '2026-09-12T16:00:00.000Z', isAllDay });
+    const op = await f.store.execute('alice', { id: randomUUID(), action: 'update', source: source(task), fields: { title: 'changed description only' } });
+    assert.equal(op.status, 'done'); assert.equal(f.accounts.alice.get(task.id).dueDate, null);
+    if (!isAllDay) {
+      const fresh = (await f.store.snapshot('alice', 'alice')).members.find(member => member.id === 'alice').tasks.find(item => item.id === task.id);
+      await f.store.execute('alice', { id: randomUUID(), action: 'update', source: source(fresh), fields: { startDate: '2026-09-15T01:00:00.000Z' } });
+      assert.equal(f.accounts.alice.get(task.id).dueDate, null);
+    }
+  }
+});
+
+test('pending ordinary updates reconcile a selected all-day date without overwriting differences or trusting residual detail records', async () => {
   for (const scenario of ['match', 'different', 'deleted', 'completed', 'lookup-error']) {
     const f = await fixture(), task = await personal(f), id = randomUUID(), date = '2026-09-30T15:59:00.000Z';
     f.gateway.update = async (owner, taskId, fields) => {
@@ -1626,7 +1654,7 @@ test('pending ordinary updates reconcile matching due-only writes without overwr
     await f.store.reconcilePendingUpdates();
     const report = await f.store.inspectOperationSync('alice', id);
     assert.equal(report.status, scenario === 'match' ? 'done' : 'pending');
-    assert.equal(report.requested.startDate, null); assert.equal(report.requested.dueDate, date);
+    assert.equal(report.requested.startDate, date); assert.equal(report.requested.dueDate, date);
     assert.equal(report.verification.outcome, { match: 'matched', different: 'different', deleted: 'missing', completed: 'different', 'lookup-error': 'error' }[scenario]);
     assert.ok(!JSON.stringify(report).includes('private external edit'));
     const before = await readFile(path.join(f.dir, 'room-collaboration.json'), 'utf8');
@@ -1673,7 +1701,7 @@ test('edit history survives failures, restart and retry while diagnostics retain
   assert.equal(report.attempts.at(-1).error, 'write failed 8');
   assert.equal(report.attempts.at(-1).stage, 'write-linked-task');
   assert.equal(report.attempts[0].requested.startDate, '2026-09-12T16:00:00.000Z');
-  assert.equal(report.attempts[0].requested.dueDate, null);
+  assert.equal(report.attempts[0].requested.dueDate, '2026-09-12T16:00:00.000Z');
   assert.equal(report.attempts.at(-1).target.expectedVersion, report.attempts.at(-1).target.observedVersion);
   assert.ok(!JSON.stringify(report).includes('private task body'));
   const pushed = []; f.gateway.notify = async notice => pushed.push(notice);

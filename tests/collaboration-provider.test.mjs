@@ -5,7 +5,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { build } from 'esbuild';
 import { encryptToken } from '../app/api/ticktick/crypto.ts';
-import { CollaborationStore, remoteVersion, taskFields } from '../app/api/room/tasks/store.ts';
+import { CollaborationStore, remoteVersion, sameFields, taskFields } from '../app/api/room/tasks/store.ts';
 import { randomUUID } from 'node:crypto';
 
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
@@ -27,7 +27,7 @@ async function providerFixture(run) {
   }
 }
 
-test('single-date edits preserve the selected field and a partial write cannot confirm a missing date', async () => {
+test('single-day edits send Dida dates together on the first write and still reject a missing date', async () => {
   await providerFixture(async gateway => {
     let task = { id: 'single-date', projectId: 'saved-list', ...taskFields({ title: '日期核对' }), etag: 'initial' };
     let omitDate = false, writes = 0;
@@ -48,8 +48,8 @@ test('single-date edits preserve the selected field and a partial write cannot c
       await gateway.update('alice', task.id, fields, remoteVersion(task), task.projectId);
       const written = requests.at(-1);
       assert.equal(Date.parse(written[key]), Date.parse(date));
-      assert.equal(written[key === 'startDate' ? 'dueDate' : 'startDate'], key === 'startDate' ? null : '1970-01-01T00:00:00.000+0000', 'clear a prior date explicitly without inventing a second date');
-      assert.deepEqual(taskFields(await gateway.get('alice', task.id, task.projectId)), fields);
+      assert.equal(written.startDate, written.dueDate, 'single-day selection sends the same day in both fields from the first request');
+      assert.ok(sameFields(await gateway.get('alice', task.id, task.projectId), fields));
     }
     omitDate = true;
     const fields = taskFields({ title: task.title, priority: 5, startDate: date }), before = remoteVersion(task);
@@ -69,7 +69,7 @@ test('single-date edits preserve the selected field and a partial write cannot c
   });
 });
 
-test('an ignored all-day date gets one equivalent-pair write, without overwriting changed dates or non-date fields', async () => {
+test('Dida single-day representation succeeds immediately and mismatches never trigger a second format write', async () => {
   for (const scenario of ['start', 'due', 'ignore-both', 'changed-date', 'changed-title', 'reminder', 'repeat', 'timed']) await providerFixture(async gateway => {
     let task = { id: 'date-fallback', projectId: 'saved-list', ...taskFields({ title: 'saved title' }), etag: 'before' };
     const before = structuredClone(task), writes = [];
@@ -81,7 +81,7 @@ test('an ignored all-day date gets one equivalent-pair write, without overwritin
       if (route === '/task/date-fallback' && init.method === 'POST') {
         const body = JSON.parse(init.body); writes.push(body);
         task = { ...body, etag: 'saved' };
-        if (writes.length === 1 || scenario === 'ignore-both') { task.startDate = null; task.dueDate = null; }
+        if (!(body.startDate && body.startDate === body.dueDate) || scenario === 'ignore-both') { task.startDate = null; task.dueDate = null; }
         if (scenario === 'changed-date') task.startDate = '2026-09-24T16:00:00.000Z';
         if (scenario === 'changed-title') task.title = 'later title';
         return Response.json(task);
@@ -90,13 +90,13 @@ test('an ignored all-day date gets one equivalent-pair write, without overwritin
     };
     if (['start', 'due'].includes(scenario)) {
       const saved = await gateway.update('alice', task.id, desired, remoteVersion(before), task.projectId, before);
-      assert.equal(writes.length, 2); assert.equal(writes[1].startDate, writes[1].dueDate);
+      assert.equal(writes.length, 1); assert.equal(writes[0].startDate, writes[0].dueDate);
       assert.equal(Date.parse(saved.startDate), Date.parse('2026-09-12T16:00:00.000Z'));
       assert.equal(desired[scenario === 'due' ? 'startDate' : 'dueDate'], null, 'keep the website single-date choice');
-      assert.equal(writes[1].etag, 'saved', 'retry uses fresh provider metadata');
+      assert.equal(writes[0].etag, 'before');
     } else {
       await assert.rejects(gateway.update('alice', task.id, desired, remoteVersion(before), task.projectId, before));
-      assert.equal(writes.length, scenario === 'ignore-both' ? 2 : 1, scenario);
+      assert.equal(writes.length, 1, scenario);
     }
   });
 });
@@ -120,7 +120,7 @@ test('updating dates uses the clear sentinel and accepts either single-date form
     for (const patch of [{ startDate: null, dueDate: null }, { startDate: date, dueDate: null }, { startDate: null, dueDate: '2026-09-30T15:59:00.000Z' }, { startDate: null, dueDate: null }]) {
       const before = structuredClone(task), desired = taskFields({ ...task, ...patch });
       const saved = await gateway.update('alice', task.id, desired, remoteVersion(task), task.projectId);
-      for (const key of ['startDate', 'dueDate']) if (!desired[key] && before[key]) assert.equal(writes.at(-1)[key], '1970-01-01T00:00:00.000+0000');
+      for (const key of ['startDate', 'dueDate']) if (!desired.startDate && !desired.dueDate && before[key]) assert.equal(writes.at(-1)[key], '1970-01-01T00:00:00.000+0000');
       assert.equal(taskFields(saved).startDate, desired.startDate ?? desired.dueDate);
       assert.equal(taskFields(saved).dueDate, desired.dueDate ?? desired.startDate);
       assert.deepEqual({ startDate: desired.startDate, dueDate: desired.dueDate }, patch, 'website values retain the chosen single-date or null form');

@@ -4,6 +4,7 @@ import { tickFetch, tickInboxData, resolveTickInbox, TickApiError } from "../../
 import { canResumeSettings, CollaborationError, remoteVersion, sameFields, taskFields, verificationIssue, type Gateway, type RemoteTask } from "./store";
 import type { TaskFields } from "../../../collaboration-types";
 import { taskSyncEvidence } from './sync-diagnostics';
+import { allDaySelection } from '../../../task-date-input';
 
 type Context = { token: string; encrypted: string; expires: number; search?: Promise<RemoteTask[]>; projects?: Promise<string[]>; completed?: Map<string, Promise<RemoteTask[]>> };
 type Inbox = { projectId: string; tasks: RemoteTask[] };
@@ -69,10 +70,15 @@ async function resolvedInbox(owner: string) {
   return resolveTickInbox(account.token, inbox);
 }
 const validId = (id: string) => /^[A-Za-z0-9_-]{1,100}$/.test(id);
-const payload = (fields: TaskFields) => ({ ...fields, startDate: fields.startDate?.replace(/\.\d{3}Z$/, "+0000") ?? null, dueDate: fields.dueDate?.replace(/\.\d{3}Z$/, "+0000") ?? null });
+const payload = (fields: TaskFields) => {
+  // New date selections are already stored as a same-day pair. Normalize
+  // older ordinary all-day requests here without rewriting their history.
+  const dates = !fields.repeatFlag && !fields.reminders.length ? allDaySelection(fields) : fields;
+  return { ...fields, startDate: dates.startDate?.replace(/\.\d{3}Z$/, "+0000") ?? null, dueDate: dates.dueDate?.replace(/\.\d{3}Z$/, "+0000") ?? null };
+};
 const updatePayload = (fields: TaskFields, before: RemoteTask) => {
   const result = payload(fields);
-  for (const key of ['startDate', 'dueDate'] as const) if (!fields[key] && before[key]) result[key] = '1970-01-01T00:00:00.000+0000';
+  for (const key of ['startDate', 'dueDate'] as const) if (!result[key] && before[key]) result[key] = '1970-01-01T00:00:00.000+0000';
   return result;
 };
 const waitForReadback = () => new Promise(resolve => setTimeout(resolve, 250));
@@ -177,12 +183,12 @@ export const gateway: Gateway = {
       if (remoteVersion(existing) !== version) throw new CollaborationError("任务刚被修改，请刷新后重新编辑");
       // An uncertain update is re-read before one bounded retry. Never repeat
       // creation/deletion here, or overwrite later edits to the same task.
-      let current = existing, response, writes = 0;
+      let current = existing, response;
       for (let attempt = 0; attempt < 2; attempt++) {
         trace.stage = 'write';
         try {
           const body = { ...current, ...updatePayload(fields, current), id, projectId: current.projectId };
-          trace.sent = taskSyncEvidence(body); writes++;
+          trace.sent = taskSyncEvidence(body);
           response = await request(owner, `/task/${encodeURIComponent(id)}`, { method: "POST", body: JSON.stringify(body) });
           break;
         } catch (error) {
@@ -203,22 +209,6 @@ export const gateway: Gateway = {
       if (saved && !sameFields(saved, fields)) {
         await waitForReadback();
         saved = await gateway.get(owner, id, current.projectId);
-        trace.readBack = taskSyncEvidence(saved);
-      }
-      // Some Open API updates accept other fields but leave a lone all-day
-      // date unchanged. Use Dida's equivalent same-day pair only in the same
-      // restricted case as our comparison rule, and only with a safe readback.
-      const singleDay = fields.isAllDay && !fields.repeatFlag && !fields.reminders.length && !!fields.startDate !== !!fields.dueDate;
-      if (writes < 2 && singleDay && saved && !sameFields(saved, fields)
-        && sameFields({ ...saved, startDate: fields.startDate, dueDate: fields.dueDate }, fields)
-        && canResumeSettings(saved, fields, { fields: taskFields(existing), status: existing.status || 0, parentId: existing.parentId || '' })) {
-        const date = fields.startDate || fields.dueDate;
-        const body = { ...saved, ...payload({ ...fields, startDate: date, dueDate: date }), id, projectId: saved.projectId };
-        trace.dateEncoding = 'same-day-pair'; trace.stage = 'write-date-pair'; trace.sent = taskSyncEvidence(body);
-        response = await request(owner, `/task/${encodeURIComponent(id)}`, { method: 'POST', body: JSON.stringify(body) });
-        trace.response = taskSyncEvidence(response); trace.stage = 'read-back';
-        saved = await gateway.get(owner, id, body.projectId);
-        if (saved && !sameFields(saved, fields)) { await waitForReadback(); saved = await gateway.get(owner, id, body.projectId); }
         trace.readBack = taskSyncEvidence(saved);
       }
       if (saved && ((saved.status || 0) !== (existing.status || 0) || (saved.parentId || '') !== (existing.parentId || ''))) throw new CollaborationError('任务刚被修改，请刷新后重新编辑');

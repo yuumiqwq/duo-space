@@ -10,6 +10,7 @@ import { appendSyncAttempt, taskSyncEvidence, type DeletionDiagnostic, type Dele
 import type { ClaimWorkflow, WorkflowCommand, WorkflowFile, CollaborationCommand, CollaborationSnapshot, ExecutionCommand, OperationResyncCommand, OperationView, RoomTask, TaskFields, TaskSource } from "../../../collaboration-types";
 import { EXECUTION_LIMIT, executionEligible, executionReserved, isExecuting } from '../../../workflow-execution.ts';
 import { descriptionAttachments } from "../../../task-description-attachments.ts";
+import { allDaySelection } from '../../../task-date-input.ts';
 
 export type RemoteTask = Partial<TaskFields> & { id: string; projectId: string; status?: number; parentId?: string; [key: string]: unknown };
 export type Gateway = {
@@ -164,6 +165,10 @@ export function validateFields(input: unknown): Partial<TaskFields> {
     } else throw new CollaborationError("包含不支持编辑的字段", 400);
   }
   return result as Partial<TaskFields>;
+}
+function editedTaskFields(previous: TaskFields, patch: Partial<TaskFields>) {
+  const fields = { ...previous, ...patch };
+  return ['startDate', 'dueDate', 'isAllDay'].some(key => Object.hasOwn(patch, key)) ? allDaySelection(fields) : fields;
 }
 
 export class CollaborationStore {
@@ -1182,7 +1187,7 @@ export class CollaborationStore {
       }
       if (command.action === "update-workflow") {
         const previousFields = workflow.edit?.fields || workflow.fields;
-        const fields = { ...previousFields, ...validateFields(command.fields) };
+        const fields = editedTaskFields(previousFields, validateFields(command.fields));
         if (fields.startDate && fields.dueDate && Date.parse(fields.startDate) > Date.parse(fields.dueDate)) throw new CollaborationError("截止时间不能早于开始时间", 400);
         const before = [workflow.fields.content, workflow.edit?.attachments?.before || '', workflow.edit?.fields.content || ''].join('\n');
         workflow.edit = { id: command.id, fields, attachments: { actor, before, publishBefore: workflow.fields.content, after: fields.content }, summary: workflowSettingChanges(previousFields, fields), diagnostics: workflow.edit?.diagnostics };
@@ -1323,7 +1328,7 @@ export class CollaborationStore {
         if (op.status !== "pending") return this.publicOperation(op);
       } else {
         let fields = taskFields({}), beforeContent = ''; const source = command.source;
-        if (command.action === "create") { fields = taskFields(validateFields(command.fields)); if (!fields.title) throw new CollaborationError("请填写任务标题", 400); }
+        if (command.action === "create") { fields = allDaySelection(taskFields(validateFields(command.fields))); if (!fields.title) throw new CollaborationError("请填写任务标题", 400); }
         else {
           if (!source || (source.ownerId !== null && !members.some(member => member.id === source!.ownerId)) || typeof source.taskId !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(source.taskId) || typeof source.version !== "string") throw new CollaborationError("任务来源无效", 400);
           if (command.action === "complete") this.requireCompletionOwner(state, actorId, source);
@@ -1334,7 +1339,7 @@ export class CollaborationStore {
           if (current.version !== source.version && !(command.action === 'update' && current.remote && source.settingsVersion && source.settingsVersion === taskSettingsVersion(current.remote))) throw new CollaborationError("任务已被修改，请刷新后重新操作");
           fields = current.fields;
           beforeContent = fields.content;
-          if (command.action === "update") fields = await this.fieldsAfterTask(state, { ...fields, ...validateFields(command.fields) }, command.dateAfter, source.ownerId, source);
+          if (command.action === "update") fields = await this.fieldsAfterTask(state, editedTaskFields(fields, validateFields(command.fields)), command.dateAfter, source.ownerId, source);
 
         }
         if (fields.startDate && fields.dueDate && Date.parse(fields.startDate) > Date.parse(fields.dueDate)) throw new CollaborationError("截止时间不能早于开始时间", 400);
