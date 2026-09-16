@@ -7,7 +7,7 @@ import { collaborationDate, collaborationDateAfter } from "../../../collaboratio
 import { clearLegacyRecords } from "../../../legacy-record-cleanup.ts";
 import { activeTaskNotice, collectTaskNotices, initializeTaskNotices, receivesTaskNotice, silentWorkflowEvent, unreadTaskNotices, workflowEventPresentation, type TaskNotice, type TaskNoticeState } from "../../../collaboration-notifications.ts";
 import { appendSyncAttempt, taskSyncEvidence, type DeletionDiagnostic, type DeletionSideEvidence, type SyncAttempt } from './sync-diagnostics.ts';
-import type { ClaimWorkflow, WorkflowCommand, WorkflowFile, CollaborationCommand, CollaborationSnapshot, ExecutionCommand, OperationView, RoomTask, TaskFields, TaskSource } from "../../../collaboration-types";
+import type { ClaimWorkflow, WorkflowCommand, WorkflowFile, CollaborationCommand, CollaborationSnapshot, ExecutionCommand, OperationResyncCommand, OperationView, RoomTask, TaskFields, TaskSource } from "../../../collaboration-types";
 import { EXECUTION_LIMIT, executionEligible, executionReserved, isExecuting } from '../../../workflow-execution.ts';
 import { descriptionAttachments } from "../../../task-description-attachments.ts";
 
@@ -41,6 +41,7 @@ type Workflow = ClaimWorkflow & { settingsResyncReceipts?: { id: string; signatu
 type Operation = OperationView & {
   signature: string; source?: TaskSource; fields: TaskFields; targetId: string;
   updateBaseline?: SettingsBaseline;
+  resyncReceipts?: { id: string; signature: string }[];
   syncCheck?: { at: number; current?: ReturnType<typeof taskSyncEvidence>; observedVersion?: string; differences?: string[]; outcome: 'matched' | 'different' | 'missing' | 'error'; error?: string; retry?: { at: number; status: OperationView['status']; error: string } };
   attachments?: AttachmentChange;
   phase: "prepared" | "destination-ready" | "source-removed";
@@ -683,7 +684,7 @@ export class CollaborationStore {
   private publicWorkflow(workflow: Workflow): ClaimWorkflow {
     const { id, title, source, reviewerId, claimantId, targetId, reviewerTaskId, fields, status, version, createdAt, updatedAt, error, events, syncIssue } = workflow;
     const currentFields = workflow.edit?.fields || fields;
-    return { id, title, source, reviewerId, claimantId, targetId, reviewerTaskId, fields: currentFields, settingsVersion: fingerprint({ fields: comparableFields(currentFields), status }), status, version, createdAt, updatedAt, error, syncIssue, executing: !!workflow.executing, editPending: !!workflow.edit, ownerDeletePending: !!workflow.ownerDeletion, taskAnomaly: workflow.taskAnomaly, syncError: workflow.syncError, reopenPending: workflow.reopenPending, needsSubmission: workflow.needsSubmission, events: events.map(({ id, actorId, type, at, comment, files, replyTo }) => ({ id, actorId, type, at, comment, files, replyTo })) };
+    return { id, title, source, reviewerId, claimantId, targetId, reviewerTaskId, fields: currentFields, settingsVersion: fingerprint({ fields: comparableFields(currentFields), status }), status, version, createdAt, updatedAt, error, syncIssue, executing: !!workflow.executing, editPending: !!workflow.edit, deletionPending: !!workflow.deletionDiagnostic?.pending, ownerDeletePending: !!workflow.ownerDeletion, taskAnomaly: workflow.taskAnomaly, syncError: workflow.syncError, reopenPending: workflow.reopenPending, needsSubmission: workflow.needsSubmission, events: events.map(({ id, actorId, type, at, comment, files, replyTo }) => ({ id, actorId, type, at, comment, files, replyTo })) };
   }
   private async saveWorkflow(state: State, workflow: Workflow) {
     workflow.executing ??= false;
@@ -1029,8 +1030,8 @@ export class CollaborationStore {
         role: side === 'target' ? 'claimant-copy' : workflow.source.ownerId ? 'original' : id ? 'legacy-publisher-copy' : 'no-publisher-copy', outcome: 'skipped' };
       results.push(result);
       if (!id) continue;
-      const confirmed = [...(workflow.deletionDiagnostic?.verification || []), ...(workflow.deletionDiagnostic?.sides || [])].find(item => item.side === side && item.taskId === id && ['deleted', 'absent'].includes(item.outcome));
-      if (!remove && confirmed) { Object.assign(result, confirmed); continue; }
+      const confirmed = [...(workflow.deletionDiagnostic?.verification || []), ...(workflow.deletionDiagnostic?.retries || []).flatMap(retry => retry.sides || []), ...(workflow.deletionDiagnostic?.sides || [])].find(item => item.side === side && item.owner === owner && item.taskId === id && ['deleted', 'absent'].includes(item.outcome));
+      if (confirmed) { Object.assign(result, confirmed); continue; }
       let stage: 'lookup' | 'delete' = 'lookup';
       try {
         const task = await (this.gateway.locate
@@ -1079,6 +1080,13 @@ export class CollaborationStore {
       if (!workflow) throw new CollaborationError("流程不存在", 404);
       if (isPersonalCollection(workflow)) throw new CollaborationError("自己的任务直接放入收集箱，不使用审批流程", 409);
       const signature = fingerprint({ actor, command }), prior = workflow.events.find(event => event.id === command.id);
+      const deletionRetry = workflow.deletionDiagnostic?.retries?.find(receipt => receipt.id === command.id);
+      if (deletionRetry) {
+        if (deletionRetry.signature !== signature) throw new CollaborationError('操作编号已使用');
+        // The saved receipt acknowledges this exact attempt, including a lost
+        // response or restart. Subsequent polling only verifies the outcome.
+        return this.publicWorkflow(workflow);
+      }
       const resync = workflow.settingsResyncReceipts?.find(receipt => receipt.id === command.id);
       if (resync) {
         if (resync.signature !== signature) throw new CollaborationError('操作编号已使用');
@@ -1104,6 +1112,26 @@ export class CollaborationStore {
         if (workflow.edit?.id === command.id) return this.finishWorkflowEdit(state, workflow);
         if (workflow.edit) return this.publicWorkflow(workflow);
         return workflow.status === "approving" && actor === workflow.reviewerId ? this.finishApproval(state, workflow) : this.publicWorkflow(workflow);
+      }
+      if (command.action === 'retry-deletion') {
+        if (![workflow.reviewerId, workflow.claimantId].includes(actor)) throw new CollaborationError('只有任务发起者或认领者能重试删除', 403);
+        if (workflow.version !== command.version) throw new CollaborationError('流程已更新，请刷新后操作');
+        if (workflow.status !== 'deleted' || workflow.error !== '滴答清单中删除失败' || workflow.deletionDiagnostic?.pending) throw new CollaborationError('此流程无需重试删除');
+        const diagnostic = workflow.deletionDiagnostic ||= { at: Date.now(), origin: 'legacy-unverified', sides: [] };
+        const receipt: NonNullable<DeletionDiagnostic['retries']>[number] = { id: command.id, signature, at: Date.now() };
+        diagnostic.retries = [...(diagnostic.retries || []), receipt];
+        diagnostic.pending = true; diagnostic.nextCheckAt = Date.now() + 120000;
+        await this.saveWorkflow(state, workflow);
+        receipt.sides = await this.inspectDeletedTasks(workflow, this.completedAfter(state, workflow), true);
+        receipt.finishedAt = Date.now();
+        diagnostic.pending = false; diagnostic.nextCheckAt = Date.now() + 15000;
+        // Preserve original failure evidence and workflow history. Reconcile
+        // uncertain sides by reading, while retaining positive DELETE receipts.
+        diagnostic.verification = await this.inspectDeletedTasks(workflow, this.completedAfter(state, workflow), false);
+        diagnostic.verifiedAt = Date.now();
+        workflow.error = diagnostic.verification.every(side => ['skipped', 'absent', 'deleted'].includes(side.outcome)) ? '' : '滴答清单中删除失败';
+        await this.saveWorkflow(state, workflow);
+        return this.publicWorkflow(workflow);
       }
       if (workflow.status === 'deleted') throw new CollaborationError('此任务已删除并归档', 409);
       // These append-only communications recheck permissions and current state,
@@ -1343,6 +1371,30 @@ export class CollaborationStore {
       else if ((op.action === "delete" && !current) || (op.action === "complete" && current?.remote?.status === 2)) { await this.finish(state, op); return this.publicOperation(op); }
       op.status = "cancelled"; op.error = ""; await this.checkpoint(state, op); return this.publicOperation(op);
     }, ["operation:" + id, "workflow:" + id]);
+  }
+  resyncOperation(actor: string, command: OperationResyncCommand) {
+    return this.serial(async () => {
+      await this.requireMember(actor);
+      if (!command || !/^[a-f0-9-]{36}$/i.test(command.id) || !/^[a-f0-9-]{36}$/i.test(command.operationId) || !Number.isSafeInteger(command.updatedAt)) throw new CollaborationError('操作编号无效', 400);
+      const state = await this.read(), op = state.operations[command.operationId];
+      if (!op) throw new CollaborationError('操作不存在', 404);
+      const signature = fingerprint({ actor, command }), receipt = op.resyncReceipts?.find(item => item.id === command.id);
+      if (receipt) {
+        if (receipt.signature !== signature) throw new CollaborationError('操作编号已使用');
+        return op.status === 'pending' ? this.run(state, op) : this.publicOperation(op);
+      }
+      if (op.action !== 'update' || op.status !== 'pending' || !op.source?.ownerId || !op.error.includes('任务已被修改')) throw new CollaborationError('此操作无需重新同步');
+      if (op.updatedAt !== command.updatedAt) throw new CollaborationError('操作已更新，请刷新后重试');
+      if (this.taskWorkflow(state, op.source.ownerId, op.source.taskId)) throw new CollaborationError('此任务正在协作，请通过工作流程提交或审批');
+      const remote = await (this.gateway.locate ? this.gateway.locate(op.source.ownerId, op.source.taskId) : this.gateway.get(op.source.ownerId, op.source.taskId));
+      if (!remote || remote.status || (remote.parentId || '') !== (op.updateBaseline?.parentId || '')) throw new CollaborationError('任务已完成、移走或所属关系已改变，请刷新后核对');
+      op.source = { ...op.source, version: remoteVersion(remote) };
+      op.updateBaseline = { fields: taskFields(remote), status: remote.status || 0, parentId: remote.parentId || '' };
+      op.resyncReceipts = [...(op.resyncReceipts || []), { id: command.id, signature }];
+      delete op.syncCheck;
+      await this.checkpoint(state, op);
+      return this.run(state, op, { fields: taskFields(remote), version: remoteVersion(remote), remote });
+    }, ['operation:' + command.operationId]);
   }
   async recover(): Promise<never> {
     throw new CollaborationError("旧转移已停用，请重新认领", 409);

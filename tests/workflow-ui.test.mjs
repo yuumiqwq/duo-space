@@ -55,6 +55,12 @@ test('workflow detail offers settings to every member and direct completion only
   workflow.error = '滴答授权不足或已失效';
   assert.ok(!render('alice', 'working', true).includes('>以网站设置同步</button>'));
   delete workflow.error;
+  workflow.error = '滴答清单中删除失败';
+  assert.ok(render('alice', 'deleted').includes('>重试删除滴答副本</button>'));
+  assert.ok(render('bob', 'deleted').includes('>重试删除滴答副本</button>'));
+  assert.ok(!render('charlie', 'deleted').includes('>重试删除滴答副本</button>'));
+  assert.ok(!render('alice', 'working').includes('>重试删除滴答副本</button>'));
+  delete workflow.error;
   const workflows = [{ ...workflow, id: 'mine', title: '我认领的事项' }, { ...workflow, id: 'theirs', title: '他人认领的事项', claimantId: 'alice', reviewerId: 'bob' }, { ...workflow, id: 'done', title: '归档事项示例', status: 'done' }, { ...workflow, id:'deleted',title:'已删除归档示例',status:'deleted' }];
   const overview = archived => renderToStaticMarkup(overviewComponent({ workflows, archived, setArchived() {}, select() {}, name: id => id }));
   const active = overview(false); assert.ok(active.includes('我认领的事项')); assert.ok(active.includes('他人认领的事项')); assert.ok(!active.includes('归档事项示例')); assert.ok(active.includes('已归档'));

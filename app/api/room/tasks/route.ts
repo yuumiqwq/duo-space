@@ -40,12 +40,12 @@ export async function POST(request: NextRequest) {
     if (command.action === "arrange-execution") return json(await store.arrangeExecution(actor, command));
     after(() => store.deliverNotices().catch(() => undefined));
     if (command.action === "legacy-reset") return json(await store.resetLegacy(actor));
-    if (command.action === "claim" || ["submit", "approve", "reject", "retry-workflow", "resync-settings", "owner-complete", "update-workflow", "restore-workflow", "delete-claimed-task", "delete-owner-task", "nudge", "reply-nudge"].includes(command.action)) {
+    if (command.action === "claim" || ["submit", "approve", "reject", "retry-workflow", "resync-settings", "retry-deletion", "owner-complete", "update-workflow", "restore-workflow", "delete-claimed-task", "delete-owner-task", "nudge", "reply-nudge"].includes(command.action)) {
       const workflow = command.action === "claim" ? await store.claim(actor, command) : await store.workflowCommand(actor, command);
       if (isPersonalCollection(workflow)) return json({ operation: collectionOperation(workflow) }, workflow.error ? 202 : 200);
       return json({ workflow }, !['submit', 'reject', 'nudge', 'reply-nudge'].includes(command.action) && workflow.status !== 'deleted' && (workflow.error || workflow.syncError) ? 202 : 200);
     }
-    const result = command.action === "recover" ? await store.recover() : command.action === "resume" || command.action === "cancel"
+    const result = command.action === 'resync-operation' ? await store.resyncOperation(actor, command) : command.action === "recover" ? await store.recover() : command.action === "resume" || command.action === "cancel"
       ? await store.resume(actor, typeof command.id === "string" ? command.id : "", command.action === "cancel")
       : await store.execute(actor, command);
     return json({ operation: result }, result.status === "pending" ? 202 : 200);

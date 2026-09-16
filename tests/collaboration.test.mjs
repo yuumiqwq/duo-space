@@ -1377,6 +1377,103 @@ test('explicit website resync recovers a legacy conflict, preserves history and 
   }
 });
 
+test('explicit deletion retry only removes remaining copies and preserves archive, original failure and replay receipts', async () => {
+  const f = await fixture(); let w = await claim(f, await f.create('legacy archive'));
+  const remove = f.gateway.remove;
+  f.gateway.remove = async () => { throw new CollaborationError('provider failed', 502, '{"status":500}'); };
+  w = await act(f, w, 'alice', 'delete-owner-task');
+  const file = path.join(f.dir, 'room-collaboration.json'), state = JSON.parse(await readFile(file, 'utf8'));
+  state.workflows[w.id].reviewerTaskId = 'old-publisher-copy';
+  state.workflows[w.id].deletionDiagnostic.verification = [{ side: 'source', owner: 'alice', taskId: 'old-publisher-copy', role: 'legacy-publisher-copy', outcome: 'absent' }];
+  await writeFile(file, JSON.stringify(state)); f.store = new CollaborationStore(f.dir, f.gateway);
+  const history = structuredClone(w.events), removed = [], reads = [];
+  f.gateway.locate = async (owner, id) => { reads.push([owner, id]); return f.gateway.get(owner, id); };
+  f.gateway.remove = async (owner, id, project) => { removed.push([owner, id, project]); return remove(owner, id); };
+  const command = { id: randomUUID(), workflowId: w.id, version: w.version, action: 'retry-deletion' };
+  await assert.rejects(f.store.workflowCommand('offline', command), /只有任务/);
+  await assert.rejects(f.store.workflowCommand('alice', { ...command, version: w.version - 1 }), /流程已更新/);
+  w = await f.store.workflowCommand('alice', command);
+  assert.equal(w.status, 'deleted'); assert.equal(w.error, ''); assert.equal(w.deletionPending, false);
+  assert.deepEqual(removed, [['bob', w.targetId, 'inbox-bob']]); assert.deepEqual(reads, [['bob', w.targetId]]);
+  assert.deepEqual(w.events, history);
+  const report = await f.store.inspectWorkflowSync('alice', w.id);
+  assert.equal(report.deletion.sides[1].outcome, 'delete-failed');
+  assert.equal(report.deletion.retries[0].sides[1].outcome, 'deleted');
+  f.store = new CollaborationStore(f.dir, f.gateway);
+  assert.equal((await f.store.workflowCommand('alice', command)).error, ''); assert.equal(removed.length, 1);
+  await assert.rejects(f.store.workflowCommand('bob', command), /操作编号已使用/);
+  await assert.rejects(act(f, w, 'alice', 'retry-deletion'), /无需重试删除/);
+});
+
+test('deletion recovery retains unknown failures, protects recurring dates and verifies lost responses', async () => {
+  for (const scenario of ['lost', 'missing-route', 'later-occurrence', 'lookup-failed']) {
+    const f = await fixture(); let w = await claim(f, await f.create('remaining deletion'));
+    f.gateway.remove = async () => { throw new Error('initial failure'); };
+    w = await act(f, w, 'alice', 'delete-owner-task'); const history = structuredClone(w.events);
+    if (scenario === 'later-occurrence') {
+      const file = path.join(f.dir, 'room-collaboration.json'), state = JSON.parse(await readFile(file, 'utf8'));
+      state.workflows[w.id].fields.repeatFlag = 'RRULE:FREQ=DAILY';
+      await writeFile(file, JSON.stringify(state)); f.accounts.bob.get(w.targetId).startDate = '2026-10-01T00:00:00Z';
+    }
+    let writes = 0;
+    f.gateway.locate = async (owner, id) => { if (scenario === 'lookup-failed') throw new Error('lookup unavailable'); return f.gateway.get(owner, id); };
+    f.gateway.remove = async (owner, id) => { writes++; if (scenario === 'missing-route') return 'missing'; f.accounts[owner].delete(id); throw new Error('lost delete response'); };
+    const command = { id: randomUUID(), workflowId: w.id, version: w.version, action: 'retry-deletion' };
+    w = await f.store.workflowCommand('bob', command);
+    assert.equal(w.status, 'deleted'); assert.deepEqual(w.events, history);
+    assert.equal(w.error, scenario === 'lost' ? '' : '滴答清单中删除失败');
+    assert.equal(writes, ['lost', 'missing-route'].includes(scenario) ? 1 : 0);
+    const report = await f.store.inspectWorkflowSync('bob', w.id);
+    assert.equal(report.deletion.verification[1].outcome, { lost: 'absent', 'missing-route': 'present', 'later-occurrence': 'later-occurrence', 'lookup-failed': 'lookup-failed' }[scenario]);
+    f.gateway.remove = async () => assert.fail('replaying recovery cannot delete again');
+    f.store = new CollaborationStore(f.dir, f.gateway);
+    await f.store.workflowCommand('bob', command);
+  }
+});
+
+test('ordinary legacy update can explicitly adopt website settings without letting replay overwrite newer changes', async () => {
+  for (const interrupted of [false, true]) {
+    const f = await fixture(), task = await personal(f), update = f.gateway.update;
+    f.gateway.update = async () => { throw new Error('old interrupted update'); };
+    const id = randomUUID(), fields = { startDate: '2026-09-23T16:00:00.000Z', dueDate: '2026-09-30T15:59:00.000Z' };
+    await f.store.execute('bob', { id, action: 'update', source: source(task), fields });
+    const file = path.join(f.dir, 'room-collaboration.json'), state = JSON.parse(await readFile(file, 'utf8'));
+    delete state.operations[id].updateBaseline; await writeFile(file, JSON.stringify(state));
+    Object.assign(f.accounts.alice.get(task.id), { startDate: '2026-09-24T16:00:00.000Z', dueDate: '2026-09-24T16:00:00.000Z' });
+    let op = await f.store.resume('alice', id); assert.match(op.error, /任务已被修改/);
+    const command = { id: randomUUID(), operationId: id, updatedAt: op.updatedAt, action: 'resync-operation' };
+    await assert.rejects(f.store.resyncOperation('outsider', command), /成员/);
+    await assert.rejects(f.store.resyncOperation('alice', { ...command, updatedAt: op.updatedAt - 1 }), /操作已更新/);
+    let writes = 0;
+    f.gateway.update = async (...args) => { writes++; if (interrupted) throw new Error('second interruption'); await update(...args); };
+    op = await f.store.resyncOperation('alice', command); assert.equal(writes, 1);
+    assert.equal(op.status, interrupted ? 'pending' : 'done');
+    if (!interrupted) { assert.equal(f.accounts.alice.get(task.id).startDate, fields.startDate); assert.equal(f.accounts.alice.get(task.id).dueDate, fields.dueDate); }
+    f.accounts.alice.get(task.id).content = 'newer edit after recovery';
+    f.gateway.update = async () => assert.fail('old confirmation cannot rebase after later edits');
+    f.store = new CollaborationStore(f.dir, f.gateway);
+    op = await f.store.resyncOperation('alice', command);
+    assert.equal(f.accounts.alice.get(task.id).content, 'newer edit after recovery');
+    assert.equal(op.status, interrupted ? 'pending' : 'done');
+    await assert.rejects(f.store.resyncOperation('bob', command), /操作编号已使用/);
+  }
+});
+
+test('ordinary resync refuses absent, completed or reparented tasks before recording or sending a write', async () => {
+  for (const scenario of ['absent', 'completed', 'parent']) {
+    const f = await fixture(), task = await personal(f);
+    f.gateway.update = async () => { throw new Error('write interrupted'); };
+    const id = randomUUID(); await f.store.execute('alice', { id, action: 'update', source: source(task), fields: { priority: 5 } });
+    f.accounts.alice.get(task.id).content = 'new external value';
+    const op = await f.store.resume('alice', id);
+    f.gateway.locate = async () => scenario === 'absent' ? null : { ...f.accounts.alice.get(task.id), ...(scenario === 'completed' ? { status: 2 } : { parentId: 'new-parent' }) };
+    f.gateway.update = async () => assert.fail('lifecycle change must not be overwritten');
+    await assert.rejects(f.store.resyncOperation('bob', { id: randomUUID(), operationId: id, updatedAt: op.updatedAt, action: 'resync-operation' }), /任务已完成、移走/);
+    const state = JSON.parse(await readFile(path.join(f.dir, 'room-collaboration.json'), 'utf8'));
+    assert.equal(state.operations[id].resyncReceipts, undefined);
+  }
+});
+
 test('opening the board imports current claimant settings without rewriting pending edits or archived history', async () => {
   const f = await fixture(), task = await f.create('原说明'); let w = await claim(f, task);
   const events = structuredClone(w.events), remote = f.accounts.bob.get(w.targetId);

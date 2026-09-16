@@ -19,6 +19,7 @@ import { insertAttachmentPlaceholders, pastedAttachmentName } from './task-attac
 import { readTaskResponse, taskErrorMessage } from './task-request';
 import { WorkflowAttachments } from './WorkflowAttachments';
 import { WorkflowResyncSettings } from './WorkflowResyncSettings';
+import { WorkflowDeletionRetry } from './WorkflowDeletionRetry';
 
 export const workflowStatus: Record<ClaimWorkflow["status"], string> = { creating: "已认领", working: "已认领", submitted: "待审批", rejected: "已认领", approving: "待审批", done: "已完成", deleted: "已删除" };
 const eventLabels = workflowEventLabels;
@@ -128,6 +129,7 @@ function WorkflowDetail({ workflow, identityId, name, busy, uncertain, error, pe
     {workflow.taskAnomaly && <p className="coop-feedback error" role="alert"><small>该任务已被删除</small></p>}
     {!workflow.taskAnomaly && feedback && (!synchronizing || fileError || workflow.ownerDeletePending || editSyncFailed || workflow.syncIssue) && <p className="coop-feedback error" role="alert"><TaskNoticeDot ids={notices.filter(item => item.kind === 'sync-error' && item.workflowId === workflow.id).map(item => item.id)} onRead={onRead} />{feedback}</p>}
     {(workflow.error || workflow.syncError) && <WorkflowSyncReport workflowId={workflow.id} />}
+    <WorkflowDeletionRetry workflow={workflow} identityId={identityId} disabled={busy || uncertain || uploading} perform={perform} />
     {editSyncFailed && !workflow.taskAnomaly && !workflow.ownerDeletePending && workflow.status !== 'deleted' && <div className="coop-workflow-actions"><button type="button" disabled={disabled} onClick={() => void perform({ id: crypto.randomUUID(), workflowId: workflow.id, version: workflow.version, action: "retry-workflow" })}>重试同步</button></div>}
     {editSyncFailed && workflow.error?.includes('同步期间被修改') && !workflow.ownerDeletePending && !workflow.taskAnomaly && workflow.status !== 'deleted' && <WorkflowResyncSettings workflow={workflow} disabled={disabled} perform={perform} />}
     {replyTo && <div className="coop-workflow-compose"><label htmlFor="workflow-nudge-reply">回复催办</label><textarea id="workflow-nudge-reply" rows={3} maxLength={2000} disabled={disabled} value={comment} onChange={event => setComment(event.target.value)} /><div className="coop-workflow-actions"><button type="button" disabled={disabled} onClick={() => setReplyTo(null)}>取消</button><button type="button" disabled={disabled || !comment.trim()} onClick={() => void act("reply-nudge")}>发送回复</button></div></div>}

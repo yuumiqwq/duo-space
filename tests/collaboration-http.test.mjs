@@ -38,6 +38,15 @@ test('room collaboration HTTP authenticates members, shares the buffer and rejec
     assert.equal(unlinkedDiagnostics.status, 401);
     assert.ok([307, 401].includes((await fetch(`${origin}/api/room/tasks`, { redirect: 'manual' })).status));
     assert.equal((await call('unknown')).status, 401);
+    for (const command of [
+      { id: randomUUID(), workflowId: randomUUID(), version: 1, action: 'retry-deletion' },
+      { id: randomUUID(), operationId: randomUUID(), updatedAt: 1, action: 'resync-operation' },
+    ]) {
+      assert.equal((await call('unknown', command)).status, 401);
+      assert.equal((await call('alice', command, { Origin: 'https://untrusted.example' })).status, 403);
+      const response = await call('alice', command); assert.equal(response.status, 404, 'recovery dispatches to its exact saved record');
+      assert.match((await response.json()).error, /不存在/);
+    }
     assert.ok(JSON.parse(await readFile(legacyFile, 'utf8')).operations.obsolete);
     assert.equal((await fetch(`${origin}/api/room/tasks?revision=1`, { headers: { Cookie: cookie('alice') } })).status, 200);
     let migrated;

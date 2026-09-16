@@ -16,6 +16,7 @@ export type DeletionDiagnostic = {
   at: number; origin: 'delete-request' | 'legacy-unverified'; pending?: boolean;
   sides: DeletionSideEvidence[]; verifiedAt?: number; verification?: DeletionSideEvidence[];
   checks?: number; nextCheckAt?: number;
+  retries?: { id: string; signature: string; at: number; finishedAt?: number; sides?: DeletionSideEvidence[] }[];
 };
 
 // Retain only identifiers and date/priority values needed to diagnose writes.

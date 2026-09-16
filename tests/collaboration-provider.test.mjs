@@ -69,6 +69,38 @@ test('single-date edits preserve the selected field and a partial write cannot c
   });
 });
 
+test('an ignored all-day date gets one equivalent-pair write, without overwriting changed dates or non-date fields', async () => {
+  for (const scenario of ['start', 'due', 'ignore-both', 'changed-date', 'changed-title', 'reminder', 'repeat', 'timed']) await providerFixture(async gateway => {
+    let task = { id: 'date-fallback', projectId: 'saved-list', ...taskFields({ title: 'saved title' }), etag: 'before' };
+    const before = structuredClone(task), writes = [];
+    const desired = taskFields({ ...task, [scenario === 'due' ? 'dueDate' : 'startDate']: '2026-09-12T16:00:00.000Z', priority: 5,
+      ...(scenario === 'reminder' ? { reminders: ['TRIGGER:PT0S'] } : scenario === 'repeat' ? { repeatFlag: 'RRULE:FREQ=DAILY' } : scenario === 'timed' ? { isAllDay: false } : {}) });
+    globalThis.fetch = async (url, init) => {
+      const route = new URL(url).pathname.replace('/open/v1', '');
+      if (route === '/project/saved-list/task/date-fallback') return Response.json(task);
+      if (route === '/task/date-fallback' && init.method === 'POST') {
+        const body = JSON.parse(init.body); writes.push(body);
+        task = { ...body, etag: 'saved' };
+        if (writes.length === 1 || scenario === 'ignore-both') { task.startDate = null; task.dueDate = null; }
+        if (scenario === 'changed-date') task.startDate = '2026-09-24T16:00:00.000Z';
+        if (scenario === 'changed-title') task.title = 'later title';
+        return Response.json(task);
+      }
+      throw new Error('Unexpected request: ' + route);
+    };
+    if (['start', 'due'].includes(scenario)) {
+      const saved = await gateway.update('alice', task.id, desired, remoteVersion(before), task.projectId, before);
+      assert.equal(writes.length, 2); assert.equal(writes[1].startDate, writes[1].dueDate);
+      assert.equal(Date.parse(saved.startDate), Date.parse('2026-09-12T16:00:00.000Z'));
+      assert.equal(desired[scenario === 'due' ? 'startDate' : 'dueDate'], null, 'keep the website single-date choice');
+      assert.equal(writes[1].etag, 'saved', 'retry uses fresh provider metadata');
+    } else {
+      await assert.rejects(gateway.update('alice', task.id, desired, remoteVersion(before), task.projectId, before));
+      assert.equal(writes.length, scenario === 'ignore-both' ? 2 : 1, scenario);
+    }
+  });
+});
+
 test('updating dates uses the clear sentinel and accepts either single-date form returned as a pair', async () => {
   await providerFixture(async gateway => {
     let task = { id: 'clear-date', projectId: 'saved-list', ...taskFields({ title: '日期写入', startDate: '2026-09-01T16:00:00.000Z', dueDate: '2026-09-02T16:00:00.000Z' }) };

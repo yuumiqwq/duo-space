@@ -16,6 +16,7 @@ export type ClaimWorkflow = {
   version: number; createdAt: number; updatedAt: number; error: string; events: WorkflowEvent[];
   settingsVersion?: string;
   editPending?: boolean;
+  deletionPending?: boolean;
   executing?: boolean;
   ownerDeletePending?: boolean;
   taskAnomaly?: boolean;
@@ -24,7 +25,8 @@ export type ClaimWorkflow = {
   reopenPending?: boolean;
   needsSubmission?: boolean;
 };
-export type WorkflowCommand = { id: string; workflowId: string; version: number; settingsVersion?: string; action: "submit" | "approve" | "reject" | "retry-workflow" | "resync-settings" | "owner-complete" | "update-workflow" | "restore-workflow" | "delete-claimed-task" | "delete-owner-task" | "nudge" | "reply-nudge"; comment?: string; replyTo?: string; attachments?: string[]; fields?: Partial<TaskFields> };
+export type WorkflowCommand = { id: string; workflowId: string; version: number; settingsVersion?: string; action: "submit" | "approve" | "reject" | "retry-workflow" | "resync-settings" | "retry-deletion" | "owner-complete" | "update-workflow" | "restore-workflow" | "delete-claimed-task" | "delete-owner-task" | "nudge" | "reply-nudge"; comment?: string; replyTo?: string; attachments?: string[]; fields?: Partial<TaskFields> };
+export type OperationResyncCommand = { id: string; operationId: string; updatedAt: number; action: 'resync-operation' };
 export type ExecutionCommand = { id: string; action: "arrange-execution"; version: number; workflowIds: string[] };
 export type CollaborationSnapshot = { identityId: string; revision: number; remoteVersions?: Record<string, string>; executionVersion?: number; noticeVersion?: number; buffer: RoomTask[]; members: CollaborationMember[]; operations: OperationView[]; workflows: ClaimWorkflow[]; legacyCleanup?: { title: string; message: string }[]; notices?: import("./collaboration-notifications").TaskNotice[] };
 export type TaskSource = { ownerId: string | null; taskId: string; version: string; settingsVersion?: string };
