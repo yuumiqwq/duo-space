@@ -3,8 +3,72 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { CollaborationError, CollaborationStore, fieldDifferences, remoteVersion, sameFields, taskFields } from '../app/api/room/tasks/store.ts';
+import { CollaborationError, CollaborationStore, fieldDifferences, remoteVersion, sameFields, taskFields, taskSettingsVersion } from '../app/api/room/tasks/store.ts';
 import { executionIds, taskboardAttentionCount } from '../app/workflow-execution.ts';
+
+test('a saved browser baseline merges independent edits before the first write and protects stale task context', async () => {
+  for (const publicTask of [false, true]) for (const conflict of [false, true]) {
+    const f = await fixture(), task = publicTask ? await f.create('baseline') : await personal(f);
+    const file = path.join(f.dir, 'room-collaboration.json');
+    if (publicTask) {
+      const state = JSON.parse(await readFile(file, 'utf8'));
+      state.buffer[task.id].fields[conflict ? 'priority' : 'content'] = conflict ? 1 : 'external note'; state.buffer[task.id].version++;
+      await writeFile(file, JSON.stringify(state));
+    } else Object.assign(f.accounts.alice.get(task.id), conflict ? { priority: 1 } : { content: 'external note', etag: 'external' });
+    const command = { id: randomUUID(), action: 'update', source: { ...source(task), settingsVersion: task.settingsVersion || taskSettingsVersion(task) }, baseFields: taskFields(task), fields: { priority: 5 } };
+    if (conflict) await assert.rejects(f.store.execute('alice', command), /被修改/);
+    else {
+      assert.equal((await f.store.execute('alice', command)).status, 'done');
+      const current = publicTask ? JSON.parse(await readFile(file, 'utf8')).buffer[task.id].fields : f.accounts.alice.get(task.id);
+      assert.equal(current.content, 'external note'); assert.equal(current.priority, 5);
+    }
+  }
+});
+
+test('workflow copies keep unrelated Dida edits through an interrupted sync and process restart', async () => {
+  const f = await fixture(), task = await personal(f); let w = await claim(f, task);
+  const update = f.gateway.update; let writes = 0;
+  f.gateway.update = async (...args) => { writes++; if (writes === 2) throw new Error('interrupted target'); await update(...args); };
+  const date = '2026-10-01T00:00:00+0800';
+  f.accounts.bob.get(w.targetId).content = 'external note with link';
+  w = await act(f, w, 'alice', 'update-workflow', { baseFields: w.fields, settingsVersion: w.settingsVersion, fields: { startDate: date } });
+  assert.equal(w.editPending, true); assert.equal(w.events.filter(item => item.type === 'updated').length, 1);
+  f.gateway.update = update; f.store = new CollaborationStore(f.dir, f.gateway);
+  await f.store.maintainWorkflows(true);
+  w = (await f.store.snapshot('alice', null)).workflows.find(item => item.id === w.id);
+  assert.equal(w.error, ''); assert.equal(w.editPending, false);
+  for (const current of [f.accounts.alice.get(task.id), f.accounts.bob.get(w.targetId), w.fields]) {
+    assert.equal(current.content, 'external note with link'); assert.equal(Date.parse(current.startDate), Date.parse(date));
+  }
+  assert.equal(w.events.filter(item => item.type === 'updated').length, 1);
+  assert.ok(!w.events.at(-1).comment.includes('external note'));
+});
+
+test('workflow browser baselines tolerate an independent website edit but reject a lifecycle change', async () => {
+  const f = await fixture(); let w = await claim(f, await f.create('task'));
+  const base = structuredClone(w);
+  w = await act(f, w, 'bob', 'update-workflow', { fields: { content: 'other member note' } });
+  const command = { id: randomUUID(), action: 'update-workflow', workflowId: w.id, version: base.version, settingsVersion: base.settingsVersion, baseFields: base.fields, fields: { priority: 5 } };
+  w = await f.store.workflowCommand('alice', command);
+  assert.equal(w.editPending, false); assert.equal(w.fields.content, 'other member note'); assert.equal(w.fields.priority, 5);
+  w = await act(f, w, 'alice', 'owner-complete');
+  await assert.rejects(f.store.workflowCommand('alice', { ...command, id: randomUUID() }), /流程已更新/);
+});
+
+test('ordinary background recovery retains unrelated changes and emits only one incident without workflow history', async () => {
+  const f = await fixture(), task = await personal(f), id = randomUUID(), sent = [];
+  const update = f.gateway.update; f.gateway.notify = async notice => sent.push(notice);
+  f.gateway.update = async () => { throw new Error('temporary failure'); };
+  await f.store.execute('alice', { id, action: 'update', source: source(task), fields: { priority: 5 } });
+  await f.store.deliverNotices(); await f.store.resume('alice', id); await f.store.deliverNotices();
+  assert.equal(sent.filter(item => item.operationId === id).length, 1);
+  f.accounts.alice.get(task.id).content = 'keep new note'; f.gateway.update = update;
+  f.store = new CollaborationStore(f.dir, f.gateway); await f.store.maintainWorkflows(true);
+  const snapshot = await f.store.snapshot('alice', null);
+  assert.equal(snapshot.operations.find(item => item.id === id).status, 'done');
+  assert.equal(f.accounts.alice.get(task.id).content, 'keep new note'); assert.equal(f.accounts.alice.get(task.id).priority, 5);
+  assert.deepEqual(snapshot.workflows, []); assert.ok(!snapshot.notices.some(item => item.operationId === id));
+});
 
 async function fixture() {
   await mkdir('codex-generated/test-data', { recursive: true });
@@ -165,7 +229,11 @@ test('lightweight revisions expose current execution attention without reading D
   assert.equal(taskboardAttentionCount(view.attentionWorkflows, view.notices), 1);
   assert.equal(taskboardAttentionCount((await f.store.revision('alice')).attentionWorkflows, (await f.store.revision('alice')).notices), 0, 'publisher receives no new-public reminder');
   let w = await claim(f, task);
-  assert.deepEqual((await f.store.revision('bob')).attentionWorkflows, []);
+  assert.equal((await f.store.revision('bob')).attentionWorkflows[0].claimantId, 'bob');
+  await f.store.markNoticesRead('bob', (await f.store.revision('bob')).notices.map(notice => notice.id));
+  w = await act(f, w, 'alice', 'update-workflow', { fields: { content: 'new requirement before execution' } });
+  view = await f.store.revision('bob');
+  assert.equal(taskboardAttentionCount(view.attentionWorkflows, view.notices, 'bob'), 1, 'claimant sees edits before arranging execution');
   const arranged = await arrange(f, 'bob', [w.id]); w = arranged.workflows.find(item => item.id === w.id);
   w = await act(f, w, 'alice', 'update-workflow', { fields: { priority: 5 } });
   view = await f.store.revision('bob');
@@ -177,14 +245,16 @@ test('lightweight revisions expose current execution attention without reading D
   for (const actor of ['alice', 'bob']) {
     view = await f.store.revision(actor);
     assert.equal(taskboardAttentionCount(view.attentionWorkflows, view.notices), 1, 'both members see the pending review');
-    assert.deepEqual(Object.keys(view.attentionWorkflows[0]).sort(), ['executing', 'id', 'ownerDeletePending', 'source', 'status']);
+    assert.deepEqual(Object.keys(view.attentionWorkflows[0]).sort(), ['claimantId', 'executing', 'id', 'ownerDeletePending', 'source', 'status']);
     await f.store.markNoticesRead(actor, view.notices.map(notice => notice.id));
     view = await f.store.revision(actor); assert.equal(taskboardAttentionCount(view.attentionWorkflows, view.notices), 1);
   }
   w = await act(f, w, 'alice', 'reject', { comment: 'needs revision' });
   view = await f.store.revision('bob'); assert.equal(taskboardAttentionCount(view.attentionWorkflows, view.notices), 0);
   await arrange(f, 'bob', []);
-  assert.deepEqual((await f.store.revision('bob')).attentionWorkflows, []);
+  view = await f.store.revision('bob');
+  assert.equal(view.attentionWorkflows[0].executing, false);
+  assert.equal(taskboardAttentionCount(view.attentionWorkflows, view.notices, 'bob'), 0);
 });
 
 test('claiming allocates a copy without execution; only the claimant can atomically arrange up to three tasks', async () => {
@@ -1161,7 +1231,7 @@ test('details can be saved while creation is uncertain and retried by any member
   assert.equal(w.status, 'working'); assert.equal(w.editPending, false); assert.equal(f.counts.creates, 1); assert.equal(f.accounts.bob.get(w.targetId).content, '新的说明');
 });
 
-test('retrying a failed detail sync resumes the original event and preserves external conflicts', async () => {
+test('retrying a failed detail sync resumes the original event and preserves an independent external edit', async () => {
   const f = await fixture(), task = await f.create('public'); let w = await claim(f, task);
   const update = f.gateway.update;
   f.gateway.update = async () => { throw new Error('write unavailable'); };
@@ -1175,12 +1245,10 @@ test('retrying a failed detail sync resumes the original event and preserves ext
   f.accounts.bob.get(w.targetId).content = 'other member changed the content';
   f.gateway.update = update;
   w = await act(f, w, 'alice', 'retry-workflow');
-  assert.match(w.error, /同步期间被修改/);
+  assert.equal(w.error, ''); assert.equal(w.editPending, false);
   assert.deepEqual(w.events, history);
   assert.equal(f.accounts.bob.get(w.targetId).content, 'other member changed the content');
-  assert.equal(f.accounts.bob.get(w.targetId).priority, task.priority);
-  f.accounts.bob.get(w.targetId).content = task.content;
-  w = await act(f, w, 'offline', 'retry-workflow');
+  assert.equal(w.fields.content, 'other member changed the content');
   assert.equal(w.error, ''); assert.equal(w.editPending, false);
   assert.equal(w.events.length, history.length);
   assert.equal(w.events.at(-1).id, history.at(-1).id);
@@ -1450,6 +1518,7 @@ test('ordinary legacy update can explicitly adopt website settings without letti
     assert.equal(op.status, interrupted ? 'pending' : 'done');
     if (!interrupted) { assert.equal(f.accounts.alice.get(task.id).startDate, fields.startDate); assert.equal(f.accounts.alice.get(task.id).dueDate, fields.dueDate); }
     f.accounts.alice.get(task.id).content = 'newer edit after recovery';
+    f.accounts.alice.get(task.id).startDate = '2026-09-25T16:00:00.000Z';
     f.gateway.update = async () => assert.fail('old confirmation cannot rebase after later edits');
     f.store = new CollaborationStore(f.dir, f.gateway);
     op = await f.store.resyncOperation('alice', command);
@@ -1465,6 +1534,7 @@ test('ordinary resync refuses absent, completed or reparented tasks before recor
     f.gateway.update = async () => { throw new Error('write interrupted'); };
     const id = randomUUID(); await f.store.execute('alice', { id, action: 'update', source: source(task), fields: { priority: 5 } });
     f.accounts.alice.get(task.id).content = 'new external value';
+    f.accounts.alice.get(task.id).priority = 1;
     const op = await f.store.resume('alice', id);
     f.gateway.locate = async () => scenario === 'absent' ? null : { ...f.accounts.alice.get(task.id), ...(scenario === 'completed' ? { status: 2 } : { parentId: 'new-parent' }) };
     f.gateway.update = async () => assert.fail('lifecycle change must not be overwritten');
@@ -1653,7 +1723,7 @@ test('pending ordinary updates reconcile a selected all-day date without overwri
     f.store = new CollaborationStore(f.dir, f.gateway);
     await f.store.reconcilePendingUpdates();
     const report = await f.store.inspectOperationSync('alice', id);
-    assert.equal(report.status, scenario === 'match' ? 'done' : 'pending');
+    assert.equal(report.status, ['match', 'different'].includes(scenario) ? 'done' : 'pending');
     assert.equal(report.requested.startDate, date); assert.equal(report.requested.dueDate, date);
     assert.equal(report.verification.outcome, { match: 'matched', different: 'different', deleted: 'missing', completed: 'different', 'lookup-error': 'error' }[scenario]);
     assert.ok(!JSON.stringify(report).includes('private external edit'));

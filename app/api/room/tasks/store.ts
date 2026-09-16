@@ -11,6 +11,7 @@ import type { ClaimWorkflow, WorkflowCommand, WorkflowFile, CollaborationCommand
 import { EXECUTION_LIMIT, executionEligible, executionReserved, isExecuting } from '../../../workflow-execution.ts';
 import { descriptionAttachments } from "../../../task-description-attachments.ts";
 import { allDaySelection } from '../../../task-date-input.ts';
+import { comparableSettings, mergeTaskSettings, type SettingsIntent } from '../../../task-settings-merge.ts';
 
 export type RemoteTask = Partial<TaskFields> & { id: string; projectId: string; status?: number; parentId?: string; [key: string]: unknown };
 export type Gateway = {
@@ -33,7 +34,7 @@ type BufferTask = { fields: TaskFields; version: number; stagedBy?: string; publ
 type Creation = { state: "new" | "sent" | "received"; beforeIds?: string[] };
 type AttachmentChange = { actor: string; before: string; after: string; publishBefore?: string };
 type SettingsBaseline = { fields: TaskFields; status: number; parentId: string };
-type WorkflowEdit = { id: string; fields: TaskFields; attachments?: AttachmentChange; summary?: string; diagnostics?: SyncAttempt[]; targets?: { owner: string; id: string; before: string; baseline?: SettingsBaseline; done: boolean }[] };
+type WorkflowEdit = { id: string; fields: TaskFields; intent?: SettingsIntent; rebaseTargets?: boolean; attachments?: AttachmentChange; summary?: string; diagnostics?: SyncAttempt[]; targets?: { owner: string; id: string; before: string; baseline?: SettingsBaseline; intent?: SettingsIntent; done: boolean }[] };
 type WorkflowSide = "source" | "target";
 type WorkflowDeletion = { id: string; done?: WorkflowSide[]; acknowledged?: Partial<Record<WorkflowSide, { id: string; projectId: string }>> };
 type ReviewDecision = { comment: string; files: WorkflowFile[] };
@@ -42,6 +43,8 @@ type Workflow = ClaimWorkflow & { settingsResyncReceipts?: { id: string; signatu
 type Operation = OperationView & {
   signature: string; source?: TaskSource; fields: TaskFields; targetId: string;
   updateBaseline?: SettingsBaseline;
+  updateIntent?: SettingsIntent;
+  syncIssue?: ClaimWorkflow['syncIssue'];
   resyncReceipts?: { id: string; signature: string }[];
   syncCheck?: { at: number; current?: ReturnType<typeof taskSyncEvidence>; observedVersion?: string; differences?: string[]; outcome: 'matched' | 'different' | 'missing' | 'error'; error?: string; retry?: { at: number; status: OperationView['status']; error: string } };
   attachments?: AttachmentChange;
@@ -112,18 +115,7 @@ function canonical(value: unknown): unknown {
 export const fingerprint = (value: unknown) => createHash("sha256").update(JSON.stringify(canonical(value))).digest("hex");
 export const remoteVersion = (task: RemoteTask) => fingerprint({ fields: taskFields(task), status: task.status || 0, parentId: task.parentId || "", desc: task.desc || "", etag: task.etag || "" });
 function comparableFields(task: Partial<TaskFields>) {
-  const fields = taskFields(task);
-  // Dida can reorder tags/reminders and choose a default repeat origin even
-  // when repetition is disabled. These do not change the user's task.
-  // A single all-day date can also be returned as start=end. Limit that
-  // equivalence to tasks without recurrence or deadline-based reminders.
-  const singleDate = fields.isAllDay && !fields.repeatFlag && !fields.reminders.length;
-  const startDate = singleDate ? fields.startDate ?? fields.dueDate : fields.startDate;
-  const dueDate = singleDate ? fields.dueDate ?? fields.startDate : fields.dueDate;
-  // Copied checklist items receive new provider IDs. Compare their content in
-  // order, retaining all other fields; remoteVersion still includes raw IDs.
-  const items = fields.items.map(item => Object.fromEntries(Object.entries(item).filter(([key]) => key !== 'id')));
-  return { ...fields, startDate, dueDate, items, tags: [...new Set(fields.tags)].sort(), reminders: [...new Set(fields.reminders)].sort(), repeatFrom: fields.repeatFlag ? fields.repeatFrom : '' };
+  return comparableSettings(taskFields(task));
 }
 export const sameFields = (a: Partial<TaskFields>, b: Partial<TaskFields>) => fingerprint(comparableFields(a)) === fingerprint(comparableFields(b));
 export const taskSettingsVersion = (task: RemoteTask) => fingerprint({ fields: comparableFields(task), status: task.status || 0, parentId: task.parentId || '' });
@@ -170,6 +162,19 @@ function editedTaskFields(previous: TaskFields, patch: Partial<TaskFields>) {
   const fields = { ...previous, ...patch };
   return ['startDate', 'dueDate', 'isAllDay'].some(key => Object.hasOwn(patch, key)) ? allDaySelection(fields) : fields;
 }
+function editBase(input: TaskFields | undefined): TaskFields | undefined {
+  if (input === undefined) return undefined;
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new CollaborationError('任务内容无效', 400);
+  const { desc, kind, items, repeatFrom, ...rest } = input;
+  if (typeof desc !== 'string' || typeof kind !== 'string' || typeof repeatFrom !== 'string' || !Array.isArray(items) || items.some(item => !item || typeof item !== 'object' || Array.isArray(item))) throw new CollaborationError('任务内容无效', 400);
+  const editable = Object.fromEntries(Object.keys(fieldLabels).filter(key => !['desc', 'kind', 'items', 'repeatFrom'].includes(key)).map(key => [key, rest[key as keyof typeof rest]]));
+  return taskFields({ ...validateFields(editable), desc, kind, items, repeatFrom });
+}
+function mergedSettings(intent: SettingsIntent, current: TaskFields, message = '关联任务在同步期间被修改，已暂停覆盖，请核对后重试') {
+  const merged = mergeTaskSettings(intent.base, intent.desired, current);
+  if (merged.conflicts.length) throw new CollaborationError(message);
+  return merged.fields;
+}
 
 export class CollaborationStore {
   private queues = new Map<string, Promise<unknown>>();
@@ -177,6 +182,7 @@ export class CollaborationStore {
   private baselines = new WeakMap<State, State>();
   private maintenance?: Promise<void>;
   private maintenanceAfter = 0;
+  private pendingMaintenanceAfter = 0;
   private file: string;
   private gateway: Gateway;
   constructor(directory: string, gateway: Gateway) { this.file = path.join(directory, "room-collaboration.json"); this.gateway = gateway; }
@@ -228,6 +234,15 @@ export class CollaborationStore {
           const notices = initializeTaskNotices(merged); notices.version = (notices.version || 0) + 1;
         }
       }
+      for (const op of Object.values(merged.operations)) {
+        if (op.action === 'update' && op.status === 'pending' && op.error) {
+          op.syncIssue ||= { id: randomUUID(), at: Date.now(), message: op.error, recipientId: op.actorId };
+          op.syncIssue.message = op.error;
+        } else if (op.syncIssue) {
+          delete op.syncIssue;
+          const notices = initializeTaskNotices(merged); notices.version = (notices.version || 0) + 1;
+        }
+      }
       collectTaskNotices(merged);
       await mkdir(path.dirname(this.file), { recursive: true, mode: 0o700 });
       const temp = this.file + '.' + randomUUID() + '.tmp';
@@ -243,6 +258,10 @@ export class CollaborationStore {
       for (const [id, workflow] of Object.entries(state.workflows)) {
         if (merged.workflows[id]?.syncIssue) workflow.syncIssue = structuredClone(merged.workflows[id].syncIssue);
         else delete workflow.syncIssue;
+      }
+      for (const [id, op] of Object.entries(state.operations)) {
+        if (merged.operations[id]?.syncIssue) op.syncIssue = structuredClone(merged.operations[id].syncIssue);
+        else delete op.syncIssue;
       }
       this.baselines.set(state, structuredClone(state));
     });
@@ -306,7 +325,7 @@ export class CollaborationStore {
     // Reuse the existing revision request for the idle classroom board. This
     // reads website task records only; it never fetches a member's TickTick inbox.
     const bufferPreview = bufferIds.slice(0, 6).map(id => ({ id, title: state.buffer[id].fields.title }));
-    const attentionWorkflows = Object.values(state.workflows).filter(workflow => !isPersonalCollection(workflow) && (isExecuting(workflow) || executionReserved(workflow))).map(({ id, source, status, executing, ownerDeletePending }) => ({ id, source, status, executing, ownerDeletePending }));
+    const attentionWorkflows = Object.values(state.workflows).filter(workflow => !isPersonalCollection(workflow) && !['done', 'deleted'].includes(workflow.status)).map(({ id, source, claimantId, status, executing, ownerDeletePending }) => ({ id, source, claimantId, status, executing, ownerDeletePending }));
     return { revision: state.revision, remoteVersions: this.remoteVersions(state), bufferCount: bufferIds.length, bufferIds, bufferPreview, attentionWorkflows, ...(actor ? { notices: unreadTaskNotices(state, actor), noticeVersion: state.notifications?.version || 0 } : {}) };
   }
   async recoverPendingWorkflows() {
@@ -338,21 +357,21 @@ export class CollaborationStore {
           if (!workflow.ownerDeletion && !workflow.completionRequest && !workflow.edit && !['creating', 'approving'].includes(workflow.status) && !workflow.reopenReceipt && !workflow.sourceReopenReceipt) {
             delete workflow.syncAttempts; delete workflow.syncRetryAt; await this.write(state);
           }
-        } catch { /* A later authenticated poll retries using the persisted schedule. */ }
+        } catch { /* The scheduler or a later request uses the persisted retry schedule. */ }
     }, ['workflow:' + candidate.id]);
   }
-  maintainWorkflows() {
+  maintainWorkflows(pendingOnly = false) {
     if (this.maintenance) return this.maintenance;
-    if (Date.now() < this.maintenanceAfter) return Promise.resolve();
+    if (Date.now() < (pendingOnly ? this.pendingMaintenanceAfter : this.maintenanceAfter)) return Promise.resolve();
     const work = (async () => {
       // Already accepted user actions must not sit behind unrelated slow checks.
-      await this.recoverPendingWorkflows();
-      await this.reconcilePendingUpdates();
-      await this.checkDeletedWorkflows();
-      await this.checkWorkflows();
-      await this.deliverNotices();
+      const stages = [() => this.recoverPendingWorkflows(), () => this.reconcilePendingUpdates(),
+        ...(!pendingOnly ? [() => this.checkDeletedWorkflows(), () => this.checkWorkflows()] : []), () => this.deliverNotices()];
+      for (const stage of stages) {
+        try { await stage(); } catch { console.error('task-maintenance: stage failed'); }
+      }
     })();
-    this.maintenance = work.finally(() => { this.maintenance = undefined; this.maintenanceAfter = Date.now() + 15000; });
+    this.maintenance = work.finally(() => { this.maintenance = undefined; this.pendingMaintenanceAfter = Date.now() + 15000; if (!pendingOnly) this.maintenanceAfter = this.pendingMaintenanceAfter; });
     return this.maintenance;
   }
   async checkWorkflows() {
@@ -420,7 +439,7 @@ export class CollaborationStore {
         const matched = sameContext && sameFields(source.fields, op.fields);
         op.syncCheck = { at: Date.now(), outcome: matched ? 'matched' : source ? 'different' : 'missing', ...(source ? { current: taskSyncEvidence(source.remote || source.fields), observedVersion: source.version, differences: fieldDifferences(source.fields, op.fields) } : {}) };
         if (matched) await this.finish(current, op);
-        else if (source?.remote && canResumeSettings(source.remote, op.fields, op.updateBaseline)) {
+        else if (source?.remote && sameContext && (op.updateIntent && op.updateBaseline ? !mergeTaskSettings(op.updateIntent.base, op.updateIntent.desired, source.fields).conflicts.length : canResumeSettings(source.remote, op.fields, op.updateBaseline))) {
           // Persist the cooldown before network I/O, including failed retries.
           await this.checkpoint(current, op);
           const at = Date.now();
@@ -511,7 +530,7 @@ export class CollaborationStore {
       identityId, revision: state.revision, remoteVersions: this.remoteVersions(state), executionVersion: state.executionPlans?.[identityId]?.version || 0,
       notices: unreadTaskNotices(state, identityId),
       noticeVersion: state.notifications?.version || 0,
-      buffer: Object.entries(state.buffer).filter(([, task]) => !task.completedAt).map(([id, task]) => lock({ ...task.fields, id, ownerId: null, version: String(task.version), publisherId: task.publisherId })),
+      buffer: Object.entries(state.buffer).filter(([, task]) => !task.completedAt).map(([id, task]) => lock({ ...task.fields, id, ownerId: null, version: String(task.version), settingsVersion: taskSettingsVersion({ ...task.fields, id, projectId: '' }), publisherId: task.publisherId })),
       members: results.map(member => ({ ...member, tasks: (inboxes.get(member.id) || []).filter(task => !task.status).map(task => lock({ ...taskFields(task), id: task.id, ownerId: member.id, version: remoteVersion(task), settingsVersion: taskSettingsVersion(task), transferBlocked: member.tasks.find(item => item.id === task.id)?.transferBlocked })) })),
       operations: [...Object.values(state.operations).map(op => this.publicOperation(op)), ...Object.values(state.workflows).filter(isPersonalCollection).map(workflow => collectionOperation(this.publicWorkflow(workflow)))].sort((a, b) => b.updatedAt - a.updatedAt).filter((op, index) => op.status === "pending" || index < 30),
       workflows: Object.values(state.workflows).filter(workflow => !isPersonalCollection(workflow)).sort((a, b) => b.updatedAt - a.updatedAt).map(workflow => this.publicWorkflow(workflow)),
@@ -889,6 +908,47 @@ export class CollaborationStore {
     } catch (error) { workflow.error = error instanceof Error ? error.message : "完成状态尚未同步，请重试"; }
     await this.saveWorkflow(state, workflow); return this.publicWorkflow(workflow);
   }
+  private async syncWorkflowIntent(state: State, workflow: Workflow, attempt: SyncAttempt) {
+    const edit = workflow.edit!, intent = edit.intent!;
+    const tasks: Partial<Record<WorkflowSide, RemoteTask | null>> = {};
+    let desired = intent.desired;
+    // Reconcile all copies before writing any, so an unrelated edit on either
+    // side is retained and competing edits to the same setting are not guessed.
+    for (const target of edit.targets!) {
+      const side = target.owner === workflow.claimantId && target.id === workflow.targetId ? 'target' : 'source';
+      const task = tasks[side] = await this.linkedTask(state, workflow, side);
+      if (!task && side === 'source' && !workflow.source.ownerId) continue;
+      if (!task) throw new CollaborationError('该任务已被删除');
+      if (!target.baseline || (task.status || 0) !== target.baseline.status || (task.parentId || '') !== target.baseline.parentId) throw new CollaborationError('关联任务在同步期间被修改，已暂停覆盖，请核对后重试');
+      attempt.stage = 'compare-version';
+      attempt.target = { owner: target.owner, id: target.id, expectedVersion: target.before, observedVersion: remoteVersion(task), differences: fieldDifferences(task, desired), current: taskSyncEvidence(task) };
+      const candidate = mergedSettings(target.intent || intent, taskFields(task));
+      desired = mergedSettings({ base: intent.base, desired }, candidate);
+    }
+    edit.fields = desired;
+    if (edit.attachments) edit.attachments.after = desired.content;
+    await this.saveWorkflow(state, workflow);
+    for (const target of edit.targets!) {
+      const side = target.owner === workflow.claimantId && target.id === workflow.targetId ? 'target' : 'source';
+      const task = tasks[side];
+      if (!task) continue;
+      if (!sameFields(task, desired)) {
+        attempt.stage = 'write-linked-task'; target.before = remoteVersion(task);
+        await this.saveWorkflow(state, workflow);
+        tasks[side] = await this.gateway.update(target.owner, target.id, desired, target.before, workflow.projects?.[side], task) || await this.linkedTask(state, workflow, side);
+      }
+      target.done = true;
+      await this.saveWorkflow(state, workflow);
+    }
+    const target = tasks.target || await this.linkedTask(state, workflow, 'target');
+    if (!target) throw new CollaborationError('该任务已被删除');
+    // The provider can retain a concurrent change to an untouched field during
+    // its bounded retry. A following pass propagates it to other linked copies.
+    edit.fields = taskFields(target);
+    if (mergeTaskSettings(intent.base, intent.desired, edit.fields).conflicts.length || !sameFields(mergedSettings(intent, edit.fields), edit.fields)) throw new CollaborationError('关联任务详情暂未一致，请核对后重试');
+    if (edit.attachments) edit.attachments.after = edit.fields.content;
+    return { ...tasks, target };
+  }
   private async finishWorkflowEdit(state: State, workflow: Workflow, completing = false) {
     const edit = workflow.edit!;
     const attempt: SyncAttempt = { id: randomUUID(), editId: edit.id, at: Date.now(), stage: 'publish-attachments', requested: taskSyncEvidence(edit.fields) };
@@ -908,13 +968,15 @@ export class CollaborationStore {
       if (!edit.targets) {
         const sides = await this.workflowSides(state, workflow);
         Object.assign(confirmed, sides);
-        const target = (owner: string, task: RemoteTask) => ({ owner, id: task.id, before: remoteVersion(task), baseline: { fields: taskFields(task), status: task.status || 0, parentId: task.parentId || '' }, done: false });
+        const target = (owner: string, task: RemoteTask) => ({ owner, id: task.id, before: remoteVersion(task), baseline: { fields: taskFields(task), status: task.status || 0, parentId: task.parentId || '' },
+          ...(edit.rebaseTargets && edit.intent ? { intent: { base: taskFields(task), desired: mergeTaskSettings(edit.intent.base, edit.intent.desired, taskFields(task)).fields } } : {}), done: false });
         edit.targets = sides.source ? [target(workflow.reviewerId, sides.source)] : [];
         if (workflow.claimantId !== workflow.reviewerId || workflow.targetId !== edit.targets[0]?.id) edit.targets.push(target(workflow.claimantId, sides.target));
         await this.saveWorkflow(state, workflow);
       }
       let wrote = false;
-      for (const target of edit.targets) {
+      if (edit.intent) Object.assign(confirmed, await this.syncWorkflowIntent(state, workflow, attempt));
+      else for (const target of edit.targets) {
         if (target.done) continue;
         const side = target.owner === workflow.reviewerId ? "source" : "target";
         const task = !wrote && confirmed[side] || await this.linkedTask(state, workflow, side);
@@ -1154,7 +1216,10 @@ export class CollaborationStore {
         workflow.events.push({ id: command.id, signature, actorId: actor, type: command.action, at: Date.now(), comment: reply ? comment : comment || "请查看任务进展，有空回复一下", files: [], ...(reply ? { replyTo: command.replyTo } : {}) });
         await this.saveWorkflow(state, workflow); return this.publicWorkflow(workflow);
       }
-      if (workflow.version !== command.version && !(command.action === 'update-workflow' && command.settingsVersion && command.settingsVersion === this.publicWorkflow(workflow).settingsVersion)) throw new CollaborationError("流程已更新，请刷新后操作");
+      const base = command.action === 'update-workflow' ? editBase(command.baseFields) : undefined;
+      const canMerge = !!base && command.settingsVersion === fingerprint({ fields: comparableFields(base), status: workflow.status });
+      if (base && !canMerge) throw new CollaborationError('流程已更新，请刷新后操作');
+      if (workflow.version !== command.version && !(command.action === 'update-workflow' && (canMerge || (command.settingsVersion && command.settingsVersion === this.publicWorkflow(workflow).settingsVersion)))) throw new CollaborationError("流程已更新，请刷新后操作");
       if (["delete-owner-task", "delete-claimed-task"].includes(command.action) || (command.action === "retry-workflow" && workflow.ownerDeletion)) {
         const permitted = command.action === 'delete-owner-task' ? actor === workflow.reviewerId : command.action === 'delete-claimed-task' ? actor === workflow.claimantId : [workflow.reviewerId, workflow.claimantId].includes(actor);
         if (!permitted) throw new CollaborationError("只有任务发起者或认领者能删除对应任务", 403);
@@ -1181,16 +1246,18 @@ export class CollaborationStore {
         if (workflow.taskAnomaly || !workflow.edit?.targets || !workflow.error?.includes('同步期间被修改')) throw new CollaborationError('此流程无需重新同步');
         workflow.settingsResyncReceipts = [...(workflow.settingsResyncReceipts || []), { id: command.id, signature, editId: workflow.edit.id }].slice(-20);
         delete workflow.edit.targets;
+        delete workflow.edit.intent;
         workflow.error = '';
         await this.saveWorkflow(state, workflow);
         return this.finishWorkflowEdit(state, workflow);
       }
       if (command.action === "update-workflow") {
         const previousFields = workflow.edit?.fields || workflow.fields;
-        const fields = editedTaskFields(previousFields, validateFields(command.fields));
+        const fields = base ? mergedSettings({ base, desired: editedTaskFields(base, validateFields(command.fields)) }, previousFields) : editedTaskFields(previousFields, validateFields(command.fields));
         if (fields.startDate && fields.dueDate && Date.parse(fields.startDate) > Date.parse(fields.dueDate)) throw new CollaborationError("截止时间不能早于开始时间", 400);
         const before = [workflow.fields.content, workflow.edit?.attachments?.before || '', workflow.edit?.fields.content || ''].join('\n');
-        workflow.edit = { id: command.id, fields, attachments: { actor, before, publishBefore: workflow.fields.content, after: fields.content }, summary: workflowSettingChanges(previousFields, fields), diagnostics: workflow.edit?.diagnostics };
+        const intent = { base: workflow.edit?.intent?.base || workflow.fields, desired: fields };
+        workflow.edit = { id: command.id, fields, intent, rebaseTargets: !!workflow.edit && workflow.error.includes('同步期间被修改'), attachments: { actor, before, publishBefore: workflow.fields.content, after: fields.content }, summary: workflowSettingChanges(previousFields, fields), diagnostics: workflow.edit?.diagnostics };
         workflow.events.push({ id: command.id, signature, actorId: actor, type: "updated", at: Date.now(), comment: workflow.edit.summary!, files: [] });
         workflow.error = "";
         await this.saveWorkflow(state, workflow);
@@ -1336,16 +1403,23 @@ export class CollaborationStore {
           if (Object.values(state.operations).some(item => item.status === "pending" && ((item.source?.ownerId === source!.ownerId && item.source.taskId === source!.taskId) || (item.to === source!.ownerId && item.targetId === source!.taskId)))) throw new CollaborationError("任务正在处理中，请先完成或取消之前的操作");
           const current = initialSource = await this.source(state, source);
           if (!current || current.remote?.status) throw new CollaborationError("任务已完成或已移走，请刷新");
-          if (current.version !== source.version && !(command.action === 'update' && current.remote && source.settingsVersion && source.settingsVersion === taskSettingsVersion(current.remote))) throw new CollaborationError("任务已被修改，请刷新后重新操作");
+          const base = command.action === 'update' ? editBase(command.baseFields) : undefined;
+          const context = current.remote || { id: source.taskId, projectId: '', ...current.fields };
+          const canMerge = !!base && source.settingsVersion === taskSettingsVersion({ ...context, ...base });
+          if (base && !canMerge) throw new CollaborationError('任务已被修改，请刷新后重新操作');
+          if (current.version !== source.version && !(command.action === 'update' && (canMerge || (source.settingsVersion && source.settingsVersion === taskSettingsVersion(context))))) throw new CollaborationError("任务已被修改，请刷新后重新操作");
           fields = current.fields;
           beforeContent = fields.content;
-          if (command.action === "update") fields = await this.fieldsAfterTask(state, editedTaskFields(fields, validateFields(command.fields)), command.dateAfter, source.ownerId, source);
+          if (command.action === "update") fields = await this.fieldsAfterTask(state, base ? mergedSettings({ base, desired: editedTaskFields(base, validateFields(command.fields)) }, fields) : editedTaskFields(fields, validateFields(command.fields)), command.dateAfter, source.ownerId, source);
 
         }
         if (fields.startDate && fields.dueDate && Date.parse(fields.startDate) > Date.parse(fields.dueDate)) throw new CollaborationError("截止时间不能早于开始时间", 400);
         op = { id: command.id, signature, actorId, action: command.action, title: fields.title, from: source?.ownerId ?? null, to: null, source, fields, targetId: randomUUID(), creation: { state: "new" }, status: "pending", phase: "prepared", error: "", createdAt: Date.now(), updatedAt: Date.now() };
         if (command.action === 'update' && source && initialSource) op.source = { ...source, version: initialSource.version };
-        if (command.action === 'update' && initialSource?.remote) op.updateBaseline = { fields: initialSource.fields, status: initialSource.remote.status || 0, parentId: initialSource.remote.parentId || '' };
+        if (command.action === 'update' && initialSource?.remote) {
+          op.updateBaseline = { fields: initialSource.fields, status: initialSource.remote.status || 0, parentId: initialSource.remote.parentId || '' };
+          op.updateIntent = { base: initialSource.fields, desired: fields };
+        }
         if (['create', 'update'].includes(command.action)) op.attachments = { actor: actorId, before: beforeContent, after: fields.content };
         state.operations[op.id] = op; await this.checkpoint(state, op);
       }
@@ -1395,6 +1469,7 @@ export class CollaborationStore {
       if (!remote || remote.status || (remote.parentId || '') !== (op.updateBaseline?.parentId || '')) throw new CollaborationError('任务已完成、移走或所属关系已改变，请刷新后核对');
       op.source = { ...op.source, version: remoteVersion(remote) };
       op.updateBaseline = { fields: taskFields(remote), status: remote.status || 0, parentId: remote.parentId || '' };
+      op.updateIntent = { base: taskFields(remote), desired: op.fields };
       op.resyncReceipts = [...(op.resyncReceipts || []), { id: command.id, signature }];
       delete op.syncCheck;
       await this.checkpoint(state, op);
@@ -1419,10 +1494,18 @@ export class CollaborationStore {
         if (op.action === "delete" && !source) { await this.finish(state, op); return this.publicOperation(op); }
         if (!source) throw new CollaborationError("任务已移走，请取消此次操作并刷新");
         if (op.action === 'update' && (source.remote?.status || (op.updateBaseline && (source.remote?.parentId || '') !== op.updateBaseline.parentId))) throw new CollaborationError("任务已被修改，请取消此次操作并刷新");
+        if (op.action === 'update' && op.updateIntent && op.updateBaseline) {
+          op.fields = mergedSettings(op.updateIntent, source.fields, '任务已被修改，请取消此次操作并刷新');
+          if (op.attachments) op.attachments.after = op.fields.content;
+          await this.checkpoint(state, op);
+        }
         if ((op.action === "update" && sameFields(source.fields, op.fields)) || (op.action === "complete" && source.remote?.status === 2)) { await this.finish(state, op); return this.publicOperation(op); }
-        if (source.version !== op.source!.version && !(op.action === 'update' && source.remote && canResumeSettings(source.remote, op.fields, op.updateBaseline))) throw new CollaborationError("任务已被修改，请取消此次操作并刷新");
+        if (source.version !== op.source!.version && !(op.action === 'update' && source.remote && ((op.updateIntent && op.updateBaseline) || canResumeSettings(source.remote, op.fields, op.updateBaseline)))) throw new CollaborationError("任务已被修改，请取消此次操作并刷新");
         if (op.source!.ownerId) {
-          if (op.action === "update") await this.gateway.update(op.source!.ownerId, op.source!.taskId, op.fields, source.version, source.remote?.projectId, source.remote);
+          if (op.action === "update") {
+            const saved = await this.gateway.update(op.source!.ownerId, op.source!.taskId, op.fields, source.version, source.remote?.projectId, source.remote);
+            if (saved) { op.fields = taskFields(saved); if (op.attachments) op.attachments.after = op.fields.content; }
+          }
           else if (op.action === "complete") await this.gateway.complete(op.source!.ownerId, op.source!.taskId, source.remote?.projectId);
           else await this.gateway.remove(op.source!.ownerId, op.source!.taskId, source.remote?.projectId);
         } else if (op.action === "update") state.buffer[op.source!.taskId] = { ...state.buffer[op.source!.taskId], fields: op.fields, version: Number(source.version) + 1 };

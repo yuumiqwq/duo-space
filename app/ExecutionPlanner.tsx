@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Check, ClipboardCheck, X } from 'lucide-react';
 import type { CollaborationSnapshot, ExecutionCommand } from './collaboration-types';
 import type { TaskNotice } from './collaboration-notifications';
-import { TaskNoticeDot } from './TaskNoticeDot';
+import { WorkflowCardSummary } from './WorkflowCardSummary';
 import { executionEligible, executionGroups, executionIds, executionReserved, toggleExecution } from './workflow-execution';
 import { taskErrorMessage } from './task-request';
 import { showCollaborationDialog } from './collaboration-dialog';
@@ -35,8 +35,8 @@ export function ExecutionPlanner({ snapshot, notices = [], name, busy, uncertain
     <div className="coop-workflow-list">
       {executionGroups(snapshot.workflows, snapshot.identityId).map(group => <section className="coop-workflow-group" key={group.title} aria-label={group.title}>
         <h4>{group.title}<span>{group.workflows.length}</span></h4>
-        {group.workflows.map(item => <button type="button" className="coop-workflow-card" key={item.id} role="checkbox" aria-checked={draft.ids.includes(item.id)} disabled={disabled || !executionEligible(item)} onClick={() => toggle(item.id)}>
-          <span><strong><TaskNoticeDot ids={notices.filter(notice => notice.workflowId === item.id).map(notice => notice.id)} />{item.title}</strong><small>{name(item.claimantId)} 认领 · {name(item.reviewerId)} 审批</small></span>
+        {group.workflows.map(item => <button type="button" className={`coop-workflow-card priority-${item.fields.priority}`} key={item.id} role="checkbox" aria-checked={draft.ids.includes(item.id)} disabled={disabled || !executionEligible(item)} onClick={() => toggle(item.id)}>
+          <WorkflowCardSummary item={item} name={name} noticeIds={notices.filter(notice => notice.workflowId === item.id).map(notice => notice.id)} />
           <span className="coop-workflow-actions">{executionReserved(item) && <span className={`coop-workflow-status ${item.status}`}>待审批</span>}<span className="coop-complete coop-execution-checkbox" aria-hidden="true">{draft.ids.includes(item.id) && <Check size={16} />}</span></span>
         </button>)}
       </section>)}

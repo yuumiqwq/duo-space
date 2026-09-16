@@ -61,6 +61,23 @@ retained. Cleanup is restricted to stopped containers beginning with known
 `/tmp/11scat-*`, and legacy artifacts directly inside `/opt/11scat-web`.
 No global Docker prune command is used.
 
+## Background task recovery
+
+The production Node process resumes persisted task updates without a browser.
+It checks due operations 15 seconds after each round, using the same store,
+queues, receipts and retry deadlines as authenticated requests. Restarting the
+container retains accepted operations through the existing `/data` mount.
+
+Before each round the scheduler requests `/api/access/runtime` at
+`TASK_SYNC_ORIGIN`, defaulting to `https://study.11scat.xyz`, and requires the
+returned instance ID to match its own. The candidate on port 3101 therefore
+does not process the shared data: the public route still serves production.
+An unreachable origin also prevents a round. Reading the endpoint alone does
+not activate scheduling; it exposes only an instance ID and runtime timestamps.
+Check `active` and `lastRunAt` after promotion to verify the scheduler is running.
+This gate assumes the existing single production instance, not load balancing
+between several writers. `TASK_SYNC_DISABLED=1` disables this scheduler.
+
 ## Roll back
 
 ```bash

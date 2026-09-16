@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { executionGroups, executionIds, toggleExecution, workflowGroups, workflowAttentionCount, taskboardAttentionCount } from '../app/workflow-execution.ts';
+import { claimantSettingsNotices, executionGroups, executionIds, toggleExecution, workflowGroups, workflowAttentionCount, taskboardAttentionCount } from '../app/workflow-execution.ts';
 
 const workflow = (id, claimantId, status, executing = false, priority = 0, createdAt = 1) => ({ id, claimantId, reviewerId: claimantId === 'alice' ? 'bob' : 'alice', status, executing, fields: { priority }, createdAt });
 const ids = group => group.workflows.map(item => item.id);
 
-test('entry badge counts both execution groups once per updated or review task and drops read updates', () => {
+test('workflow entry badge counts only pending reviews regardless of unread edits', () => {
   const workflows = [
     workflow('own-updated', 'alice', 'working', true), workflow('other-review', 'bob', 'submitted', true),
     workflow('own-review', 'alice', 'approving', true), workflow('own-idle', 'alice', 'working'),
@@ -16,10 +16,31 @@ test('entry badge counts both execution groups once per updated or review task a
   ];
   const settings = ['own-updated', 'own-updated', 'other-review', 'own-idle', 'other-idle', 'archived', 'done', 'no-slot-completing', 'deleting'].map((workflowId, index) => ({ id: String(index), workflowId, kind: 'workflow', eventType: 'updated' }));
   const other = [{ workflowId: 'only-nudge', kind: 'workflow', eventType: 'nudge' }, { workflowId: 'only-error', kind: 'sync-error' }];
-  assert.equal(workflowAttentionCount(workflows, [...settings, ...other]), 3);
-  assert.equal(workflowAttentionCount(workflows, other), 2, 'reading the settings removes its count while pending reviews remain');
+  assert.equal(workflowAttentionCount(workflows, [...settings, ...other]), 2);
+  assert.equal(workflowAttentionCount(workflows, other), 2, 'reading settings has no effect on the review count');
   assert.equal(workflowAttentionCount(workflows.map(item => ({ ...item, status: 'done' })), settings), 0);
   assert.equal(workflowAttentionCount([], settings), 0, 'old notices without a visible workflow do not count');
+});
+
+test('claimant edit dots include unarranged tasks, exclude own edits and disappear after read acknowledgement', () => {
+  const claimed = { ...workflow('claimed', 'alice', 'working'), source: { ownerId: null, taskId: 'public' } };
+  const notices = [
+    { id: 'other-edit', workflowId: claimed.id, kind: 'workflow', eventType: 'updated', actorId: 'bob' },
+    { id: 'third-edit', workflowId: claimed.id, kind: 'workflow', eventType: 'updated', actorId: 'charlie', recipients: ['alice', 'bob'] },
+    { id: 'own-edit', workflowId: claimed.id, kind: 'workflow', eventType: 'updated', actorId: 'alice' },
+    { id: 'reject', workflowId: claimed.id, kind: 'workflow', eventType: 'reject', actorId: 'bob' },
+    { id: 'failure', workflowId: claimed.id, kind: 'sync-error', actorId: '' },
+  ];
+  assert.deepEqual(claimantSettingsNotices(claimed, notices, 'alice'), ['other-edit', 'third-edit']);
+  assert.deepEqual(claimantSettingsNotices(claimed, notices, 'bob'), []);
+  assert.equal(taskboardAttentionCount([claimed], notices, 'alice'), 1, 'several edits count as one task without an execution slot');
+  assert.equal(taskboardAttentionCount([claimed], notices, 'bob'), 0);
+  assert.equal(workflowAttentionCount([claimed]), 0);
+  const read = notices.filter(notice => !['other-edit', 'third-edit'].includes(notice.id));
+  assert.deepEqual(claimantSettingsNotices(claimed, read, 'alice'), []);
+  assert.equal(taskboardAttentionCount([claimed], read, 'alice'), 0);
+  assert.equal(taskboardAttentionCount([{ ...claimed, status: 'submitted', executing: true }], notices, 'alice'), 1, 'pending review and a dot share one count');
+  for (const status of ['done', 'deleted']) assert.deepEqual(claimantSettingsNotices({ ...claimed, status }, notices, 'alice'), []);
 });
 
 test('workflow overview shows only execution slots by claimant, pinning review before priority and recency', () => {

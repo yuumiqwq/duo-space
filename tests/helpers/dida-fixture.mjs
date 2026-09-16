@@ -37,6 +37,7 @@ globalThis.fetch = async (input, init = {}) => {
     const id = route.slice('/task/'.length);
     if (!tasks[id]) return new Response(null, { status: 404 });
     tasks[id] = { ...tasks[id], ...JSON.parse(init.body) };
+    if (process.env.DIDA_FIXTURE_PROCESS) tasks[id].fixtureUpdateWriter = process.env.DIDA_FIXTURE_PROCESS;
     for (const key of ['startDate', 'dueDate']) if (tasks[id][key]?.startsWith('1970-01-01T00:00:00')) tasks[id][key] = null;
     save(); return Response.json(tasks[id]);
   }

@@ -3,7 +3,7 @@ import { isWorkflowSettingsNotice, type TaskNotice } from './collaboration-notif
 
 export const EXECUTION_LIMIT = 3;
 type ExecutionState = Pick<ClaimWorkflow, 'status' | 'executing' | 'ownerDeletePending'>;
-export type WorkflowAttention = ExecutionState & Pick<ClaimWorkflow, 'id' | 'source'>;
+export type WorkflowAttention = ExecutionState & Pick<ClaimWorkflow, 'id' | 'source' | 'claimantId'>;
 export const executionEligible = (workflow: ExecutionState) => ['creating', 'working', 'rejected'].includes(workflow.status) && !workflow.ownerDeletePending;
 export const isExecuting = (workflow: ExecutionState) => !!workflow.executing && executionEligible(workflow);
 export const executionReserved = (workflow: ExecutionState) => !workflow.ownerDeletePending && (workflow.status === 'submitted' || (workflow.status === 'approving' && !!workflow.executing));
@@ -18,12 +18,17 @@ function attentionTasks<T extends ExecutionState & Pick<ClaimWorkflow, 'id'>>(wo
   const updated = new Set(notices.filter(isWorkflowSettingsNotice).map(notice => notice.workflowId));
   return workflows.filter(workflow => executionReserved(workflow) || (isExecuting(workflow) && updated.has(workflow.id)));
 }
-export function workflowAttentionCount(workflows: (ExecutionState & Pick<ClaimWorkflow, 'id'>)[], notices: TaskNotice[]): number {
-  return attentionTasks(workflows, notices).length;
+export function claimantSettingsNotices(workflow: (ExecutionState & Pick<ClaimWorkflow, 'id' | 'claimantId'>) | undefined, notices: TaskNotice[], identityId: string): string[] {
+  if (!workflow || workflow.claimantId !== identityId || workflow.ownerDeletePending || ['done', 'deleted'].includes(workflow.status)) return [];
+  return notices.filter(notice => notice.workflowId === workflow.id && isWorkflowSettingsNotice(notice) && !!notice.actorId && notice.actorId !== identityId && (!notice.recipients || notice.recipients.includes(identityId))).map(notice => notice.id);
 }
-export function taskboardAttentionCount(workflows: WorkflowAttention[], notices: TaskNotice[]): number {
+export function workflowAttentionCount(workflows: (ExecutionState & Pick<ClaimWorkflow, 'id'>)[]): number {
+  return workflows.filter(executionReserved).length;
+}
+export function taskboardAttentionCount(workflows: WorkflowAttention[], notices: TaskNotice[], identityId: string): number {
   const tasks = new Set(notices.filter(notice => notice.kind === 'public' && notice.taskId).map(notice => `public:${notice.taskId}`));
-  for (const workflow of attentionTasks(workflows, notices)) {
+  const attention = new Set(attentionTasks(workflows, notices).map(workflow => workflow.id));
+  for (const workflow of workflows.filter(workflow => attention.has(workflow.id) || claimantSettingsNotices(workflow, notices, identityId).length)) {
     tasks.add(workflow.source.ownerId === null ? `public:${workflow.source.taskId}` : `workflow:${workflow.id}`);
   }
   return tasks.size;

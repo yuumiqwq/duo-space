@@ -25,27 +25,30 @@ function Choices({ label, value, options, disabled, change }: { label: string; v
 export function WorkflowSettings({ workflow, identityId, disabled, perform, onDeleted }: { workflow: ClaimWorkflow; identityId: string; disabled: boolean; perform: (command: WorkflowCommand) => Promise<boolean>; onDeleted?: () => void }) {
   disabled ||= workflow.status === 'deleted' || !!workflow.ownerDeletePending;
   return <TaskSettings taskKey={workflow.id} currentFields={workflow.fields} disabled={disabled}
-    save={fields => perform({ id: crypto.randomUUID(), workflowId: workflow.id, version: workflow.version, settingsVersion: workflow.settingsVersion, action: "update-workflow", fields })}
+    save={(fields, baseFields) => perform({ id: crypto.randomUUID(), workflowId: workflow.id, version: workflow.version, settingsVersion: workflow.settingsVersion, action: "update-workflow", fields, baseFields })}
     deletion={locked => <WorkflowTaskDeletion workflow={workflow} identityId={identityId} disabled={locked} perform={perform} onDeleted={onDeleted} />} />;
 }
 
-export function TaskSettings({ taskKey, currentFields, disabled, save, deletion }: { taskKey: string; currentFields: TaskFields; disabled: boolean; save: (fields: Partial<TaskFields>) => Promise<boolean>; deletion: (disabled: boolean) => ReactNode }) {
+export function TaskSettings({ taskKey, currentFields, disabled, save, deletion }: { taskKey: string; currentFields: TaskFields; disabled: boolean; save: (fields: Partial<TaskFields>, baseFields: TaskFields) => Promise<boolean>; deletion: (disabled: boolean) => ReactNode }) {
   const [uploading, setUploading] = useState(false);
-  const [draft, setDraft] = useState<{ fields: TaskFields; base: TaskFields; start: string; due: string; tags: string } | null>(null);
-  const fields = draft?.fields || currentFields;
+  const [draft, setDraft] = useState<{ fields: TaskFields; base: TaskFields; start: string; due: string; tags: string; allDayChanged?: boolean } | null>(null);
+  const fields = draft?.fields || { ...currentFields, isAllDay: !currentFields.startDate && !currentFields.dueDate ? true : currentFields.isAllDay };
   const dates = taskDateInputs(fields);
   const start = draft?.start ?? dates.start, due = draft?.due ?? dates.due;
   const tags = draft?.tags ?? fields.tags.join(", ");
-  const change = (patch: Partial<TaskFields>, inputs: Partial<{ start: string; due: string; tags: string }> = {}) => setDraft({ base: draft?.base ?? currentFields, fields: { ...fields, ...patch }, start, due, tags, ...inputs });
+  const change = (patch: Partial<TaskFields>, inputs: Partial<{ start: string; due: string; tags: string; allDayChanged: boolean }> = {}) => setDraft({ base: draft?.base ?? currentFields, fields: { ...fields, ...patch }, start, due, tags, allDayChanged: draft?.allDayChanged, ...inputs });
   const editedFields = { ...fields,
     ...taskDateSelection(fields, start, due),
     tags: tags.split(/[,，]/).map(tag => tag.trim()).filter(Boolean),
   };
+  // An untouched default is presentation only; changing another field must not
+  // silently rewrite an undated imported task's stored all-day flag.
+  if (!editedFields.startDate && !editedFields.dueDate && !draft?.allDayChanged) editedFields.isAllDay = (draft?.base || currentFields).isAllDay;
   const rebased = rebaseWorkflowDraft(draft?.base || currentFields, editedFields, currentFields);
   return <form className="coop-editor coop-workflow-settings" aria-label="详细设置" onSubmit={event => {
     event.preventDefault();
     if (!draft || disabled || uploading || rebased.conflicts.length) return;
-    void save(rebased.patch).then(done => { if (done) setDraft(null); });
+    void save(rebased.patch, currentFields).then(done => { if (done) setDraft(null); });
   }}>
     <h4>详细设置</h4>
     {draft && rebased.conflicts.length > 0 && <div className="coop-feedback" role="status"><p>其他成员修改了你正在编辑的内容，你的输入已保留。</p><button type="button" disabled={disabled} onClick={() => setDraft(null)}>采用最新内容</button><button type="button" disabled={disabled} onClick={() => { const merged = { ...currentFields, ...rebased.patch }; setDraft({ fields: merged, base: currentFields, ...taskDateInputs(merged), tags: merged.tags.join(', ') }); }}>保留我的修改</button></div>}
@@ -55,7 +58,7 @@ export function TaskSettings({ taskKey, currentFields, disabled, save, deletion 
     <div className="workflow-dates">
     <CalendarField label="开始时间" value={start} allDay={fields.isAllDay} disabled={disabled} change={value => change({}, { start: value })} />
     <CalendarField label="结束时间" value={due} allDay={fields.isAllDay} disabled={disabled} change={value => change({}, { due: value })} />
-    <label className="coop-allday"><input type="checkbox" checked={fields.isAllDay} disabled={disabled} onChange={event => { const allDay = event.target.checked; change({ isAllDay: allDay, startDate: null, dueDate: null }, { start: start ? allDay ? start.slice(0, 10) : `${start.slice(0, 10)}T09:00` : "", due: due ? allDay ? due.slice(0, 10) : `${due.slice(0, 10)}T18:00` : "" }); }} />全天</label>
+    <label className="coop-allday"><input type="checkbox" checked={fields.isAllDay} disabled={disabled} onChange={event => { const allDay = event.target.checked; change({ isAllDay: allDay, startDate: null, dueDate: null }, { allDayChanged: true, start: start ? allDay ? start.slice(0, 10) : `${start.slice(0, 10)}T09:00` : "", due: due ? allDay ? due.slice(0, 10) : `${due.slice(0, 10)}T18:00` : "" }); }} />全天</label>
     </div>
     <Choices label="重复" value={fields.repeatFlag} options={[["", "不重复"], ...["DAILY", "WEEKLY", "MONTHLY"].map((period, index): [string, string] => [`RRULE:FREQ=${period};INTERVAL=1`, ["每天", "每周", "每月"][index]]), ...(fields.repeatFlag && !["DAILY", "WEEKLY", "MONTHLY"].some(period => fields.repeatFlag === `RRULE:FREQ=${period};INTERVAL=1`) ? [[fields.repeatFlag, "现有规则"] as [string, string]] : [])]} disabled={disabled} change={value => change({ repeatFlag: value })} />
     <Choices label="提醒" value={fields.reminders.length > 1 ? "custom" : fields.reminders[0] || ""} options={[["", "不提醒"], ["TRIGGER:PT0S", "准时"], ["TRIGGER:-PT15M", "提前15分"], ["TRIGGER:-PT1H", "提前1时"], ...((fields.reminders.length > 1 || (fields.reminders[0] && !["TRIGGER:PT0S", "TRIGGER:-PT15M", "TRIGGER:-PT1H"].includes(fields.reminders[0]))) ? [[fields.reminders.length > 1 ? "custom" : fields.reminders[0], "现有提醒"] as [string, string]] : [])]} disabled={disabled} change={value => { if (value !== "custom") change({ reminders: value ? [value] : [] }); }} />

@@ -347,10 +347,19 @@
 .coop-members .coop-member-lanes { margin: 0 4px 4px; }
 .coop-members .coop-lane .coop-task-list { padding: 6px 5px; }
 .coop-members .coop-lane > header { padding: 7px 6px 5px; }
-.member-task { --panel: #fff; --soft: #f6f6f4; --line: #deddd7; --ink: #504c43; --muted: #827b6e; background: #fff; border-color: #deddd7; border-radius: 0; }
+.member-task, .coop-workflow-card { --panel: #fff; --soft: #f6f6f4; --line: #deddd7; --ink: #504c43; --muted: #827b6e; background: #fff; border-color: #deddd7; border-radius: 0; }
 .coop-lane .member-task { padding: 7px 7px 7px 9px; }
-.coop-task.priority-5 { --priority-bar: #ed3f3f; }.coop-task.priority-3 { --priority-bar: #ffa600; }.coop-task.priority-1 { --priority-bar: #4c6fff; }
-.member-task:not(.priority-0)::before, .buffer .coop-task:not(.priority-0)::before { content: ''; position: absolute; left: -1px; top: -1px; bottom: -1px; width: 3px; border-radius: 0; background: var(--priority-bar); pointer-events: none; }
+.coop-task.priority-5, .coop-workflow-card.priority-5 { --priority-bar: #ed3f3f; }.coop-task.priority-3, .coop-workflow-card.priority-3 { --priority-bar: #ffa600; }.coop-task.priority-1, .coop-workflow-card.priority-1 { --priority-bar: #4c6fff; }
+.member-task:not(.priority-0)::before, .buffer .coop-task:not(.priority-0)::before, .coop-workflow-card:not(.priority-0)::before { content: ''; position: absolute; left: -1px; top: -1px; bottom: -1px; width: 3px; border-radius: 0; background: var(--priority-bar); pointer-events: none; }
+.coop-workflow-card { position: relative; min-width: 0; }
+.coop-workflow-summary { min-width: 0; flex: 1; display: grid; gap: 6px; }
+.coop-workflow-summary > strong { overflow-wrap: anywhere; }
+.coop-workflow-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; }
+.coop-workflow-meta small { margin-top: 0; }
+.coop-workflow-meta .coop-task-date { margin: 0; white-space: nowrap; }
+.coop-workflow-card > .coop-workflow-actions { flex-shrink: 0; }
+.coop-workflow-card .coop-workflow-status { white-space: nowrap; }
+@media (max-width: 480px) { .coop-workflow-card { gap: 8px; padding: 12px; }.coop-workflow-card > .coop-workflow-actions { max-width: 90px; flex-wrap: wrap; justify-content: flex-end; } }
 .buffer .coop-task:not(.priority-0)::before { left: 0; top: 0; bottom: 0; border-radius: 2px 0 0 2px; }
 .coop-priority-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 /* Keep the existing keyboard drag control accessible without a visible pin. */

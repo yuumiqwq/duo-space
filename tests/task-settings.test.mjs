@@ -47,3 +47,23 @@ test('task settings preserve untouched dates and support date ranges and all-day
   allDay.input('checkbox').props.onChange({ target: { checked: true } }); allDay.tree().props.onSubmit({ preventDefault() {} });
   assert.deepEqual(allDay.saved[0], { startDate: '2026-09-13T00:00:00+0800', dueDate: '2026-09-13T00:00:00+0800', isAllDay: true });
 });
+
+test('undated imported tasks default to all-day without rewriting an untouched flag', () => {
+  for (const selected of ['start', 'due', 'both']) {
+    const view = editor(taskFields({ title: 'undated', isAllDay: false }));
+    assert.equal(view.input('checkbox').props.checked, true);
+    if (selected !== 'due') view.calendar('开始时间').props.change('2026-10-01');
+    if (selected !== 'start') view.calendar('结束时间').props.change('2026-10-01');
+    view.tree().props.onSubmit({ preventDefault() {} });
+    assert.deepEqual(view.saved[0], { startDate: '2026-10-01T00:00:00+0800', dueDate: '2026-10-01T00:00:00+0800', isAllDay: true });
+  }
+  const title = editor(taskFields({ title: 'old', isAllDay: false }));
+  title.input(undefined).props.onChange({ target: { value: 'new' } }); title.tree().props.onSubmit({ preventDefault() {} });
+  assert.deepEqual(title.saved[0], { title: 'new' });
+  const timed = editor(taskFields({ title: 'time', isAllDay: false, startDate: '2026-10-01T01:00:00.000Z' }));
+  assert.equal(timed.input('checkbox').props.checked, false);
+  const override = editor(taskFields({ title: 'explicit time', isAllDay: false }));
+  override.input('checkbox').props.onChange({ target: { checked: false } });
+  override.calendar('开始时间').props.change('2026-10-01T09:00'); override.tree().props.onSubmit({ preventDefault() {} });
+  assert.deepEqual(override.saved[0], { startDate: '2026-10-01T09:00:00+0800' });
+});

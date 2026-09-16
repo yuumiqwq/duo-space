@@ -1,9 +1,9 @@
-import type { ClaimWorkflow, WorkflowEvent } from "./collaboration-types";
+import type { ClaimWorkflow, WorkflowEvent, WorkflowSyncIssue } from "./collaboration-types";
 
-export type TaskNotice = { id: string; kind: "public" | "workflow" | "sync-error"; title: string; body: string; at: number; actorId: string; recipients?: string[]; taskId?: string; workflowId?: string; eventId?: string; eventType?: string };
+export type TaskNotice = { id: string; kind: "public" | "workflow" | "sync-error"; title: string; body: string; at: number; actorId: string; recipients?: string[]; taskId?: string; workflowId?: string; operationId?: string; eventId?: string; eventType?: string };
 export type TaskNoticeState = { version?: number; known: string[]; entries: TaskNotice[]; read: Record<string, string[]>; attempted: string[] };
 export const isWorkflowSettingsNotice = (notice: TaskNotice) => notice.kind === 'workflow' && ['updated', 'updating', 'update-replaced'].includes(notice.eventType || '');
-type NoticeSource = { buffer: Record<string, { fields: { title: string }; publisherId?: string; stagedBy?: string; completedAt?: number }>; workflows: Record<string, ClaimWorkflow>; notifications?: TaskNoticeState };
+type NoticeSource = { buffer: Record<string, { fields: { title: string }; publisherId?: string; stagedBy?: string; completedAt?: number }>; workflows: Record<string, ClaimWorkflow>; operations?: Record<string, { title: string; syncIssue?: WorkflowSyncIssue }>; notifications?: TaskNoticeState };
 export const silentWorkflowEvent = (type?: string) => ["external-claimant-check", "external-task-reopened", "task-relocated", "task-anomaly"].includes(type || "");
 export function workflowEventPresentation(event: WorkflowEvent, pendingSummary?: string): WorkflowEvent {
   if (!["updating", "updated", "update-replaced"].includes(event.type)) return event;
@@ -18,6 +18,10 @@ function available(source: NoticeSource): TaskNotice[] {
     for (const event of workflow.events.map(event => workflowEventPresentation(event)).filter(event => event.type !== "completed" && !silentWorkflowEvent(event.type))) items.push({ id: `workflow:${workflow.id}:${event.id}`, workflowId: workflow.id, eventId: event.id, eventType: event.type, kind: "workflow", title: workflow.title, body: `${workflowEventLabels[event.type] || "流程更新"}${event.comment ? `：${event.comment.slice(0, 160)}` : ""}`, at: event.at, actorId: event.actorId, recipients: [...new Set([workflow.reviewerId, workflow.claimantId])] });
     const issue = workflow.syncIssue;
     if (issue) items.push({ id: `sync-error:${workflow.id}:${issue.id}`, workflowId: workflow.id, kind: "sync-error", title: workflow.title, body: issue.message, at: issue.at, actorId: "", recipients: [issue.recipientId] });
+  }
+  for (const [id, operation] of Object.entries(source.operations || {})) {
+    const issue = operation.syncIssue;
+    if (issue) items.push({ id: `sync-error:operation:${id}:${issue.id}`, operationId: id, kind: 'sync-error', title: operation.title, body: issue.message, at: issue.at, actorId: '', recipients: [issue.recipientId] });
   }
   return items;
 }
@@ -36,7 +40,9 @@ export function collectTaskNotices(source: NoticeSource) {
     if (stored && (stored.body !== item.body || stored.eventType !== item.eventType)) { Object.assign(stored, item); notices.version = (notices.version || 0) + 1; }
   }
 }
-export const activeTaskNotice = (source: NoticeSource, notice: TaskNotice) => notice.kind !== "sync-error" || notice.id === `sync-error:${notice.workflowId}:${source.workflows[notice.workflowId!]?.syncIssue?.id}`;
+export const activeTaskNotice = (source: NoticeSource, notice: TaskNotice) => notice.kind !== "sync-error" || (notice.operationId
+  ? notice.id === `sync-error:operation:${notice.operationId}:${source.operations?.[notice.operationId]?.syncIssue?.id}`
+  : notice.id === `sync-error:${notice.workflowId}:${source.workflows[notice.workflowId!]?.syncIssue?.id}`);
 export const receivesTaskNotice = (notice: TaskNotice, actor: string) => !silentWorkflowEvent(notice.eventType) && notice.actorId !== actor && (!notice.recipients || notice.recipients.includes(actor));
 export function unreadTaskNotices(source: NoticeSource, actor: string): TaskNotice[] {
   const notices = initializeTaskNotices(source), seen = new Set(notices.read[actor] || []);

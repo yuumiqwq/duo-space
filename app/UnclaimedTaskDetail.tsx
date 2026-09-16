@@ -28,7 +28,7 @@ export function UnclaimedTaskDetail({ task, identityId, name, busy, uncertain = 
       {error && <p className="coop-feedback error" role="alert">{taskErrorMessage(error)}</p>}
     </section>
     <TaskSettings taskKey={`${task.ownerId || "buffer"}:${task.id}`} currentFields={task} disabled={disabled}
-      save={fields => perform({ id: crypto.randomUUID(), action: "update", source, fields })}
+      save={(fields, baseFields) => perform({ id: crypto.randomUUID(), action: "update", source, fields, baseFields })}
       deletion={locked => <div className="workflow-task-deletion"><div className="coop-workflow-actions"><button type="button" className={deleteArmed ? "coop-delete workflow-delete-confirm" : "coop-delete workflow-delete-icon"} aria-label={deleteArmed ? "确认删除" : "删除任务"} disabled={locked} onClick={() => void remove()}>{deleteArmed ? "确认删除" : <Trash2 size={19} aria-hidden="true" />}</button></div></div>} />
   </div>;
 }

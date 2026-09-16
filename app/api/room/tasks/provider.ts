@@ -1,10 +1,11 @@
 import { getUser, listRoomMembers } from "../../identity/store";
 import { decryptToken } from "../../ticktick/crypto";
 import { tickFetch, tickInboxData, resolveTickInbox, TickApiError } from "../../ticktick/client";
-import { canResumeSettings, CollaborationError, remoteVersion, sameFields, taskFields, verificationIssue, type Gateway, type RemoteTask } from "./store";
+import { CollaborationError, remoteVersion, sameFields, taskFields, verificationIssue, type Gateway, type RemoteTask } from "./store";
 import type { TaskFields } from "../../../collaboration-types";
 import { taskSyncEvidence } from './sync-diagnostics';
 import { allDaySelection } from '../../../task-date-input';
+import { mergeTaskSettings } from '../../../task-settings-merge';
 
 type Context = { token: string; encrypted: string; expires: number; search?: Promise<RemoteTask[]>; projects?: Promise<string[]>; completed?: Map<string, Promise<RemoteTask[]>> };
 type Inbox = { projectId: string; tasks: RemoteTask[] };
@@ -181,6 +182,7 @@ export const gateway: Gateway = {
       if (!existing) throw new CollaborationError("任务不存在");
       if (existing.id !== id || (projectId && existing.projectId !== projectId)) throw new CollaborationError('任务编号无效', 400);
       if (remoteVersion(existing) !== version) throw new CollaborationError("任务刚被修改，请刷新后重新编辑");
+      const intent = { base: taskFields(existing), desired: fields };
       // An uncertain update is re-read before one bounded retry. Never repeat
       // creation/deletion here, or overwrite later edits to the same task.
       let current = existing, response;
@@ -198,7 +200,10 @@ export const gateway: Gateway = {
           await waitForReadback();
           const observed = await gateway.locate!(owner, id, current.projectId);
           trace.retryReadBack = taskSyncEvidence(observed);
-          if (!observed || !canResumeSettings(observed, fields, { fields: taskFields(existing), status: existing.status || 0, parentId: existing.parentId || '' })) throw new CollaborationError('任务刚被修改，请刷新后重新编辑');
+          if (!observed || (observed.status || 0) !== (existing.status || 0) || (observed.parentId || '') !== (existing.parentId || '')) throw new CollaborationError('任务刚被修改，请刷新后重新编辑');
+          const merged = mergeTaskSettings(intent.base, intent.desired, taskFields(observed));
+          if (merged.conflicts.length) throw new CollaborationError('任务刚被修改，请刷新后重新编辑');
+          fields = merged.fields;
           if (sameFields(observed, fields)) return observed;
           current = observed; trace.retryCount = 1;
         }

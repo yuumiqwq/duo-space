@@ -20,6 +20,7 @@ import { readTaskResponse, taskErrorMessage } from './task-request';
 import { WorkflowAttachments } from './WorkflowAttachments';
 import { WorkflowResyncSettings } from './WorkflowResyncSettings';
 import { WorkflowDeletionRetry } from './WorkflowDeletionRetry';
+import { WorkflowCardSummary } from './WorkflowCardSummary';
 
 export const workflowStatus: Record<ClaimWorkflow["status"], string> = { creating: "已认领", working: "已认领", submitted: "待审批", rejected: "已认领", approving: "待审批", done: "已完成", deleted: "已删除" };
 const eventLabels = workflowEventLabels;
@@ -55,8 +56,8 @@ export function WorkflowList({ workflows, archived, setArchived, select, name, n
   const settingsUnread = (id: string) => notices.some(item => item.workflowId === id && isWorkflowSettingsNotice(item));
   const archiveUnread = workflows.filter(item => ["done", "deleted"].includes(item.status)).reduce((count, item) => count + unread(item.id).length, 0);
   const archivedItems = workflows.filter(item => ['done', 'deleted'].includes(item.status)).sort((a, b) => Number(unread(b.id).length > 0) - Number(unread(a.id).length > 0) || b.updatedAt - a.updatedAt);
-  const card = (item: ClaimWorkflow) => <button type="button" className="coop-workflow-card" key={item.id} disabled={disabled} onClick={() => select(item.id)}>
-    <span><strong><TaskNoticeDot ids={unread(item.id)} />{item.title}</strong><small>{name(item.claimantId)} 认领 · {name(item.reviewerId)} 审批</small></span>
+  const card = (item: ClaimWorkflow) => <button type="button" className={`coop-workflow-card priority-${item.fields.priority}`} key={item.id} disabled={disabled} onClick={() => select(item.id)}>
+    <WorkflowCardSummary item={item} name={name} noticeIds={unread(item.id)} />
     <span className="coop-workflow-actions">{settingsUnread(item.id) ? <>{!archived && executionReserved(item) && <span className={`coop-workflow-status ${item.status}`}>待审批</span>}<span className="coop-workflow-status has-update">有更新</span></> : <span className={`coop-workflow-status ${item.status}`}>{workflowLabel(item)}</span>}</span>
   </button>;
   return <>

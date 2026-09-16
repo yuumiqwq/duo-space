@@ -189,7 +189,7 @@ test('write diagnostics distinguish rejected HTTP writes from successful respons
 });
 
 test('task updates absorb transient failures and delayed readback without repeating acknowledged writes or overwriting changes', async () => {
-  for (const scenario of ['transient', 'lost-response', 'partial', 'delayed-readback', 'conflict', 'deleted', 'auth', 'rate-limit', 'still-offline']) await providerFixture(async gateway => {
+  for (const scenario of ['transient', 'lost-response', 'partial', 'independent-edit', 'delayed-readback', 'conflict', 'deleted', 'auth', 'rate-limit', 'still-offline']) await providerFixture(async gateway => {
     let task = { id: 'recover-update', projectId: 'saved-list', ...taskFields({ title: 'sync task' }) };
     const before = structuredClone(task), desired = taskFields({ ...task, priority: 5, startDate: '2026-09-12T16:00:00.000Z' });
     let writes = 0, reads = 0, lookups = 0;
@@ -203,7 +203,8 @@ test('task updates absorb transient failures and delayed readback without repeat
         if (writes === 1 && !['lost-response', 'delayed-readback'].includes(scenario)) {
           if (scenario === 'partial') Object.assign(task, { priority: 5, etag: 'partial' });
           if (scenario === 'conflict') Object.assign(task, { priority: 1, etag: 'later-edit' });
-          return new Response(null, { status: 503 });
+          if (scenario === 'independent-edit') Object.assign(task, { content: 'note from another device', etag: 'concurrent' });
+          return new Response(null, { status: scenario === 'independent-edit' ? 409 : 503 });
         }
         task = { ...JSON.parse(init.body), etag: 'saved' };
         if (scenario === 'lost-response') throw new TypeError('fetch failed');
@@ -217,12 +218,13 @@ test('task updates absorb transient failures and delayed readback without repeat
       }
       throw new Error(`Unexpected request: ${route}`);
     };
-    if (['transient', 'lost-response', 'partial', 'delayed-readback'].includes(scenario)) {
+    if (['transient', 'lost-response', 'partial', 'independent-edit', 'delayed-readback'].includes(scenario)) {
       const saved = await gateway.update('alice', task.id, desired, remoteVersion(before), task.projectId, before);
       assert.equal(taskFields(saved).priority, 5, scenario);
       assert.equal(taskFields(saved).startDate, desired.startDate, scenario);
+      if (scenario === 'independent-edit') assert.equal(saved.content, 'note from another device');
     } else await assert.rejects(gateway.update('alice', task.id, desired, remoteVersion(before), task.projectId, before));
-    assert.equal(writes, ['transient', 'partial', 'still-offline'].includes(scenario) ? 2 : 1, scenario);
+    assert.equal(writes, ['transient', 'partial', 'independent-edit', 'still-offline'].includes(scenario) ? 2 : 1, scenario);
     if (['auth', 'rate-limit'].includes(scenario)) assert.equal(lookups, 0, 'permanent rejection and rate limits do not trigger immediate retries');
     if (scenario === 'conflict') assert.equal(task.priority, 1);
   });

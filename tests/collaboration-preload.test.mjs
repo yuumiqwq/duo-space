@@ -76,7 +76,7 @@ test('member column renders preloaded tasks alongside a refresh error instead of
 test('closed taskboard polls update review badges without inbox reloads and stale summaries cannot replace newer state', async () => {
   const pollEffect = component.body.statements.find(node => ts.isExpressionStatement(node) && ts.isCallExpression(node.expression) && node.expression.expression.getText(source) === 'useEffect' && node.expression.arguments[1]?.elements?.some(item => item.getText(source) === 'onChanged'));
   const badgeDeclarations = component.body.statements.filter(node => ts.isVariableStatement(node) && node.declarationList.declarations.some(item => ['badgeWorkflows', 'unseenCount', 'workflowCount'].includes(item.name.getText(source))));
-  const counts = new Function('attention', 'snapshot', 'taskNotices', 'taskboardAttentionCount', 'workflowAttentionCount', transpile(`${badgeDeclarations.map(node => node.getText(source)).join('\n')}\nreturn { main: unseenCount, workflow: workflowCount };`));
+  const counts = new Function('attention', 'snapshot', 'taskNotices', 'taskboardAttentionCount', 'workflowAttentionCount', transpile(`const identityId = 'alice';\n${badgeDeclarations.map(node => node.getText(source)).join('\n')}\nreturn { main: unseenCount, workflow: workflowCount };`));
   let attention = null, notices = [], snapshot = { revision: 1, workflows: [] }, interval, first, cleanup;
   const submitted = { id: 'review', status: 'submitted', executing: true, source: { ownerId: null, taskId: 'shared' } };
   let response = { revision: 2, attentionWorkflows: [submitted], notices: [], remoteVersions: { bob: 'unchanged' } };
@@ -108,6 +108,9 @@ test('closed taskboard polls update review badges without inbox reloads and stal
     response = { ...response, revision: 5, attentionWorkflows: [], notices: [{ kind: 'public', taskId: 'new' }] }; interval(); await tick();
     assert.deepEqual(currentCounts(), { main: 1, workflow: 0 });
     notices = []; assert.deepEqual(currentCounts(), { main: 0, workflow: 0 }, 'read acknowledgement updates the count without a new summary');
+    response = { ...response, revision: 6, attentionWorkflows: [{ ...submitted, claimantId: 'alice', status: 'working', executing: false }], notices: [{ id: 'other-edit', kind: 'workflow', workflowId: 'review', eventType: 'updated', actorId: 'bob' }] };
+    interval(); await tick(); assert.deepEqual(currentCounts(), { main: 1, workflow: 0 }, 'an unarranged claimant edit appears without opening the board');
+    notices = []; assert.deepEqual(currentCounts(), { main: 0, workflow: 0 }, 'detail acknowledgement clears the claimant count');
     assert.ok(requests.every(url => url === '/api/room/tasks?revision=1'));
   } finally { cleanup(); }
 });
