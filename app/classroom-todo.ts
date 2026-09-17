@@ -26,7 +26,10 @@ export function classroomTodoTasks<T extends TodoTask>(tasks: T[], now: Date | n
   return tasks.filter(task => {
     const due = todoDueTime(task);
     const allDay = task.isAllDay || [task.startDate, task.dueDate].some(date => date?.length === 10);
-    return Number.isFinite(due) && due >= window.start && due < (allDay ? midnight : window.end);
+    if (!Number.isFinite(due) || due >= (allDay ? midnight : window.end)) return false;
+    // Unfinished work carries over. A carried task checked in this room day
+    // remains visible until the next 06:00, just like today's completed tasks.
+    return !task.done || due >= window.start || task.completedDay === window.day;
   });
 }
 export function mergeTodoSnapshot<T extends TodoTask>(previous: T[], incoming: T[], now = Date.now()): T[] {

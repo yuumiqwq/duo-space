@@ -22,6 +22,8 @@ test('todo routes preserve checked tasks for both devices and save only the auth
   const oldHistory=Object.fromEntries(Array.from({length:200},(_,i)=>[`old-${i}`,{...t(`old-${i}`,'窗口外的完成历史',2),dueDate:oldDate}]));
   const allDayDate = new Date(Date.parse(`${window.day}T00:00:00+0800`)).toISOString();
   const extra = {
+    overduedone: { ...t('overduedone','今天完成的过期任务',2), dueDate: oldDate, completedTime: new Date().toISOString() },
+    overduestart: { ...t('overduestart','只有开始日期的过期全天任务'), dueDate: undefined, startDate: new Date(Date.parse(allDayDate)-86400000).toISOString(), isAllDay: true },
     allday: { ...t('allday','当日全天'), dueDate: allDayDate, isAllDay: true },
     alldaydone: { ...t('alldaydone','已完成全天',2), dueDate: undefined, startDate: allDayDate, isAllDay: true },
     laterstart: { ...t('laterstart','按较晚开始时间'), dueDate: oldDate, startDate: date },
@@ -38,15 +40,20 @@ test('todo routes preserve checked tasks for both devices and save only the auth
     let ready=false;for(let i=0;i<80;i++){try{if((await call('alice','/api/room/classroom')).ok){ready=true;break;}}catch{}await new Promise(resolve=>setTimeout(resolve,200));}assert.ok(ready);
     const tasksUrl='/api/ticktick/tasks?view=today&classroom=1';
     let response=await call('alice',tasksUrl);assert.equal(response.status,200);let data=await response.json();
-    assert.deepEqual(data.tasks.map(t=>t.id).sort(),['allday','alldaydone','history','laterend','laterstart','one']);assert.equal(data.tasks.find(t=>t.id==='history').done,true);
+    assert.deepEqual(data.tasks.map(t=>t.id).sort(),['allday','alldaydone','history','laterend','laterstart','one','overdue','overduedone','overduestart']);assert.equal(data.tasks.find(t=>t.id==='history').done,true);
+    assert.equal(data.tasks.find(t=>t.id==='overduedone').done,true);
+    assert.equal(data.tasks.find(t=>t.id==='overduedone').completedDay,window.day);
+    assert.equal(data.tasks.find(t=>t.id==='overdue').dueDate,oldDate,'including overdue tasks must preserve their original dates');
     assert.equal(data.tasks.find(t=>t.id==='alldaydone').done,true);
     assert.equal(data.tasks.find(t=>t.id==='laterstart').startDate,date,'the browser and peer must retain the later start time');
     assert.equal(data.inboxError,undefined,'historical record count must not warn or expand the current task window');
     assert.equal((await call('alice','/api/ticktick/complete',{projectId:'inbox-alice',taskId:'one',ownerId:'bob'})).status,403);
     assert.equal((await call('alice','/api/ticktick/complete',{projectId:'inbox-alice',taskId:'one'})).status,204);
+    assert.equal((await call('alice','/api/ticktick/complete',{projectId:'inbox-alice',taskId:'overdue'})).status,204);
     // Remove the external history: a fresh device must still read our saved check.
-    const external=JSON.parse(await readFile(path.join(dir,'fake-dida.json'),'utf8'));delete external.alice.one;await writeFile(path.join(dir,'fake-dida.json'),JSON.stringify(external));
+    const external=JSON.parse(await readFile(path.join(dir,'fake-dida.json'),'utf8'));delete external.alice.one;delete external.alice.overdue;await writeFile(path.join(dir,'fake-dida.json'),JSON.stringify(external));
     data=await (await call('alice',tasksUrl)).json();assert.equal(data.tasks.find(t=>t.id==='one').done,true);assert.equal(data.tasks.find(t=>t.id==='one').completedDay,window.day);
+    assert.equal(data.tasks.find(t=>t.id==='overdue').done,true);assert.equal(data.tasks.find(t=>t.id==='overdue').completedDay,window.day);
     assert.deepEqual((await (await call('bob',tasksUrl)).json()).tasks,[]);
     assert.equal((await call('alice','/api/room/todo',{note:'随手记'},'PATCH')).status,200);
     let profile=await (await call('bob','/api/room/classroom')).json();assert.equal(profile.members.find(m=>m.id==='alice').todoNote,'随手记');assert.equal(profile.members.find(m=>m.id==='bob').todoNote,'');

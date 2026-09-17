@@ -15,12 +15,12 @@ test('room todo uses the current Shanghai 06:00-to-06:00 window', () => {
   assert.deepEqual(classroomTodoWindow(now + 12*3600000), classroomTodoWindow(now));
   assert.equal(classroomTodoWindow(new Date('2026-09-10T22:00:00Z')).day,'2026-09-11');
 });
-test('todo includes current-window completed and pending tasks regardless of the current time', () => {
-  const tasks = [task('overdue','2026-09-01T12:00:00+08:00'),task('previous','2026-09-10',false,{isAllDay:true}),task('window-done','2026-09-11T06:00:00+08:00',true),task('older-done','2026-09-11T05:59:59+08:00',true,{completedDay:'2026-09-11'}),task('today','2026-09-11',false,{isAllDay:true}),task('today-done','2026-09-11',true,{isAllDay:true}),task('boundary','2026-09-11T06:00:00+08:00'),task('end-minus-one','2026-09-12T05:59:59.999+08:00'),task('next','2026-09-12T06:00:00+08:00'),task('undated',undefined),task('undated-done',undefined,true,{completedDay:'2026-09-11'})];
-  const expected=['window-done','today','today-done','boundary','end-minus-one'];
+test('todo includes current-window tasks and carries overdue unfinished tasks into following days', () => {
+  const tasks = [task('overdue','2026-09-01T12:00:00+08:00'),task('previous','2026-09-10',false,{isAllDay:true}),task('window-done','2026-09-11T06:00:00+08:00',true),task('older-done','2026-09-11T05:59:59+08:00',true,{completedDay:'2026-09-10'}),task('today','2026-09-11',false,{isAllDay:true}),task('today-done','2026-09-11',true,{isAllDay:true}),task('boundary','2026-09-11T06:00:00+08:00'),task('end-minus-one','2026-09-12T05:59:59.999+08:00'),task('next','2026-09-12T06:00:00+08:00'),task('undated',undefined),task('undated-done',undefined,true,{completedDay:'2026-09-11'})];
+  const expected=['overdue','previous','window-done','today','today-done','boundary','end-minus-one'];
   assert.deepEqual(classroomTodoTasks(tasks,now).map(t=>t.id),expected);
   assert.deepEqual(classroomTodoTasks(tasks,now+12*3600000).map(t=>t.id),expected);
-  assert.deepEqual(classroomTodoTasks(tasks,now+86400000).map(t=>t.id),['next']);
+  assert.deepEqual(classroomTodoTasks(tasks,now+86400000).map(t=>t.id),['overdue','previous','today','boundary','end-minus-one','next']);
   assert.ok(classroomTodoTasks(tasks,now+1).some(t=>t.id==='boundary'));
 });
 test('all-day tasks end at midnight of the last six oclock day and switch only at six', () => {
@@ -37,9 +37,9 @@ test('all-day tasks end at midnight of the last six oclock day and switch only a
   for (const time of ['2026-09-11T00:00:00+0800', '2026-09-11T05:59:59.999+0800']) {
     assert.deepEqual(classroomTodoTasks(tasks, Date.parse(time)).map(t => t.id), ['previous', 'early']);
   }
-  assert.deepEqual(classroomTodoTasks(tasks, now).map(t => t.id), ['today', 'today-done', 'six']);
-  assert.deepEqual(classroomTodoTasks(tasks, Date.parse('2026-09-12T00:00:00+0800')).map(t => t.id), ['today', 'today-done', 'six']);
-  assert.deepEqual(classroomTodoTasks(tasks, Date.parse('2026-09-12T06:00:00+0800')).map(t => t.id), ['next']);
+  assert.deepEqual(classroomTodoTasks(tasks, now).map(t => t.id), ['previous', 'today', 'today-done', 'early', 'six']);
+  assert.deepEqual(classroomTodoTasks(tasks, Date.parse('2026-09-12T00:00:00+0800')).map(t => t.id), ['previous', 'today', 'today-done', 'early', 'six']);
+  assert.deepEqual(classroomTodoTasks(tasks, Date.parse('2026-09-12T06:00:00+0800')).map(t => t.id), ['previous', 'today', 'next', 'early', 'six']);
 });
 
 test('all-day UTC timestamps match the same Shanghai date as local timestamps and date-only tasks', () => {
@@ -52,7 +52,18 @@ test('all-day UTC timestamps match the same Shanghai date as local timestamps an
   assert.equal(classroomTodoTasks(tasks, now).length, 6);
   assert.equal(classroomTodoTasks(tasks, Date.parse('2026-09-12T02:00:00+0800')).length, 6);
   assert.equal(classroomTodoTasks(tasks, now - 1).length, 0);
-  assert.equal(classroomTodoTasks(tasks, now + 86400000).length, 0);
+  assert.deepEqual(classroomTodoTasks(tasks, now + 86400000).map(t => t.id), ['end-0', 'end-1', 'end-2']);
+});
+
+test('overdue completions stay only for their completion day without reviving older or undated history', () => {
+  const checked = task('checked', '2026-09-01', true, { isAllDay: true, completedDay: '2026-09-11' });
+  const tasks = [checked, task('old', '2026-09-01', true, { completedDay: '2026-09-10' }), task('unknown', '2026-09-01', true), task('undated', undefined, true, { completedDay: '2026-09-11' }), task('invalid', 'invalid', false), task('start-only', undefined, false, { startDate: '2026-09-01T16:00:00Z', isAllDay: true })];
+  assert.deepEqual(classroomTodoTasks(tasks, now).map(t => t.id), ['checked', 'start-only']);
+  assert.deepEqual(mergeTodoSnapshot([checked], [], now + 86400000 - 1), [checked]);
+  assert.deepEqual(mergeTodoSnapshot([checked], [], now + 86400000), []);
+  assert.deepEqual(mergeTodoSnapshot([checked], [{ ...checked, done: false, completedDay: undefined }], now), [checked]);
+  const nextOccurrence = { ...checked, dueDate: '2026-09-11', done: false, completedDay: undefined };
+  assert.deepEqual(mergeTodoSnapshot([checked], [nextOccurrence], now), [nextOccurrence]);
 });
 
 test('timed tasks use the later valid start or end including reversed dates and timezone offsets', () => {
@@ -83,7 +94,7 @@ test('checks stay for the completion day after refresh, and leave at the next si
 test('completion snapshots are durable, concurrent member writes stay independent',async()=>{
   const root=path.resolve('codex-generated/classroom-todo-tests'); await mkdir(root,{recursive:true});
   const dir=await mkdtemp(path.join(root,'case-')), store=createTodoStore(dir);
-  const a=task('same','2026-09-11'), b=task('same','2026-09-11T08:00:00+08:00');
+  const a=task('same','2026-09-01'), b=task('same','2026-09-11T08:00:00+08:00');
   await Promise.all([store.reconcile('alice',[a],now),store.reconcile('bob',[b],now)]);
   await store.complete('alice','same',now);
   const loaded=createTodoStore(dir);
