@@ -250,7 +250,17 @@ test('lightweight revisions expose current execution attention without reading D
     view = await f.store.revision(actor); assert.equal(taskboardAttentionCount(view.attentionWorkflows, view.notices), 1);
   }
   w = await act(f, w, 'alice', 'reject', { comment: 'needs revision' });
-  view = await f.store.revision('bob'); assert.equal(taskboardAttentionCount(view.attentionWorkflows, view.notices), 0);
+  view = await f.store.revision('bob'); assert.equal(taskboardAttentionCount(view.attentionWorkflows, view.notices, 'bob'), 1);
+  const rejection = view.notices.find(notice => notice.eventType === 'reject');
+  await assert.rejects(f.store.dismissRejection('alice', rejection.id), { status: 403 });
+  const dismissed = await f.store.dismissRejection('bob', rejection.id);
+  assert.equal(dismissed.notices.find(notice => notice.id === rejection.id).rejection.dismissed, true);
+  assert.equal((await f.store.dismissRejection('bob', rejection.id)).noticeVersion, dismissed.noticeVersion, 'closing twice is idempotent');
+  f.store = new CollaborationStore(f.dir, f.gateway);
+  view = await f.store.revision('bob');
+  assert.equal(view.notices.find(notice => notice.id === rejection.id).rejection.dismissed, true, 'dismissal survives restart');
+  assert.equal(taskboardAttentionCount(view.attentionWorkflows, view.notices, 'bob'), 1, 'closing popup does not read task details');
+  await f.store.markNoticesRead('bob', [rejection.id]);
   await arrange(f, 'bob', []);
   view = await f.store.revision('bob');
   assert.equal(view.attentionWorkflows[0].executing, false);

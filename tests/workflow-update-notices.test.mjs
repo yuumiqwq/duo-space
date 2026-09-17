@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { activeTaskNotice, collectTaskNotices, initializeTaskNotices, unreadTaskNotices, workflowEventPresentation } from '../app/collaboration-notifications.ts';
+import { activeTaskNotice, collectTaskNotices, initializeTaskNotices, nextTaskPrompt, unreadTaskNotices, workflowEventPresentation } from '../app/collaboration-notifications.ts';
 
 test('workflow edits and replies increase unread counts without requiring pending approval', () => {
   const workflow = { id: 'work', title: '任务', status: 'working', source: { ownerId: 'alice' }, reviewerId: 'alice', claimantId: 'bob', events: [] };
@@ -64,4 +64,38 @@ test('error notices reach the originating actor separately and become inactive o
   assert.equal(activeTaskNotice(source, notice), false);
   workflow.syncIssue = { id: 'next', at: 3, recipientId: 'alice', message: '再次失败' }; collectTaskNotices(source);
   assert.equal(unreadTaskNotices(source, 'alice').length, 1);
+});
+
+test('rejection popup includes its full event, is claimant-only, and dismissal is separate from detail reading', () => {
+  const workflow = { id: 'work', title: '任务', status: 'rejected', source: { ownerId: 'alice' }, reviewerId: 'alice', claimantId: 'bob', events: [] };
+  const source = { buffer: {}, workflows: { work: workflow } };
+  initializeTaskNotices(source);
+  const comment = '完整评语\n' + '需要补充的证明内容。'.repeat(80);
+  const files = [{ id: 'proof', name: '证明.png', url: '/api/room/tasks/files/proof', size: 10 }];
+  workflow.events.push({ id: 'reject-1', type: 'reject', actorId: 'alice', at: 1, comment, files });
+  collectTaskNotices(source);
+  const notice = nextTaskPrompt(unreadTaskNotices(source, 'bob'), 'bob');
+  assert.equal(notice.rejection.comment, comment); assert.deepEqual(notice.rejection.files, files);
+  assert.ok(notice.body.length < comment.length);
+  assert.equal(source.notifications.entries[0].rejection, undefined, 'do not duplicate full review materials in notification storage');
+  for (const actor of ['alice', 'other']) assert.equal(nextTaskPrompt(unreadTaskNotices(source, actor), actor), null);
+  source.notifications.dismissedRejections = { bob: [notice.id] };
+  let unread = unreadTaskNotices(JSON.parse(JSON.stringify(source)), 'bob');
+  assert.equal(unread.length, 1); assert.equal(unread[0].rejection.dismissed, true);
+  assert.equal(nextTaskPrompt(unread, 'bob', notice), null, 'popup remains closed after restart but the detail is still unread');
+  source.notifications.read.bob = [notice.id];
+  assert.equal(unreadTaskNotices(source, 'bob').length, 0);
+  workflow.events.push({ id: 'reject-2', type: 'reject', actorId: 'alice', at: 2, comment: '', files: [] });
+  collectTaskNotices(source); unread = unreadTaskNotices(source, 'bob');
+  assert.equal(nextTaskPrompt(unread, 'bob').eventId, 'reject-2', 'a later rejection opens again, even without optional materials');
+  assert.deepEqual(workflow.events[0].files, files); assert.equal(workflow.events[0].comment, comment, 'reading never removes the historical review');
+});
+
+test('task popup queue keeps its current item and advances after that notice is acknowledged', () => {
+  const nudge = { id: 'nudge', kind: 'workflow', eventType: 'nudge', actorId: 'alice', recipients: ['bob'] };
+  const rejected = { id: 'reject', kind: 'workflow', eventType: 'reject', actorId: 'alice', recipients: ['bob'], rejection: { claimantId: 'bob', dismissed: false, comment: '', files: [] } };
+  assert.equal(nextTaskPrompt([rejected, nudge], 'bob', nudge), nudge);
+  assert.equal(nextTaskPrompt([rejected], 'bob', nudge), rejected);
+  assert.equal(nextTaskPrompt([nudge, { ...rejected, rejection: { ...rejected.rejection, dismissed: true } }], 'bob', rejected), nudge);
+  assert.equal(nextTaskPrompt([], 'bob', rejected), null);
 });

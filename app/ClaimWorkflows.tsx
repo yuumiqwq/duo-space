@@ -74,9 +74,9 @@ function WorkflowDetail({ workflow, identityId, name, busy, uncertain, error, pe
   useEffect(() => { active.current = true; return () => { active.current = false; }; }, []);
   useEffect(() => {
     if (!onRead) return;
-    const ids = notices.filter(item => item.workflowId === workflow.id && item.kind === 'workflow').map(item => item.id);
+    const ids = notices.filter(item => (item.workflowId === workflow.id && item.kind === 'workflow') || (item.kind === 'public' && workflow.source.ownerId === null && item.taskId === workflow.source.taskId)).map(item => item.id);
     if (ids.length) return watchWorkflowVisit(() => onRead(ids));
-  }, [workflow.id, notices, onRead]);
+  }, [workflow.id, workflow.source, notices, onRead]);
   const submit = isExecuting(workflow) && workflow.claimantId === identityId && ["working", "rejected"].includes(workflow.status);
   const review = workflow.reviewerId === identityId && workflow.status === "submitted";
   const synchronizing = workflow.ownerDeletePending || workflow.reopenPending || workflow.editPending || ['creating', 'approving'].includes(workflow.status);

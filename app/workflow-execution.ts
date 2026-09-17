@@ -1,4 +1,4 @@
-import type { ClaimWorkflow } from './collaboration-types';
+import type { ClaimWorkflow, RoomTask } from './collaboration-types';
 import { isWorkflowSettingsNotice, type TaskNotice } from './collaboration-notifications.ts';
 
 export const EXECUTION_LIMIT = 3;
@@ -21,6 +21,10 @@ function attentionTasks<T extends ExecutionState & Pick<ClaimWorkflow, 'id'>>(wo
 export function claimantSettingsNotices(workflow: (ExecutionState & Pick<ClaimWorkflow, 'id' | 'claimantId'>) | undefined, notices: TaskNotice[], identityId: string): string[] {
   if (!workflow || workflow.claimantId !== identityId || workflow.ownerDeletePending || ['done', 'deleted'].includes(workflow.status)) return [];
   return notices.filter(notice => notice.workflowId === workflow.id && isWorkflowSettingsNotice(notice) && !!notice.actorId && notice.actorId !== identityId && (!notice.recipients || notice.recipients.includes(identityId))).map(notice => notice.id);
+}
+export function taskCardNotices(task: Pick<RoomTask, 'id' | 'ownerId'>, workflow: WorkflowAttention | undefined, notices: TaskNotice[], identityId: string): string[] {
+  const publicId = workflow ? workflow.source.ownerId === null ? workflow.source.taskId : undefined : task.ownerId === null ? task.id : undefined;
+  return [...new Set([...notices.filter(notice => notice.kind === 'public' && !!publicId && notice.taskId === publicId).map(notice => notice.id), ...claimantSettingsNotices(workflow, notices, identityId)])];
 }
 export function workflowAttentionCount(workflows: (ExecutionState & Pick<ClaimWorkflow, 'id'>)[]): number {
   return workflows.filter(executionReserved).length;

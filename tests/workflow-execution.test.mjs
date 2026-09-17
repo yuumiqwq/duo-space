@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { claimantSettingsNotices, executionGroups, executionIds, toggleExecution, workflowGroups, workflowAttentionCount, taskboardAttentionCount } from '../app/workflow-execution.ts';
+import { claimantSettingsNotices, taskCardNotices, executionGroups, executionIds, toggleExecution, workflowGroups, workflowAttentionCount, taskboardAttentionCount } from '../app/workflow-execution.ts';
 
 const workflow = (id, claimantId, status, executing = false, priority = 0, createdAt = 1) => ({ id, claimantId, reviewerId: claimantId === 'alice' ? 'bob' : 'alice', status, executing, fields: { priority }, createdAt });
 const ids = group => group.workflows.map(item => item.id);
@@ -31,16 +31,27 @@ test('claimant edit dots include unarranged tasks, exclude own edits and disappe
     { id: 'reject', workflowId: claimed.id, kind: 'workflow', eventType: 'reject', actorId: 'bob' },
     { id: 'failure', workflowId: claimed.id, kind: 'sync-error', actorId: '' },
   ];
-  assert.deepEqual(claimantSettingsNotices(claimed, notices, 'alice'), ['other-edit', 'third-edit']);
+  assert.deepEqual(claimantSettingsNotices(claimed, notices, 'alice'), ['other-edit', 'third-edit', 'reject']);
   assert.deepEqual(claimantSettingsNotices(claimed, notices, 'bob'), []);
   assert.equal(taskboardAttentionCount([claimed], notices, 'alice'), 1, 'several edits count as one task without an execution slot');
   assert.equal(taskboardAttentionCount([claimed], notices, 'bob'), 0);
   assert.equal(workflowAttentionCount([claimed]), 0);
-  const read = notices.filter(notice => !['other-edit', 'third-edit'].includes(notice.id));
+  const read = notices.filter(notice => !['other-edit', 'third-edit', 'reject'].includes(notice.id));
   assert.deepEqual(claimantSettingsNotices(claimed, read, 'alice'), []);
   assert.equal(taskboardAttentionCount([claimed], read, 'alice'), 0);
   assert.equal(taskboardAttentionCount([{ ...claimed, status: 'submitted', executing: true }], notices, 'alice'), 1, 'pending review and a dot share one count');
   for (const status of ['done', 'deleted']) assert.deepEqual(claimantSettingsNotices({ ...claimed, status }, notices, 'alice'), []);
+});
+
+test('public notes and member cards share update and rejection dots with one task count', () => {
+  const claimed = { ...workflow('work', 'bob', 'rejected', true), source: { ownerId: null, taskId: 'public' } };
+  const card = { id: 'copy', ownerId: 'bob' }, note = { id: 'public', ownerId: null };
+  const notices = [{ id: 'new', kind: 'public', taskId: 'public' }, { id: 'reject', kind: 'workflow', eventType: 'reject', workflowId: 'work', actorId: 'alice', rejection: { claimantId: 'bob', dismissed: true } }];
+  assert.deepEqual(taskCardNotices(card, claimed, notices, 'bob'), ['new', 'reject']);
+  assert.deepEqual(taskCardNotices(note, claimed, notices, 'bob'), ['new', 'reject']);
+  assert.equal(taskboardAttentionCount([claimed], notices, 'bob'), 1);
+  assert.equal(workflowAttentionCount([claimed]), 0);
+  for (const task of [card, note]) assert.deepEqual(taskCardNotices(task, claimed, [], 'bob'), []);
 });
 
 test('workflow overview shows only execution slots by claimant, pinning review before priority and recency', () => {

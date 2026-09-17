@@ -1,8 +1,8 @@
 import type { ClaimWorkflow, WorkflowEvent, WorkflowSyncIssue } from "./collaboration-types";
 
-export type TaskNotice = { id: string; kind: "public" | "workflow" | "sync-error"; title: string; body: string; at: number; actorId: string; recipients?: string[]; taskId?: string; workflowId?: string; operationId?: string; eventId?: string; eventType?: string };
-export type TaskNoticeState = { version?: number; known: string[]; entries: TaskNotice[]; read: Record<string, string[]>; attempted: string[] };
-export const isWorkflowSettingsNotice = (notice: TaskNotice) => notice.kind === 'workflow' && ['updated', 'updating', 'update-replaced'].includes(notice.eventType || '');
+export type TaskNotice = { id: string; kind: "public" | "workflow" | "sync-error"; title: string; body: string; at: number; actorId: string; recipients?: string[]; taskId?: string; workflowId?: string; operationId?: string; eventId?: string; eventType?: string; rejection?: Pick<WorkflowEvent, 'comment' | 'files'> & { claimantId: string; dismissed: boolean } };
+export type TaskNoticeState = { version?: number; known: string[]; entries: TaskNotice[]; read: Record<string, string[]>; dismissedRejections?: Record<string, string[]>; attempted: string[] };
+export const isWorkflowSettingsNotice = (notice: TaskNotice) => notice.kind === 'workflow' && ['updated', 'updating', 'update-replaced', 'reject'].includes(notice.eventType || '');
 type NoticeSource = { buffer: Record<string, { fields: { title: string }; publisherId?: string; stagedBy?: string; completedAt?: number }>; workflows: Record<string, ClaimWorkflow>; operations?: Record<string, { title: string; syncIssue?: WorkflowSyncIssue }>; notifications?: TaskNoticeState };
 export const silentWorkflowEvent = (type?: string) => ["external-claimant-check", "external-task-reopened", "task-relocated", "task-anomaly"].includes(type || "");
 export function workflowEventPresentation(event: WorkflowEvent, pendingSummary?: string): WorkflowEvent {
@@ -44,8 +44,22 @@ export const activeTaskNotice = (source: NoticeSource, notice: TaskNotice) => no
   ? notice.id === `sync-error:operation:${notice.operationId}:${source.operations?.[notice.operationId]?.syncIssue?.id}`
   : notice.id === `sync-error:${notice.workflowId}:${source.workflows[notice.workflowId!]?.syncIssue?.id}`);
 export const receivesTaskNotice = (notice: TaskNotice, actor: string) => !silentWorkflowEvent(notice.eventType) && notice.actorId !== actor && (!notice.recipients || notice.recipients.includes(actor));
+// Use one modal slot for nudges and rejections, retaining the current notice
+// until it is acknowledged, including an acknowledgement from another device.
+export function nextTaskPrompt(notices: TaskNotice[], actor: string, current: TaskNotice | null = null): TaskNotice | null {
+  const prompts = notices.filter(notice => notice.kind === 'workflow' && receivesTaskNotice(notice, actor) &&
+    (notice.eventType === 'nudge' || (notice.eventType === 'reject' && notice.rejection?.claimantId === actor && !notice.rejection.dismissed)));
+  return prompts.find(notice => notice.id === current?.id) || prompts[0] || null;
+}
 export function unreadTaskNotices(source: NoticeSource, actor: string): TaskNotice[] {
   const notices = initializeTaskNotices(source), seen = new Set(notices.read[actor] || []);
   const current = new Map(available(source).map(item => [item.id, item]));
-  return notices.entries.filter(item => item.eventType !== "completed" && activeTaskNotice(source, item) && receivesTaskNotice(item, actor) && !seen.has(item.id) && (item.kind !== "public" || (source.buffer[item.taskId!] && !source.buffer[item.taskId!].completedAt))).map(item => current.get(item.id) || item);
+  return notices.entries.filter(item => item.eventType !== "completed" && activeTaskNotice(source, item) && receivesTaskNotice(item, actor) && !seen.has(item.id) && (item.kind !== "public" || (source.buffer[item.taskId!] && !source.buffer[item.taskId!].completedAt))).map(item => {
+    const notice = current.get(item.id) || item;
+    const workflow = notice.workflowId && source.workflows[notice.workflowId];
+    const event = notice.kind === 'workflow' && notice.eventType === 'reject' && workflow && workflow.claimantId === actor && workflow.events.find(event => event.id === notice.eventId && event.type === 'reject');
+    // The full comment and attachments come from the immutable event, not the
+    // truncated push summary, and are not copied into persisted notice records.
+    return event ? { ...notice, rejection: { claimantId: actor, comment: event.comment, files: event.files, dismissed: !!notices.dismissedRejections?.[actor]?.includes(notice.id) } } : notice;
+  });
 }

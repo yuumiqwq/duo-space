@@ -394,6 +394,19 @@ export class CollaborationStore {
       return { notices: unreadTaskNotices(state, actor), noticeVersion: notices.version || 0 };
     });
   }
+  dismissRejection(actor: string, id: unknown) {
+    return this.serial(async () => {
+      await this.requireMember(actor);
+      if (typeof id !== 'string' || !id || id.length > 200) throw new CollaborationError('浏览记录参数无效', 400);
+      const state = await this.read(), notices = initializeTaskNotices(state);
+      const notice = notices.entries.find(item => item.id === id && item.kind === 'workflow' && item.eventType === 'reject' && receivesTaskNotice(item, actor));
+      if (!notice?.workflowId || state.workflows[notice.workflowId]?.claimantId !== actor) throw new CollaborationError('当前账号不能操作此提醒', 403);
+      notices.dismissedRejections ||= {};
+      const dismissed = notices.dismissedRejections[actor] ||= [];
+      if (!dismissed.includes(id)) { dismissed.push(id); notices.version = (notices.version || 0) + 1; await this.write(state); }
+      return { notices: unreadTaskNotices(state, actor), noticeVersion: notices.version || 0 };
+    });
+  }
   async deliverNotices() {
     if (!this.gateway.notify) return;
     const items = await this.serial(async () => {

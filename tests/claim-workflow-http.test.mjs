@@ -128,6 +128,16 @@ test('claim workflow HTTP covers actual routes, sidebar guard, file streaming, r
     assert.equal((await act('bob', 'approve')).status, 403);
     response = await upload('alice', '补充证明'); assert.equal(response.status, 200); const reviewFile = (await response.json()).file;
     response = await act('alice', 'reject', { attachments: [reviewFile.id], comment: '请补充证明' }); w = (await response.json()).workflow; assert.equal(w.status, 'rejected');
+    const rejection = (await (await call('bob', '/api/room/tasks?revision=1')).json()).notices.find(notice => notice.eventType === 'reject');
+    assert.equal(rejection.rejection.comment, '请补充证明'); assert.equal(rejection.rejection.files[0].id, reviewFile.id);
+    assert.equal((await call('alice', '/api/room/tasks', { action: 'dismiss-rejection', noticeId: rejection.id })).status, 403);
+    assert.equal((await call('bob', '/api/room/tasks', { action: 'dismiss-rejection', noticeId: rejection.id }, { Origin: 'https://foreign.example' })).status, 403);
+    const dismissed = await (await call('bob', '/api/room/tasks', { action: 'dismiss-rejection', noticeId: rejection.id })).json();
+    assert.equal(dismissed.notices.find(notice => notice.id === rejection.id).rejection.dismissed, true);
+    await call('bob', '/api/room/tasks', { action: 'read-notices', ids: [rejection.id] });
+    assert.ok(!(await (await call('bob', '/api/room/tasks?revision=1')).json()).notices.some(notice => notice.id === rejection.id));
+    const viewed = (await (await call('bob', '/api/room/tasks?local=1')).json()).workflows.find(item => item.id === w.id).events.find(event => event.type === 'reject');
+    assert.equal(viewed.comment, '请补充证明'); assert.equal(viewed.files[0].id, reviewFile.id);
     assert.equal((await call('bob', reviewFile.url)).status, 200);
     const state = JSON.parse(await readFile(path.join(dir, 'fake-dida.json'), 'utf8')); assert.ok(!state.alice.original.status); assert.equal(state.bob[w.targetId].status, 2, 'rejection does not reopen Dida tasks');
     const count = (await readdir(path.join(dir, 'workflow-files'))).length;
