@@ -30,6 +30,7 @@ export const normalizeBoardText = (value: unknown): BoardText | null => {
     x: Math.max(0, Math.min(1200, item.x)), y: Math.max(0, Math.min(720, item.y)),
     width: Math.max(80, Math.min(1200, item.width)), height: Math.max(40, Math.min(720, item.height)),
     color: item.color, fontSize: typeof item.fontSize === "number" ? Math.max(10, Math.min(96, item.fontSize)) : 20,
+    ...(typeof item.autoWidth === 'boolean' ? { autoWidth: item.autoWidth } : {}),
     ...(item.material === "chalk-v1" ? { material: "chalk-v1" as const } : {}),
     confirmed: item.confirmed !== false, updatedAt: typeof item.updatedAt === "number" && Number.isFinite(item.updatedAt) ? item.updatedAt : 0,
     revision: typeof item.revision === "string" ? item.revision.slice(0, 120) : `${String(typeof item.updatedAt === "number" ? item.updatedAt : 0).padStart(13, "0")}:${item.id}`,

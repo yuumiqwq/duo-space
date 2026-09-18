@@ -8,7 +8,7 @@ import { BOARD_TEXT_PADDING_X, BOARD_TEXT_PADDING_Y, BOARD_TEXT_LINE_HEIGHT, fit
 
 export type BoardPoint = { x: number; y: number };
 export type BoardStroke = { id: string; color: string; width: number; points: BoardPoint[]; createdAt: number; revision: string; tool?: "pen" | "erase"; material?: "chalk-v1" };
-export type BoardText = { id: string; text: string; x: number; y: number; width: number; height: number; color: string; fontSize: number; confirmed: boolean; updatedAt: number; revision: string; material?: "chalk-v1" };
+export type BoardText = { id: string; text: string; x: number; y: number; width: number; height: number; color: string; fontSize: number; confirmed: boolean; updatedAt: number; revision: string; material?: "chalk-v1"; autoWidth?: boolean };
 export type RoomBoard = { id: string; name: string; strokes: BoardStroke[]; texts: BoardText[]; deletedStrokeIds: string[]; deletedTextIds: string[]; epoch: string; createdAt: number };
 
 const BOARD_WIDTH = 1200;
@@ -157,9 +157,13 @@ export function Whiteboard({ board, fullscreen, onToggleFullscreen, onDelete, on
     event.preventDefault();
     const point = pointerPoint(event);
     if (tool === "text") {
-      const text: BoardText = { id: crypto.randomUUID(), text: "", x: Math.min(point.x, BOARD_WIDTH - 280), y: Math.min(point.y, BOARD_HEIGHT - 92), width: 280, height: 92, color, fontSize: 36, confirmed: false, updatedAt: Date.now(), revision: makeBoardRevision(), material: "chalk-v1" };
+      const fontSize = 36;
+      const width = Math.ceil(fontSize * (3 + 2 * BOARD_TEXT_PADDING_X));
+      const height = Math.ceil(fontSize * (BOARD_TEXT_LINE_HEIGHT + 2 * BOARD_TEXT_PADDING_Y));
+      const text: BoardText = { id: crypto.randomUUID(), text: "", x: Math.min(point.x, BOARD_WIDTH - width), y: Math.min(point.y, BOARD_HEIGHT - height), width, height, color, fontSize, confirmed: false, updatedAt: Date.now(), revision: makeBoardRevision(), material: "chalk-v1", autoWidth: true };
+      const ctx = textCanvasRef.current?.getContext('2d');
       setEditingTextId(text.id);
-      onUpsertText(text, board.epoch);
+      onUpsertText(ctx ? fitBoardText(ctx, text) : text, board.epoch);
       return;
     }
     activePointerRef.current = event.pointerId;
@@ -245,7 +249,7 @@ export function Whiteboard({ board, fullscreen, onToggleFullscreen, onDelete, on
     const rect = paperRef.current?.getBoundingClientRect();
     if (!gesture || gesture.pointerId !== event.pointerId || !rect) return;
     const current = board.texts.find(item => item.id === gesture.text.id);
-    if (current) updateText(current, resizeTextGeometry(gesture.text, gesture.handle, (event.clientX - gesture.x) * BOARD_WIDTH / rect.width, (event.clientY - gesture.y) * BOARD_HEIGHT / rect.height));
+    if (current) updateText(current, { ...resizeTextGeometry(gesture.text, gesture.handle, (event.clientX - gesture.x) * BOARD_WIDTH / rect.width, (event.clientY - gesture.y) * BOARD_HEIGHT / rect.height), ...(['e', 'w'].includes(gesture.handle) ? { autoWidth: false } : {}) });
   };
   const finishResize = (event: React.PointerEvent<HTMLButtonElement>) => {
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);

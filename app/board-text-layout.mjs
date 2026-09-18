@@ -34,8 +34,9 @@ export function measureBoardText(ctx, item) {
 }
 
 /**
- * Grow only overflowing dimensions. Side handles can still set wrapping width.
- * @template {{text:string, x:number, y:number, width:number, height:number, fontSize:number, material?:string}} T
+ * New boxes grow horizontally until the board edge; a chosen wrapping width
+ * and legacy boxes retain their width. Never shrink dimensions while typing.
+ * @template {{text:string, x:number, y:number, width:number, height:number, fontSize:number, material?:string, autoWidth?:boolean}} T
  * @param {CanvasRenderingContext2D} ctx @param {T} item
  * @returns {T}
  */
@@ -43,6 +44,11 @@ export function fitBoardText(ctx, item) {
   ctx.font = boardTextFont(item);
   const widestGlyph = Math.max(0, ...Array.from(item.text, char => ctx.measureText(char).width));
   let width = Math.min(1200, Math.max(item.width, Math.ceil(widestGlyph + 2 * item.fontSize * BOARD_TEXT_PADDING_X)));
+  if (item.autoWidth) {
+    const longestLine = Math.max(...item.text.replace(/\r\n?/g, '\n').split('\n').map(line => ctx.measureText(line.replace(/\t/g, '    ')).width));
+    const naturalWidth = Math.ceil(longestLine + 2 * item.fontSize * BOARD_TEXT_PADDING_X);
+    width = Math.max(width, Math.min(naturalWidth, 1200 - item.x));
+  }
   // When wrapping would exceed the whole board height, use horizontal space too.
   if (measureBoardText(ctx, { ...item, width }).height > 720 && width < 1200) {
     let low = Math.ceil(width), high = 1200;
