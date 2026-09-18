@@ -52,7 +52,9 @@ export function savePushSubscription(subscription: StoredPushSubscription) {
     const index = store.subscriptions.findIndex((item) => item.endpoint === subscription.endpoint);
     if (index >= 0) store.subscriptions[index] = subscription;
     else store.subscriptions.push(subscription);
-    store.subscriptions = store.subscriptions.filter((item) => item.updatedAt >= Date.now() - 180 * 24 * 60 * 60 * 1000);
+    store.subscriptions = store.subscriptions.filter((item) =>
+      item.updatedAt >= Date.now() - 180 * 24 * 60 * 60 * 1000
+      && (item.endpoint === subscription.endpoint || item.identityId !== subscription.identityId || item.deviceId !== subscription.deviceId));
   });
 }
 

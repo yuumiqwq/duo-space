@@ -20,7 +20,7 @@ test('task push reuses subscription devices, excludes unrelated recipients and c
     await writeFile(path.join(dir, 'push-subscriptions.json'), JSON.stringify({ version: 1, subscriptions }));
     webPush.sendNotification = async (subscription, payload, options) => { deliveries.push({ endpoint: subscription.endpoint, data: JSON.parse(payload), options }); if (subscription.endpoint.endsWith('/expired')) throw { statusCode: 410 }; return { statusCode: 201 }; };
     const output = path.join(dir, 'push.mjs'); await build({ entryPoints: ['app/api/push/store.ts'], bundle: true, packages: 'external', platform: 'node', format: 'esm', outfile: output, logLevel: 'silent' });
-    const { sendTaskPush, sendDeviceTestPush, sendChatPush } = await import(pathToFileURL(output).href);
+    const { sendTaskPush, sendDeviceTestPush, sendChatPush, savePushSubscription } = await import(pathToFileURL(output).href);
     assert.equal((await sendDeviceTestPush('alice', 'https://push.example/bob')).status, 404);
     assert.equal(deliveries.length, 0, 'a user cannot test another identity endpoint');
     assert.equal((await sendDeviceTestPush('bob', 'https://push.example/bob')).status, 200);
@@ -40,6 +40,11 @@ test('task push reuses subscription devices, excludes unrelated recipients and c
     assert.deepEqual(deliveries.map(item => item.endpoint), ['https://push.example/bob', 'https://push.example/charlie']);
     assert.equal(deliveries[0].data.kind, 'chat');
     assert.ok(Buffer.byteLength(JSON.stringify(deliveries[0].data)) < 3993);
+    await savePushSubscription({ ...subscriptions[1], endpoint: 'https://push.example/bob-renewed' });
+    const saved = JSON.parse(await readFile(path.join(dir, 'push-subscriptions.json'), 'utf8')).subscriptions;
+    assert.equal(saved.filter(item => item.identityId === 'bob' && item.deviceId === 'bob-device').length, 1);
+    assert.ok(saved.some(item => item.endpoint === 'https://push.example/bob-renewed'));
+    assert.ok(saved.some(item => item.identityId === 'alice'), 'renewal must retain other devices');
   } finally {
     webPush.sendNotification = send;
     for (const [key, value] of Object.entries(env)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
