@@ -98,8 +98,10 @@ test('background chat pushes display without a page or fetch, preserve different
   windows = [{ postMessage: data => received.push(data) }];
   await push('second');
   await push('second');
-  assert.deepEqual(shown.map(item => item.tag), ['11scat-chat-first', '11scat-chat-second']);
-  assert.equal(received.length, 1);
+  assert.deepEqual(shown.map(item => item.tag), ['11scat-chat-first', '11scat-chat-second', '11scat-chat-second']);
+  assert.equal(shown.at(-1).silent, true);
+  assert.equal(shown.at(-1).renotify, false);
+  assert.equal(received.length, 2);
   assert.equal(received[0].type, 'chat-updated');
 });
 
@@ -133,7 +135,8 @@ test('an existing browser subscription is restored on the server, and a rejected
     useEffect: effect => { cleanup = effect(); },
     crypto: { randomUUID: () => 'device-1' },
     document: { visibilityState: 'visible', addEventListener: (name, fn) => { listeners[name] = fn; }, removeEventListener: () => {} },
-    window: { PushManager: {}, localStorage: { getItem: () => 'device-1', setItem: () => {} }, addEventListener: (name, fn) => { listeners[name] = fn; }, removeEventListener: () => {} },
+    Notification: { permission: 'granted' },
+    window: { Notification: {}, PushManager: {}, localStorage: { getItem: () => 'device-1', setItem: () => {} }, addEventListener: (name, fn) => { listeners[name] = fn; }, removeEventListener: () => {} },
     navigator: { serviceWorker: { register: async () => ({ pushManager: { getSubscription: async () => ({ expirationTime: null, options: { applicationServerKey: new Uint8Array([1, 2, 3]).buffer }, toJSON: () => ({ endpoint: 'https://push.example/device-1' }) }) } }) } },
     fetch: async (url, options) => {
       if (url === '/api/push/public-key') return { ok: true, json: async () => ({ publicKey: 'AQID' }) };
@@ -154,6 +157,11 @@ test('an existing browser subscription is restored on the server, and a rejected
     context.document.visibilityState = 'visible';
     await listeners.visibilitychange();
     assert.equal(saved.length, 2);
+    assert.equal(states.at(-1), false);
+    ok = true;
+    context.Notification.permission = 'denied';
+    await listeners.visibilitychange();
+    assert.equal(saved.length, 2, 'revoked permission must not refresh a stale subscription');
     assert.equal(states.at(-1), false);
   } finally { cleanup?.(); }
 });

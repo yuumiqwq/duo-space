@@ -46,13 +46,17 @@ test('task push reuses subscription devices, excludes unrelated recipients and c
   }
 });
 
-test('service worker uses task event tags, vibration and duplicate suppression', async () => {
+test('service worker replaces duplicate task tags without silently dropping a push', async () => {
   const handlers = {}, shown = [];
   const self = { addEventListener: (name, callback) => { handlers[name] = callback; }, registration: { getNotifications: async ({ tag }) => shown.filter(item => item.options.tag === tag), showNotification: async (title, options) => shown.push({ title, options }) } };
   runInNewContext(await readFile('public/sw.js', 'utf8'), { self });
   const push = async data => { let done; handlers.push({ data: { json: () => data }, waitUntil: promise => { done = promise; } }); await done; };
   const notice = { kind: 'task', noticeId: 'event-1', title: '同桌催办', body: '请回复', url: '/?taskboard=1' };
   await push(notice); await push(notice); await push({ ...notice, noticeId: 'event-2' });
-  assert.equal(shown.length, 2); assert.equal(shown[0].options.tag, '11scat-task-event-1');
+  assert.equal(shown.length, 3); assert.equal(shown[0].options.tag, '11scat-task-event-1');
+  assert.equal(shown[1].options.tag, shown[0].options.tag);
+  assert.equal(shown[1].options.silent, true);
+  assert.equal(shown[1].options.renotify, false);
+  assert.equal(shown[1].options.vibrate, undefined);
   assert.deepEqual(Array.from(shown[0].options.vibrate), [200, 100, 200]); assert.equal(shown[0].options.data.url, '/?taskboard=1');
 });

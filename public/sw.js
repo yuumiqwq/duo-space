@@ -9,6 +9,7 @@ async function notificationsFor(tag) {
 self.addEventListener("push", (event) => {
   let data = {};
   try { data = event.data ? event.data.json() : {}; } catch { data = {}; }
+  if (!data || typeof data !== "object") data = {};
   const title = typeof data.title === "string" ? data.title : "11scat 新消息";
   const body = typeof data.body === "string" ? data.body : "自习室有一条新消息";
   const url = typeof data.url === "string" && data.url.startsWith("/") && !data.url.startsWith("//") && !data.url.includes("\\") ? data.url : "/";
@@ -16,39 +17,30 @@ self.addEventListener("push", (event) => {
     const ring = data.kind === "ring" && typeof data.ringId === "string";
     const task = data.kind === "task" && typeof data.noticeId === "string";
     const chat = data.kind === "chat" && typeof data.messageId === "string";
-    if (chat && (await notificationsFor(`11scat-chat-${data.messageId}`)).length) return;
-    if (task && (await notificationsFor(`11scat-task-${data.noticeId}`)).length) return;
-    if (ring) {
-      if (!Number.isFinite(data.expiresAt) || data.expiresAt <= Date.now()) return;
-      const existing = await notificationsFor(`11scat-ring-${data.ringId}`);
-      if (existing.some(notification => !data.repeat || (notification.data?.sequence || 0) >= (data.sequence || 1))) return;
-    }
+    const tag = ring ? `11scat-ring-${data.ringId}` : task ? `11scat-task-${data.noticeId}` : chat ? `11scat-chat-${data.messageId}` : "11scat-room-message";
+    const existing = await notificationsFor(tag);
+    const duplicate = existing.length > 0 && (!ring || existing.some(notification => !data.repeat || (notification.data?.sequence || 0) >= (data.sequence || 1)));
+    const ended = ring && (!Number.isFinite(data.expiresAt) || data.expiresAt <= Date.now());
+    // Safari requires EVERY push event to display a notification. Returning early
+    // for duplicates/late rings can revoke the whole subscription, including chat.
+    // Replace the existing tag without re-alerting, instead of dropping the event.
     await self.registration.showNotification(title, {
-    body,
+    body: ended ? "" : body,
     icon: "/favicon.svg",
     badge: "/favicon.svg",
-    tag: ring ? `11scat-ring-${data.ringId}` : task ? `11scat-task-${data.noticeId}` : chat ? `11scat-chat-${data.messageId}` : "11scat-room-message",
-    ...(task ? { vibrate: [200, 100, 200] } : {}),
-    renotify: !ring || !!data.repeat,
-    ...(ring ? { actions: [{ action: "acknowledge", title: "知道了" }] } : {}),
-    data: { url, ...(ring ? { ringId: data.ringId, sequence: data.sequence || 1 } : {}) },
+    tag,
+    ...(duplicate || ended ? { silent: true } : task ? { vibrate: [200, 100, 200] } : {}),
+    renotify: !duplicate && !ended && (!ring || !!data.repeat),
+    ...(ring && !ended ? { actions: [{ action: "acknowledge", title: "知道了" }] } : {}),
+    ...(ended && Number.isFinite(data.expiresAt) ? { timestamp: data.expiresAt } : {}),
+    data: { url: ended ? "/" : url, ...(ring ? { ringId: data.ringId, sequence: Math.max(data.sequence || 1, ...existing.map(notification => notification.data?.sequence || 0)) } : {}) },
     });
     if (chat) {
       const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
       windows.forEach(client => client.postMessage({ type: "chat-updated" }));
     }
-    // Display first: background network/authentication must not swallow a push.
-    if (ring) {
-      try {
-        const response = await fetch("/api/room/rings", { credentials: "include", cache: "no-store", signal: AbortSignal.timeout(5000) });
-        if (!response.ok || response.redirected || !response.headers.get("content-type")?.includes("application/json")) return;
-        const snapshot = await response.json();
-        if (!snapshot.rings.some(item => item.id === data.ringId && item.recipientId === snapshot.identityId && item.state === "active")) {
-          const notifications = await self.registration.getNotifications({ tag: `11scat-ring-${data.ringId}` });
-          notifications.forEach(notification => notification.close());
-        }
-      } catch { /* Keep the single notification when the phone is offline. */ }
-    }
+    // RoomBell clears ended rings when the user returns. Do not immediately
+    // close a just-displayed notification from a background network request.
   })());
 });
 

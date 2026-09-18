@@ -519,6 +519,10 @@ export default function Home() {
       const request = requests.begin();
       if (!request) return;
       try {
+        if (!("Notification" in window) || Notification.permission !== "granted") {
+          setPushEnabled(false);
+          return;
+        }
         pushDeviceIdRef.current = window.localStorage.getItem("11scat-push-device-id") || crypto.randomUUID();
         window.localStorage.setItem("11scat-push-device-id", pushDeviceIdRef.current);
         const registration = await navigator.serviceWorker.register("/sw.js");
@@ -576,7 +580,9 @@ export default function Home() {
       await navigator.serviceWorker.register("/sw.js");
       const registration = await navigator.serviceWorker.ready;
       let existing = await registration.pushManager.getSubscription();
-      if (existing && subscriptionNeedsRenewal(existing, keyData.publicKey)) {
+      // A revoked provider subscription can still look valid locally. An explicit
+      // enable action must rebuild it, not re-save the same dead endpoint.
+      if (existing) {
         if (!await existing.unsubscribe()) throw new Error("旧订阅移除失败，请重试。");
         existing = null;
       }

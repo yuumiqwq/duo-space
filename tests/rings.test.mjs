@@ -52,7 +52,7 @@ test('repeated reminders claim once per interval, do not catch up, and stop at c
   assert.equal((await claimDueRings(now+190000)).length, 0);
 });
 
-test('ring notifications validate server state, dedupe tags, expire and support explicit acknowledgement', async () => {
+test('every ring push displays, duplicates replace without alerting, and acknowledgement remains explicit', async () => {
   const source = await readFile(new URL('../public/sw.js', import.meta.url), 'utf8');
   const listeners = {};
   const shown = [];
@@ -69,16 +69,25 @@ test('ring notifications validate server state, dedupe tags, expire and support 
   assert.equal(shown[0][1].tag, '11scat-ring-ring-1');
   assert.equal(shown[0][1].renotify, false);
   state = 'cancelled'; await push(payload); assert.equal(shown.length, 2);
-  state = 'active'; await push({ ...payload, expiresAt: 0 }); assert.equal(shown.length, 2);
-  networkFailure = true; await push(payload); assert.equal(shown.length, 3, 'offline revalidation cannot swallow a valid push'); networkFailure = false;
-  self.registration.getNotifications = async () => [{}]; await push(payload); assert.equal(shown.length, 3);
+  state = 'active'; await push({ ...payload, expiresAt: 0 }); assert.equal(shown.length, 3);
+  assert.equal(shown.at(-1)[1].silent, true);
+  assert.equal(shown.at(-1)[1].actions, undefined);
+  assert.equal(shown.at(-1)[1].body, '');
+  networkFailure = true; await push(payload); assert.equal(shown.length, 4, 'offline revalidation cannot swallow a valid push'); networkFailure = false;
+  self.registration.getNotifications = async () => [{}]; await push(payload); assert.equal(shown.length, 5);
+  assert.equal(shown.at(-1)[1].renotify, false);
   self.registration.getNotifications = async () => [{data:{sequence:1}}];
   await push({...payload, repeat:true, sequence:2});
-  assert.equal(shown.length, 4);
+  assert.equal(shown.length, 6);
   assert.equal(shown.at(-1)[1].renotify, true);
   self.registration.getNotifications = async () => [{data:{sequence:2}}];
   await push({...payload, repeat:true, sequence:2});
-  assert.equal(shown.length, 4);
+  assert.equal(shown.length, 7);
+  assert.equal(shown.at(-1)[1].renotify, false);
+  await push({...payload, repeat:true, sequence:1});
+  assert.equal(shown.length, 8);
+  assert.equal(shown.at(-1)[1].data.sequence, 2, 'out-of-order replacement must not regress the sequence');
+  assert.equal(fetches.length, 0, 'background processing does not close freshly displayed notifications');
   let work;
   listeners.notificationclick({ action: 'acknowledge', notification: { close() {}, data: { ringId: 'ring-1', url: '/' } }, waitUntil: p => { work = p; } });
   await work;
