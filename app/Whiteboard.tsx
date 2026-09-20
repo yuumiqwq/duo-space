@@ -5,18 +5,16 @@ import { resizeTextGeometry, scaleTextGeometry, type ResizeHandle } from './boar
 import { ChalkToolIcon, ClassroomFullscreenIcon } from "./ClassroomScene";
 import { BOARD_COLOR, CHALK_COLORS, CHALK_FONT, createBoardPainter, visibleBoardColor } from "./board-painter.mjs";
 import { BOARD_TEXT_PADDING_X, BOARD_TEXT_PADDING_Y, BOARD_TEXT_LINE_HEIGHT, fitBoardText } from './board-text-layout.mjs';
+import { boardPointerPoints, appendStrokePoints } from './board-pointer.mjs';
+import { strokeContainsPoint } from './board-stroke-path.mjs';
 
 export type BoardPoint = { x: number; y: number };
-export type BoardStroke = { id: string; color: string; width: number; points: BoardPoint[]; createdAt: number; revision: string; tool?: "pen" | "erase"; material?: "chalk-v1" };
+export type BoardStroke = { id: string; color: string; width: number; points: BoardPoint[]; createdAt: number; revision: string; tool?: "pen" | "erase"; material?: "chalk-v1"; path?: "smooth-v1" };
 export type BoardText = { id: string; text: string; x: number; y: number; width: number; height: number; color: string; fontSize: number; confirmed: boolean; updatedAt: number; revision: string; material?: "chalk-v1"; autoWidth?: boolean };
 export type RoomBoard = { id: string; name: string; strokes: BoardStroke[]; texts: BoardText[]; deletedStrokeIds: string[]; deletedTextIds: string[]; epoch: string; createdAt: number };
 
 const BOARD_WIDTH = 1200;
 const BOARD_HEIGHT = 720;
-
-function pointDistance(left: BoardPoint, right: BoardPoint) {
-  return Math.hypot(left.x - right.x, left.y - right.y);
-}
 
 let lastBoardRevisionMs = 0;
 let boardRevisionSequence = 0;
@@ -144,7 +142,7 @@ export function Whiteboard({ board, fullscreen, onToggleFullscreen, onDelete, on
 
   const eraseWholeStroke = (point: BoardPoint) => {
     const hitDistance = Math.max(14, width * 2.2);
-    const hit = [...board.strokes].reverse().find((stroke) => !erasedDuringGestureRef.current.has(stroke.id) && stroke.points.some((candidate) => pointDistance(candidate, point) <= hitDistance));
+    const hit = [...board.strokes].reverse().find((stroke) => !erasedDuringGestureRef.current.has(stroke.id) && strokeContainsPoint(stroke, point, hitDistance));
     if (!hit) return;
     erasedDuringGestureRef.current.add(hit.id);
     onDeleteStroke(hit.id, board.epoch);
@@ -170,7 +168,7 @@ export function Whiteboard({ board, fullscreen, onToggleFullscreen, onDelete, on
     event.currentTarget.setPointerCapture(event.pointerId);
     erasedDuringGestureRef.current.clear();
     if (tool === "erase-stroke") { eraseWholeStroke(point); return; }
-    const stroke: BoardStroke = { id: crypto.randomUUID(), color, width: tool === "erase-area" ? Math.max(24, width * 4) : width, points: [point], createdAt: Date.now(), revision: makeBoardRevision(), material: "chalk-v1", tool: tool === "erase-area" ? "erase" : "pen" };
+    const stroke: BoardStroke = { id: crypto.randomUUID(), color, width: tool === "erase-area" ? Math.max(24, width * 4) : width, points: [point], createdAt: Date.now(), revision: makeBoardRevision(), material: "chalk-v1", path: "smooth-v1", tool: tool === "erase-area" ? "erase" : "pen" };
     draftRef.current = stroke;
     draftEpochRef.current = board.epoch;
     setDraftEpoch(board.epoch);
@@ -181,16 +179,18 @@ export function Whiteboard({ board, fullscreen, onToggleFullscreen, onDelete, on
 
   const continueStroke = (event: React.PointerEvent<HTMLCanvasElement>) => {
     if (activePointerRef.current !== event.pointerId) return;
-    const point = pointerPoint(event);
-    if (tool === "erase-stroke") { eraseWholeStroke(point); return; }
+    const samples = boardPointerPoints(event.nativeEvent, event.currentTarget.getBoundingClientRect());
+    if (tool === "erase-stroke") { samples.forEach(eraseWholeStroke); return; }
     const current = draftRef.current;
     if (draftEpochRef.current !== board.epoch || (current && board.deletedStrokeIds.includes(current.id))) {
       draftRef.current = null;
       setDraft(null);
       return;
     }
-    if (!current || pointDistance(current.points[current.points.length - 1], point) < 1.5) return;
-    const next = { ...current, points: [...current.points, point], revision: makeBoardRevision() };
+    if (!current) return;
+    const points = appendStrokePoints(current.points, samples);
+    if (points === current.points) return;
+    const next = { ...current, points, revision: makeBoardRevision() };
     draftRef.current = next;
     setDraft(next);
     if (event.timeStamp - lastStrokeBroadcastRef.current >= 32) {
@@ -204,8 +204,13 @@ export function Whiteboard({ board, fullscreen, onToggleFullscreen, onDelete, on
     activePointerRef.current = null;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
     erasedDuringGestureRef.current.clear();
-    const finished = draftRef.current;
+    let finished = draftRef.current;
     if (!finished) return;
+    // Cancel/lost-capture coordinates are not a real endpoint of the gesture.
+    if (event.type === 'pointerup') {
+      const points = appendStrokePoints(finished.points, boardPointerPoints(event.nativeEvent, event.currentTarget.getBoundingClientRect()), true);
+      if (points !== finished.points) finished = { ...finished, points, revision: makeBoardRevision() };
+    }
     if (draftEpochRef.current === board.epoch && !board.deletedStrokeIds.includes(finished.id)) onAddStroke(finished, draftEpochRef.current);
     draftRef.current = null;
     setDraft(null);

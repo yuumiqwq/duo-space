@@ -1,4 +1,5 @@
 // Versioned chalk geometry shared by live boards, replay and PNG export.
+import { strokePath } from './board-stroke-path.mjs';
 export const CHALK_RENDERER_VERSION = 1;
 export function seedFromId(id) {
   let hash = 2166136261;
@@ -34,7 +35,7 @@ export function resample(points, spacing = 1) {
 }
 export function buildChalkOutline(stroke) {
   const width = Math.max(.5, Math.min(80, Number(stroke.width) || 8));
-  const points = resample(stroke.points || [], Math.max(.6, width * .16));
+  const points = resample(strokePath(stroke), Math.max(.6, width * .16));
   if (!points.length) return null;
   const seed = seedFromId(stroke.id), left = [], right = [];
   for (let i = 0; i < points.length; i++) {
@@ -106,7 +107,7 @@ export function createChalkRenderer(createCanvas) {
     applyGrain(ctx,0,0,c.width,c.height,strength);target.drawImage(c,0,0);
   }
   function erase(target, stroke) {
-    const p=stroke.points;if(!p?.length)return;
+    const p=strokePath(stroke);if(!p.length)return;
     target.save();target.globalCompositeOperation='destination-out';target.lineWidth=stroke.width;
     target.lineCap='round';target.lineJoin='round';target.beginPath();target.moveTo(p[0].x,p[0].y);
     if(p.length===1)target.lineTo(p[0].x+.01,p[0].y);

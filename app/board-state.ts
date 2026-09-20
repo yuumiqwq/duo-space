@@ -14,6 +14,7 @@ export const normalizeBoardStroke = (value: unknown): BoardStroke | null => {
   return {
     id: item.id.slice(0, 80), color: item.color, width: item.width, points,
     ...(item.material === "chalk-v1" ? { material: "chalk-v1" as const } : {}),
+    ...(item.path === "smooth-v1" ? { path: "smooth-v1" as const } : {}),
     ...(item.tool === "pen" || item.tool === "erase" ? { tool: item.tool } : {}),
     createdAt: typeof item.createdAt === "number" && Number.isFinite(item.createdAt) ? item.createdAt : 0,
     revision: typeof item.revision === "string" ? item.revision.slice(0, 120) : `${String(typeof item.createdAt === "number" ? item.createdAt : 0).padStart(13, "0")}:${item.id}`,
