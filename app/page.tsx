@@ -1668,7 +1668,8 @@ export default function Home() {
       // direction when our own screen sender was suspended in the background.
       mediaRecovery.request("screen");
       mediaRecovery.request("camera");
-      mediaRecovery.request("microphone");
+      // Focus/visibility alone do not indicate a microphone failure. Keep the
+      // established call; the receiver requests repair if audio packets stall.
       // Re-request even when the old MediaConnection still reports open.
       connections.forEach((connection) => {
         if (!connection.open) return;
@@ -2023,9 +2024,8 @@ export default function Home() {
     if(microphoneStream) dataConnectionsRef.current.forEach((_connection,peerId) => callPeerRef.current(peerId,microphoneStream,'microphone'));
     const track=microphoneStream?.getAudioTracks()[0];
     const resume=()=>recoverPublishedMediaRef.current('microphone');
-    const visible=()=>{if(!document.hidden)resume();};
-    track?.addEventListener('unmute',resume);window.addEventListener('focus',resume);document.addEventListener('visibilitychange',visible);
-    return ()=>{track?.removeEventListener('unmute',resume);window.removeEventListener('focus',resume);document.removeEventListener('visibilitychange',visible);microphoneStream?.getTracks().forEach(item=>item.stop());};
+    track?.addEventListener('unmute',resume);
+    return ()=>{track?.removeEventListener('unmute',resume);microphoneStream?.getTracks().forEach(item=>item.stop());};
   },[microphoneStream]);
   const stopMicrophone = () => {
     microphoneRequest.current += 1;
