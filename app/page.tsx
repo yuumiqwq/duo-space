@@ -3,7 +3,7 @@
 import { taskRefresh } from "./task-refresh";
 
 import { AudioPlayer } from "./AudioPlayer";
-import { RemoteMicrophone } from "./RemoteMicrophone";
+import { RemoteRoomAudio } from "./RemoteMicrophone";
 import { prepareClassroomAssets } from './classroom-loading';
 import { RoomLoadingScreen } from './RoomLoadingScreen';
 import { createChatSyncRequest } from "./chat-sync-request";
@@ -207,7 +207,6 @@ export default function Home() {
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [shareStarting, setShareStarting] = useState(false);
   const [remoteScreenMuted, setRemoteScreenMuted] = useState(false);
-  const [remoteAudioBlocked, setRemoteAudioBlocked] = useState(false);
   const [pictureInPicture, setPictureInPicture] = useState(false);
   const [shareError, setShareError] = useState("");
   const [microphoneStream, setMicrophoneStream] = useState<MediaStream | null>(null);
@@ -305,8 +304,6 @@ export default function Home() {
   const chatSyncRequestRef = useRef(createChatSyncRequest());
   const outgoingChatRef = useRef(new Map<string, OutgoingChat>());
   const sendingChatIdsRef = useRef(new Set<string>());
-
-  const markRemoteAudioBlocked = useCallback(() => setRemoteAudioBlocked(true), []);
 
   const broadcastRoomMessage = useCallback((message: object) => {
     try {
@@ -1856,20 +1853,7 @@ export default function Home() {
     if (document.pictureInPictureElement) void document.exitPictureInPicture().catch(() => undefined);
   };
 
-  const toggleRemoteScreenAudio = () => {
-    const video = document.querySelector<HTMLVideoElement>("video.main-media.screen.remote");
-    const hasAudio = Boolean(video?.srcObject && (video.srcObject as MediaStream).getAudioTracks().some((track) => track.readyState === "live"));
-    if (!video || !hasAudio) {
-      setShareError("对方当前的共享没有音频。如需声音，请对方重新投屏，并在浏览器的共享窗口中选择共享音频。");
-      return;
-    }
-    const enableAudio = remoteScreenMuted || remoteAudioBlocked;
-    video.muted = !enableAudio;
-    video.volume = 1;
-    setRemoteScreenMuted(!enableAudio);
-    setRemoteAudioBlocked(false);
-    if (enableAudio) void video.play().catch(() => setShareError("浏览器仍阻止声音播放，请点击页面后再试一次。"));
-  };
+  const toggleRemoteScreenAudio = () => setRemoteScreenMuted(current => !current);
 
   const togglePictureInPicture = async () => {
     setShareError("");
@@ -2375,8 +2359,7 @@ export default function Home() {
                 className={`main-media ${activeMedia.kind}${activeMedia.remote ? " remote" : ""}`}
                 stream={activeMedia.stream}
                 label={activeMedia.label}
-                muted={!activeMedia.remote || activeMedia.kind !== "screen" || remoteScreenMuted}
-                onAudioBlocked={activeMedia.remote && activeMedia.kind === "screen" ? markRemoteAudioBlocked : undefined}
+                muted={true}
               />
               {mediaItems.length > 1 && <>
                 <button className="media-nav media-prev" type="button" onClick={() => stepMedia(-1)} aria-label="查看上一个画面"><ChevronLeft aria-hidden="true" /></button>
@@ -2385,7 +2368,7 @@ export default function Home() {
               <div className="media-caption">{activeMedia.label}<span>{mediaItems.findIndex((item) => item.id === activeMedia.id) + 1} / {mediaItems.length}</span></div>
               {activeMedia.kind === "screen" && <div className="media-window-actions">
                 {activeMedia.id === "self-screen" && <span className={activeMedia.stream.getAudioTracks().length ? "share-audio-status active" : "share-audio-status"}>{activeMedia.stream.getAudioTracks().length ? <Volume2 aria-hidden="true" /> : <VolumeX aria-hidden="true" />}{activeMedia.stream.getAudioTracks().length ? "正在共享电脑音频" : "未共享电脑音频"}</span>}
-                {activeMedia.remote && activeMedia.stream.getAudioTracks().length > 0 && <button className="remote-audio-button" type="button" onClick={toggleRemoteScreenAudio} aria-label={remoteScreenMuted || remoteAudioBlocked ? "播放共享声音" : "静音共享声音"}>{remoteScreenMuted || remoteAudioBlocked ? <Volume2 aria-hidden="true" /> : <VolumeX aria-hidden="true" />}{remoteScreenMuted || remoteAudioBlocked ? "播放声音" : "静音"}</button>}
+                {activeMedia.remote && activeMedia.stream.getAudioTracks().length > 0 && <button className="remote-audio-button" type="button" onClick={toggleRemoteScreenAudio} aria-label={remoteScreenMuted ? "播放共享声音" : "静音共享声音"}>{remoteScreenMuted ? <Volume2 aria-hidden="true" /> : <VolumeX aria-hidden="true" />}{remoteScreenMuted ? "播放声音" : "静音"}</button>}
                 {activeMedia.remote && activeMedia.stream.getAudioTracks().length === 0 && <span className="share-audio-status"><VolumeX aria-hidden="true" />未共享电脑音频</span>}
                 <button className={pictureInPicture ? "picture-in-picture-button active" : "picture-in-picture-button"} type="button" onClick={() => void togglePictureInPicture()} aria-label={pictureInPicture ? "关闭小窗" : "开启小窗"}><PictureInPicture2 size={18} aria-hidden="true" />{pictureInPicture ? "关闭小窗" : "小窗"}</button>
               </div>}
@@ -2574,7 +2557,10 @@ export default function Home() {
       </div>
 
       <EmergencyExit onClick={() => { intentionalLeaveRef.current = true; stopShare(); stopCamera(); stopMicrophone(); window.location.assign("/access"); }} />
-      {Object.entries(remoteMicrophones).filter(([peer]) => peerIdentityIds[peer] !== identityId).map(([peer,media]) => <RemoteMicrophone key={peer} stream={media} />)}
+      <RemoteRoomAudio sources={[
+        ...Object.entries(remoteMicrophones).filter(([peer]) => peerIdentityIds[peer] !== identityId).map(([peer, media]) => ({ id: `microphone:${peer}`, stream: media })),
+        ...Object.entries(remoteScreens).filter(([peer]) => peerIdentityIds[peer] !== identityId).map(([peer, media]) => ({ id: `screen:${peer}`, stream: media, muted: remoteScreenMuted })),
+      ]} />
       {microphoneError && <p className="room-microphone-error" role="alert">{microphoneError}</p>}
       <RoomBell triggerHost={bellHost} onShowChat={showBellChat} />
       {profileReady && !joined && <p className="error-message" role="alert">{joinError || "正在进入自习室…"}</p>}
