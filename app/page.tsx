@@ -1,6 +1,7 @@
 "use client";
 
 import { createCameraCapture } from './camera-capture';
+import { onMediaForeground } from './media-foreground';
 import { attachVideoPlayback } from './video-playback';
 import { taskRefresh } from "./task-refresh";
 
@@ -1620,14 +1621,7 @@ export default function Home() {
       }
     };
 
-    let hiddenSince = 0;
-    let lastMediaResume = 0;
     const resumeMedia = () => {
-      if (document.visibilityState !== "visible" || !hiddenSince) return;
-      const duration = Date.now() - hiddenSince;
-      hiddenSince = 0;
-      if (duration < 3000 || Date.now() - lastMediaResume < 5000) return;
-      lastMediaResume = Date.now();
       // This page is also a publisher. Remote requests alone repair the wrong
       // direction when our own screen sender was suspended in the background.
       mediaRecovery.request("screen");
@@ -1643,21 +1637,19 @@ export default function Home() {
     };
     const handleVisibilityChange = () => {
       if (document.visibilityState !== "visible") {
-        hiddenSince = Date.now();
         void syncRoomPresence(true);
         return;
       }
       clearReconnectTimer();
       recoverRoomConnection();
       void syncRoomPresence();
-      resumeMedia();
     };
     const recoverWhenActive = () => {
       clearReconnectTimer();
       recoverRoomConnection();
       void syncRoomPresence();
-      resumeMedia();
     };
+    const stopForegroundRecovery = onMediaForeground(document, window, resumeMedia);
     document.addEventListener("visibilitychange", handleVisibilityChange);
     window.addEventListener("focus", recoverWhenActive);
     window.addEventListener("online", recoverWhenActive);
@@ -1670,6 +1662,7 @@ export default function Home() {
       clearRecoveryMessageTimer();
       if (presenceTimer !== null) window.clearInterval(presenceTimer);
       if (!mobileClient || intentionalLeaveRef.current) leaveRoomPresence();
+      stopForegroundRecovery();
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       window.removeEventListener("focus", recoverWhenActive);
       window.removeEventListener("online", recoverWhenActive);

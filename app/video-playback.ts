@@ -1,3 +1,5 @@
+import { onMediaForeground } from './media-foreground.ts';
+
 export function attachVideoPlayback(video: HTMLVideoElement, stream: MediaStream, options: {
   blocked: (value: boolean) => void;
   document?: Document;
@@ -33,7 +35,7 @@ export function attachVideoPlayback(video: HTMLVideoElement, stream: MediaStream
   };
   const ready = () => { if (video.paused) resume(); };
   const gesture = () => { if (video.paused || video.readyState < 2) resume(); };
-  const foreground = () => resume(true);
+  const stopForeground = onMediaForeground(doc, win, () => resume(true));
   // Set Safari's inline/autoplay requirements before assigning the stream.
   video.muted = true;
   video.playsInline = true;
@@ -43,10 +45,8 @@ export function attachVideoPlayback(video: HTMLVideoElement, stream: MediaStream
   video.addEventListener('canplay', ready);
   stream.addEventListener('addtrack', syncTracks);
   stream.addEventListener('removetrack', syncTracks);
-  doc.addEventListener('visibilitychange', foreground);
   doc.addEventListener('pointerup', gesture);
   doc.addEventListener('keydown', gesture);
-  win.addEventListener('pageshow', foreground);
   syncTracks();
   return {
     resume: () => resume(true),
@@ -56,10 +56,9 @@ export function attachVideoPlayback(video: HTMLVideoElement, stream: MediaStream
       video.removeEventListener('canplay', ready);
       stream.removeEventListener('addtrack', syncTracks);
       stream.removeEventListener('removetrack', syncTracks);
-      doc.removeEventListener('visibilitychange', foreground);
+      stopForeground();
       doc.removeEventListener('pointerup', gesture);
       doc.removeEventListener('keydown', gesture);
-      win.removeEventListener('pageshow', foreground);
       for (const track of tracks) track.removeEventListener('unmute', unmute);
       if (video.srcObject === stream) { video.pause(); video.srcObject = null; }
     },

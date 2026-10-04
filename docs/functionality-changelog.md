@@ -322,6 +322,12 @@
 
 19 项媒体相关测试及生产构建通过。WebKit 官方的[采集控制说明](https://webkit.org/blog/7763/a-closer-look-into-webrtc/)解释了系统暂停可发送黑帧；[重复采集历史报告](https://bugs.webkit.org/show_bug.cgi?id=179363)仅作为风险参考，该报告已关闭，不能当作当前 iPadOS 的已确认缺陷。真实 iPad 首次开启、重启以及后台返回后的双端画面仍需设备配合验证。
 
+### Windows 虚拟桌面返回后恢复视频
+
+替代上一版仅依赖页面隐藏记录且要求后台超过 3 秒的恢复条件。窗口焦点、页面可见性、pageshow 和 resume 统一触发恢复，连续事件合并，等待 250 毫秒再重挂视频并协调摄像头与共享屏幕双向媒体连接。视频即使 paused=false 也会重挂，画中画不拆流，离开页面或重新进入后台会取消尚未执行的恢复。沿用发送端恢复队列及冷却机制，不重新申请采集权限。
+
+23 项媒体测试、生产构建及新增模块 lint 通过；覆盖只有 focus 没有 hidden 事件、快速切换、重复事件合并、离开清理和画中画保护。当前浏览器页面未显示视频，未完成对方 Windows 虚拟桌面的真机复现及验收。[Chromium 官方遮挡跟踪说明](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/docs/windows_native_window_occlusion_tracking.md)说明其他虚拟桌面的窗口会按被遮挡处理；这提供了恢复设计依据，不代表已证实对方黑屏的唯一根因。
+
 ## 后续记录方式
 
 功能变化在同一工作单元更新[当前功能说明](current-functionality.md)，并在上方日期记录区追加小节。标题先说明用户能感知的变化，正文用简短段落或少量要点解释，必要时另行注明后续调整。
