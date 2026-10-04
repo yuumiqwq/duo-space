@@ -1,5 +1,7 @@
 "use client";
 
+import { createCameraCapture } from './camera-capture';
+import { attachVideoPlayback } from './video-playback';
 import { taskRefresh } from "./task-refresh";
 
 import { AudioPlayer } from "./AudioPlayer";
@@ -146,55 +148,20 @@ const mergeChatMessages = (incoming: ChatMessage[], current: ChatMessage[]) => {
 };
 
 
-function MediaVideo({ stream, label, className, muted = true, onAudioBlocked }: { stream: MediaStream; label: string; className: string; muted?: boolean; onAudioBlocked?: () => void }) {
+function MediaVideo({ stream, label, className }: { stream: MediaStream; label: string; className: string }) {
   const ref = useRef<HTMLVideoElement>(null);
-
+  const playback = useRef<ReturnType<typeof attachVideoPlayback> | null>(null);
+  const [blocked, setBlocked] = useState(false);
   useEffect(() => {
-    const video = ref.current;
-    if (!video) return;
-    video.srcObject = stream;
-    video.muted = muted;
-    video.volume = 1;
-    let disposed = false;
-    const play = async () => {
-      try { await video.play(); }
-      catch (error) {
-        if (disposed || video.srcObject !== stream) return;
-        if ((error as DOMException).name === "NotAllowedError" && !video.muted) {
-          // Autoplay restrictions must not prevent the video frames from appearing.
-          video.muted = true;
-          if (!muted) onAudioBlocked?.();
-          await video.play().catch(() => undefined);
-        }
-      }
-    };
-    let hiddenAt = 0;
-    const resume = () => {
-      if (document.visibilityState !== "visible") { hiddenAt = Date.now(); return; }
-      if (hiddenAt && Date.now() - hiddenAt > 3000 && document.pictureInPictureElement !== video) {
-        // A suspended decoder can remain black while paused is false. Reattach it.
-        video.pause();
-        video.srcObject = null;
-        video.srcObject = stream;
-      }
-      hiddenAt = 0;
-      void play();
-    };
-    const onReady = () => { if (video.paused) void play(); };
-    video.addEventListener("loadedmetadata", onReady);
-    video.addEventListener("canplay", onReady);
-    document.addEventListener("visibilitychange", resume);
-    void play();
-    return () => {
-      disposed = true;
-      video.removeEventListener("loadedmetadata", onReady);
-      video.removeEventListener("canplay", onReady);
-      document.removeEventListener("visibilitychange", resume);
-      if (video.srcObject === stream) video.srcObject = null;
-    };
-  }, [muted, onAudioBlocked, stream]);
-
-  return <video className={className} ref={ref} autoPlay muted={muted} playsInline disablePictureInPicture={false} aria-label={label} />;
+    if (!ref.current) return;
+    const controller = attachVideoPlayback(ref.current, stream, { blocked: setBlocked });
+    playback.current = controller;
+    return () => { controller.dispose(); playback.current = null; };
+  }, [stream]);
+  return <>
+    <video className={className} ref={ref} autoPlay muted playsInline disablePictureInPicture={false} aria-label={label} />
+    {blocked && <div className="media-window-actions"><button className="remote-audio-button" type="button" onClick={() => playback.current?.resume()}>播放画面</button></div>}
+  </>;
 }
 
 export default function Home() {
@@ -911,7 +878,7 @@ export default function Home() {
   useEffect(() => { displayNameRef.current = displayName.trim(); }, [displayName]);
   useEffect(() => { memberNamesRef.current = memberNames; }, [memberNames]);
   useEffect(() => () => stream?.getTracks().forEach((track) => track.stop()), [stream]);
-  useEffect(() => () => cameraStream?.getTracks().forEach((track) => track.stop()), [cameraStream]);
+
 
   useEffect(() => {
     if (!joined || !USE_LIVEKIT) return;
@@ -1735,6 +1702,10 @@ export default function Home() {
     if (cameraStream) {
       dataConnectionsRef.current.forEach((_connection, peerId) => callPeerRef.current(peerId, cameraStream, "camera"));
     }
+    const track = cameraStream?.getVideoTracks()[0];
+    const onUnmute = () => recoverPublishedMediaRef.current('camera');
+    track?.addEventListener('unmute', onUnmute);
+    return () => track?.removeEventListener('unmute', onUnmute);
   }, [cameraStream]);
 
   useEffect(() => {
@@ -2039,45 +2010,39 @@ export default function Home() {
   };
   useEffect(() => () => { microphoneRequest.current += 1; microphoneBusy.current = false; }, [joined]);
 
-  const stopCamera = () => {
-    cameraStream?.getTracks().forEach((track) => { void roomRef.current?.localParticipant.unpublishTrack(track); track.stop(); });
-    setCameraStream(null);
+  const [cameraCapture] = useState(() => createCameraCapture({
+    capture: () => navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 24, max: 30 }, facingMode: 'user' },
+      audio: false,
+    }),
+    publish: async media => { await roomRef.current?.localParticipant.publishTrack(media.getVideoTracks()[0], { source: Track.Source.Camera }); },
+    release: media => { media.getTracks().forEach(track => { void roomRef.current?.localParticipant.unpublishTrack(track); }); },
+    changed: media => {
+      cameraStreamRef.current = media;
+      setCameraStream(media);
+      if (media) setActiveMediaId('self-camera');
+    },
+    error: error => setCameraError((error as DOMException)?.name === 'NotAllowedError'
+      ? '摄像头权限未开启，请在浏览器地址栏允许 11scat 使用摄像头。'
+      : '摄像头暂时无法开启，请确认没有被其他程序占用。'),
+  }));
+  useEffect(() => () => cameraCapture.stop(), [cameraCapture, joined]);
+  const stopCamera = () => cameraCapture.stop();
+  const toggleCamera = async () => {
+    if (cameraStreamRef.current) { stopCamera(); return; }
+    if (!joined || intentionalLeaveRef.current) return;
+    setCameraError('');
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setCameraError('当前浏览器不支持摄像头访问，请使用最新版 Chrome、Edge 或 Safari。');
+      return;
+    }
+    await cameraCapture.start();
+    if (cameraStreamRef.current) projection.reveal();
   };
 
-  const toggleCamera = async () => {
-    if (cameraStream) {
-      stopCamera();
-      return;
-    }
-
-    setCameraError("");
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setCameraError("当前浏览器不支持摄像头访问，请使用最新版 Chrome、Edge 或 Safari。");
-      return;
-    }
-
-    try {
-      const nextCameraStream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-          frameRate: { ideal: 24, max: 30 },
-          facingMode: "user",
-        },
-        audio: false,
-      });
-      const track = nextCameraStream.getVideoTracks()[0];
-      track?.addEventListener("ended", () => { if (track) void roomRef.current?.localParticipant.unpublishTrack(track); setCameraStream(null); });
-      if (track) await roomRef.current?.localParticipant.publishTrack(track, { source: Track.Source.Camera });
-      setCameraStream(nextCameraStream);
-      setActiveMediaId("self-camera");
-      projection.reveal();
-    } catch (error) {
-      const name = (error as DOMException).name;
-      setCameraError(name === "NotAllowedError"
-        ? "摄像头权限未开启，请在浏览器地址栏允许 11scat 使用摄像头。"
-        : "摄像头暂时无法开启，请确认没有被其他程序占用。");
-    }
+  const restartCamera = async () => {
+    stopCamera();
+    await toggleCamera();
   };
 
   const submitActivity = async (event: FormEvent) => {
@@ -2359,7 +2324,6 @@ export default function Home() {
                 className={`main-media ${activeMedia.kind}${activeMedia.remote ? " remote" : ""}`}
                 stream={activeMedia.stream}
                 label={activeMedia.label}
-                muted={true}
               />
               {mediaItems.length > 1 && <>
                 <button className="media-nav media-prev" type="button" onClick={() => stepMedia(-1)} aria-label="查看上一个画面"><ChevronLeft aria-hidden="true" /></button>
@@ -2537,6 +2501,7 @@ export default function Home() {
           return <div className="classroom-desk" key={index}><DeviceCard font={classroomProfile.profile.font} kind={index === 0 ? 'tablet' : 'laptop'} name={self ? displayName : member.name} online={!!member.id && ((self && joined) || peers.length > 0)} screen={screenOn} camera={cameraOn} microphone={self ? !!microphoneStream : peers.some(id=>!!remoteMicrophones[id])} self={self} onMicrophone={self ? ()=>void toggleMicrophone() : undefined}
             onScreen={self ? () => stream ? stopShare() : screenPeer ? view(screenPeer + '-screen') : void startShare() : screenPeer ? () => view(screenPeer + '-screen') : undefined}
             onCamera={self ? () => cameraStream ? stopCamera() : cameraPeer ? view(cameraPeer + '-camera') : void toggleCamera() : cameraPeer ? () => view(cameraPeer + '-camera') : undefined}>
+            {self && cameraStream && <button className="remote-audio-button" type="button" onClick={() => void restartCamera()}>重启摄像头</button>}
             {self ? <form className="activity-box" onSubmit={submitActivity}><ActivityInput value={activity} readOnly={activitySaveStatus === '正在保存…'} onChange={value => { setActivity(value); setActivitySaveStatus(''); }} />{activitySaveStatus && <small role="status">{activitySaveStatus}</small>}</form> : <p>{peers.map(id => memberActivities[id]).find(value => value !== undefined) ?? member.activity}</p>}
           </DeviceCard></div>;
         })}
