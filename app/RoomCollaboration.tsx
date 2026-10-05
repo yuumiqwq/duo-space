@@ -37,7 +37,7 @@ const taskSource = (task: RoomTask) => ({ ownerId: task.ownerId, taskId: task.id
 const priorities = { 0: "无优先级", 1: "低", 3: "中", 5: "高" };
 const operationTime = (value: number) => new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(new Date(value));
 
-export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTasks, triggerContent, previewSnapshot, previewAutoOpen = true }: { identityId: string; onChanged: (fresh?: boolean) => Promise<boolean>; onNotice?: (id: string) => void; onPublicTasks?: (tasks: PublicTaskPreview[]) => void; triggerContent?: ReactNode; previewSnapshot?: CollaborationSnapshot; previewAutoOpen?: boolean }) {
+export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTasks, onInitialLoad, active = true, triggerContent, previewSnapshot, previewAutoOpen = true }: { identityId: string; onChanged: (fresh?: boolean) => Promise<boolean>; onNotice?: (id: string) => void; onPublicTasks?: (tasks: PublicTaskPreview[]) => void; onInitialLoad?: (error: string) => void; active?: boolean; triggerContent?: ReactNode; previewSnapshot?: CollaborationSnapshot; previewAutoOpen?: boolean }) {
   const [stampFontsReady, setStampFontsReady] = useState(false);
   const [open, setOpen] = useState(false);
   const [snapshot, setSnapshot] = useState<CollaborationSnapshot | null>(previewSnapshot || null);
@@ -70,6 +70,7 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
 
   useEffect(() => () => { drag.current?.stop(); }, []);
   useEffect(() => { if (snapshot) onPublicTasks?.(snapshot.buffer); }, [snapshot, onPublicTasks]);
+  useEffect(() => { if (snapshot || error) onInitialLoad?.(snapshot ? '' : error); }, [snapshot, error, onInitialLoad]);
 
   useEffect(() => { if (!notice) return; const timer = setTimeout(() => setNotice(""), 2400); return () => clearTimeout(timer); }, [notice]);
 
@@ -108,6 +109,7 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
   }, [acceptNotices]);
   const openIssue = (workflowId?: string) => { setOpen(true); setRecoveryOpen(!workflowId); setEditor(null); setWorkflowId(workflowId || null); setWorkflowOpen(!!workflowId); setError(''); };
   useEffect(() => {
+    if (!active) return;
     if (previewSnapshot) {
       if (!previewAutoOpen) return;
       const timer = setTimeout(() => setOpen(true), 0); return () => clearTimeout(timer);
@@ -116,7 +118,7 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
     if (params.get("taskboard") !== "1") return;
     const timer = setTimeout(() => { setOpen(true); const id = params.get("workflow"); if (id && /^[a-f0-9-]{36}$/i.test(id)) { setWorkflowId(id); setWorkflowOpen(true); } }, 0);
     return () => clearTimeout(timer);
-  }, [previewSnapshot, previewAutoOpen]);
+  }, [active, previewSnapshot, previewAutoOpen]);
 
   const load = useCallback(async (force = false, memberIds?: string[]) => {
     if (previewSnapshot) return previewSnapshot;
@@ -440,9 +442,9 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
       </div>
       {ghost && <div className={`coop-drag-ghost${ghost.task.ownerId === null ? " buffer" : ""}`} aria-hidden="true" inert style={{ left: ghost.x, top: ghost.y, width: ghost.width }}>{card(ghost.task, true)}</div>}
     </dialog>, document.body)}
-    {taskPrompt && (taskPrompt.eventType === 'reject'
+    {active && taskPrompt && (taskPrompt.eventType === 'reject'
       ? <TaskRejection key={taskPrompt.id} notice={taskPrompt} onDismiss={dismissRejection} onClose={() => setTaskPrompt(current => current?.id === taskPrompt.id ? null : current)} />
       : <TaskNudge key={taskPrompt.id} notice={taskPrompt} onRead={markRead} onClose={() => setTaskPrompt(current => current?.id === taskPrompt.id ? null : current)} />)}
-    {!open && !taskPrompt && issueNotice && createPortal(<WorkflowSyncAlert fixed notice={issueNotice} open={() => openIssue(issueNotice.workflowId!)} dismiss={() => markViewed([issueNotice.id])} />, document.body)}
+    {active && !open && !taskPrompt && issueNotice && createPortal(<WorkflowSyncAlert fixed notice={issueNotice} open={() => openIssue(issueNotice.workflowId!)} dismiss={() => markViewed([issueNotice.id])} />, document.body)}
   </>;
 }

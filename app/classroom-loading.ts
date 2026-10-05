@@ -19,26 +19,35 @@ export const classroomEntryImages = [
   '/classroom/chalk-cup-flat.svg', '/classroom/settings-flat.svg',
   '/classroom/calendar-entry.svg', '/classroom/folder-flat.svg',
   '/classroom/taskboard-flat.svg', '/classroom/projector-on.svg', '/classroom/projector-off.svg', '/classroom/fabric.webp',
+  '/classroom/emergency-exit.svg', '/classroom/pencil-tip.svg', '/classroom/chalk/expand.svg',
 ];
 
-const images = new Map<string, Promise<void>>();
+// Retain the actual images, not just fulfilled promises: a later render must be
+// able to request decoding again if the browser discarded its decoded surface.
+const images = new Map<string, { image: HTMLImageElement; loaded: Promise<void> }>();
 let preparing: Promise<void> | undefined;
 
-function loadImage(url: string) {
+export function loadClassroomImage(url: string) {
+  if (document.baseURI) url = new URL(url, document.baseURI).href;
   let pending = images.get(url);
   if (!pending) {
     const image = new Image();
-    pending = withLoadingTimeout(new Promise<void>((resolve, reject) => {
+    const loaded = withLoadingTimeout(new Promise<void>((resolve, reject) => {
       image.onload = () => {
         if (!image.naturalWidth) { reject(new Error('教室图片未能加载，请重试。')); return; }
-        void (image.decode ? image.decode() : Promise.resolve()).then(() => resolve(), reject);
+        resolve();
       };
       image.onerror = () => reject(new Error('教室图片未能加载，请重试。'));
       image.src = url;
     })).catch(error => { images.delete(url); image.src = ''; throw error; });
+    pending = { image, loaded };
     images.set(url, pending);
   }
-  return pending;
+  const { image, loaded } = pending;
+  return withLoadingTimeout(loaded.then(() => image.decode?.())).catch(error => {
+    if (images.get(url) === pending) images.delete(url);
+    throw error;
+  });
 }
 
 // Both login and direct room entry wait on this shared preparation. Never cache a failed attempt.
@@ -47,7 +56,7 @@ export function prepareClassroomAssets(): Promise<void> {
     preparing = withLoadingTimeout(Promise.all([
       loadDeviceFont(CLASSROOM_DEVICE_FONT),
       loadFontResources(classroomEntryFonts),
-      ...classroomEntryImages.map(loadImage),
+      ...classroomEntryImages.map(loadClassroomImage),
     ])).then(() => undefined).catch(error => { preparing = undefined; throw error; });
   }
   return preparing;
