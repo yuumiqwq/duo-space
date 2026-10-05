@@ -9,7 +9,7 @@ import { ClassroomProp } from "./ClassroomScene";
 import { placeBellPanel } from "./bell-position";
 
 type Snapshot = { identityId: string; rings: Ring[]; members: { id: string; name: string }[]; serverNow: number };
-export function RoomBell({ triggerHost, onShowChat, onInitialLoad, active = true }: { triggerHost: HTMLElement | null; onShowChat: () => void; onInitialLoad?: (error: string) => void; active?: boolean }) {
+export function RoomBell({ triggerHost, onShowChat }: { triggerHost: HTMLElement | null; onShowChat: () => void }) {
   const [data, setData] = useState<Snapshot | null>(null);
   const [openFor, setOpenFor] = useState<HTMLElement | null>(null);
   const open = !!triggerHost && openFor === triggerHost;
@@ -24,7 +24,6 @@ export function RoomBell({ triggerHost, onShowChat, onInitialLoad, active = true
   const pending = useRef<Record<string, string>>({});
   const offset = useRef(0);
   const notificationLinkHandled = useRef(false);
-  useEffect(() => { if (data || offline) onInitialLoad?.(data ? '' : '摇铃状态暂时无法更新'); }, [data, offline, onInitialLoad]);
   const close = useCallback((restoreFocus = false) => {
     setOpenFor(null);
     if (restoreFocus) root.current?.focus({ preventScroll: true });
@@ -62,14 +61,13 @@ export function RoomBell({ triggerHost, onShowChat, onInitialLoad, active = true
     return () => { stopped = true; invalidatePending(); clearTimeout(timer); document.removeEventListener("visibilitychange", resume); window.removeEventListener("online", resume); window.removeEventListener("focus", resume); };
   }, [refresh]);
   useEffect(() => {
-    if (!active) return;
     const timer = setTimeout(() => {
       if (notificationLinkHandled.current || !new URLSearchParams(window.location.search).has("ring")) return;
       onShowChat();
       if (triggerHost) { notificationLinkHandled.current = true; setOpenFor(triggerHost); }
     }, 0);
     return () => clearTimeout(timer);
-  }, [active, triggerHost, onShowChat]);
+  }, [triggerHost, onShowChat]);
   useEffect(() => { const timer = setInterval(() => setNow(Date.now() + offset.current), 1000); return () => clearInterval(timer); }, []);
   useEffect(() => {
     if (!open) return;

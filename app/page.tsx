@@ -10,7 +10,6 @@ import { AudioPlayer } from "./AudioPlayer";
 import { RemoteRoomAudio } from "./RemoteMicrophone";
 import { prepareClassroomAssets } from './classroom-loading';
 import { RoomLoadingScreen } from './RoomLoadingScreen';
-import { useClassroomEntry } from './use-classroom-entry';
 import { createChatSyncRequest } from "./chat-sync-request";
 import { startChatSyncLifecycle } from "./chat-sync-lifecycle";
 import { decodeVapidKey, subscriptionNeedsRenewal } from "./push-subscription";
@@ -215,8 +214,6 @@ export default function Home() {
   const [chatHistoryLoading, setChatHistoryLoading] = useState(false);
   const [chatHistoryCursor, setChatHistoryCursor] = useState<string | null>(null);
   const [chatHistoryReady, setChatHistoryReady] = useState(false);
-  const [collaborationEntry, setCollaborationEntry] = useState<string | null>(null);
-  const [bellEntry, setBellEntry] = useState<string | null>(null);
   const [chatQuote, setChatQuote] = useState<ChatQuote | null>(null);
   const [messageMenuId, setMessageMenuId] = useState("");
   const [messageMenuPlacement, setMessageMenuPlacement] = useState<"above" | "below">("below");
@@ -289,7 +286,6 @@ export default function Home() {
   }, []);
 
   const classroomProfile = useClassroomProfile(joined, broadcastRoomMessage);
-  const classroomEntry = useClassroomEntry(profileReady && joined && classroomProfile.ready && chatHistoryReady && collaborationEntry === '' && bellEntry === '');
 
   const updateBoards = useCallback((update: (current: RoomBoard[]) => RoomBoard[]) => {
     const next = update(boardsRef.current).filter(board => !deletedBoardIdsRef.current.has(board.id));
@@ -671,7 +667,7 @@ export default function Home() {
     }
     if (chatAtBottomRef.current) scrollChatToBottom("auto");
     else list.scrollTop = chatSavedScrollTopRef.current;
-  }, [messages, sideView, scrollChatToBottom, classroomProfile.ready]);
+  }, [messages, sideView, scrollChatToBottom]);
 
 
   const taskLoadVersionRef = useRef(0);
@@ -801,16 +797,16 @@ export default function Home() {
         if (!response.ok) throw new Error("无法加载聊天记录");
         const data = await response.json() as { messages?: unknown; nextCursor?: unknown };
         if (disposed) return;
-        if (!Array.isArray(data.messages)) throw new Error("无法加载聊天记录");
-        const incoming = data.messages.map((item) => normalizeIncomingMessage(item, identityIdRef.current)).filter((item): item is ChatMessage => Boolean(item));
+        const incoming = Array.isArray(data.messages)
+          ? data.messages.map((item) => normalizeIncomingMessage(item, identityIdRef.current)).filter((item): item is ChatMessage => Boolean(item))
+          : [];
         chatSyncCursorRef.current = incoming.reduce((latest, message) => Math.max(latest, message.createdAt || 0), chatSyncCursorRef.current);
         setMessages((current) => mergeChatMessages(incoming, current));
         setChatHistoryCursor(typeof data.nextCursor === "string" ? data.nextCursor : null);
-        setChatHistoryReady(true);
       } catch (error) {
         if (!disposed) setChatImageError(error instanceof Error ? error.message : "无法加载聊天记录");
       } finally {
-        if (!disposed) setChatHistoryLoading(false);
+        if (!disposed) { setChatHistoryLoading(false); setChatHistoryReady(true); }
       }
     };
     void loadInitialChat();
@@ -2319,8 +2315,7 @@ export default function Home() {
   }
 
   return (
-    <>
-    <main ref={classroomEntry.root} className="app-shell classroom-scene" id="top" data-device-font={classroomProfile.profile.font} inert={!classroomEntry.ready} aria-hidden={!classroomEntry.ready}>
+    <main className="app-shell classroom-scene" id="top" data-device-font={classroomProfile.profile.font}>
       <section className="workspace">
         <section className="focus-stage panel">
           {roomError && <p className="room-error" role="alert">{roomError}</p>}
@@ -2526,7 +2521,7 @@ export default function Home() {
         <div className="classroom-desk desk-media">
           <button className="object-button" type="button" onClick={createBoard} aria-label="画板"  aria-pressed={!!activeBoard}><ClassroomProp name="chalk-cup" /></button>
           <button className="object-button calendar-entry-button" type="button" aria-label="双人日历" ><ClassroomProp name="calendar-entry" /></button>
-          <RoomCollaboration key={identityId} identityId={identityId} onChanged={loadTasks} onNotice={playNotificationSound} onPublicTasks={setPublicTasks} onInitialLoad={setCollaborationEntry} active={classroomEntry.ready} triggerContent={<ClassroomProp name="taskboard" />} />
+          <RoomCollaboration key={identityId} identityId={identityId} onChanged={loadTasks} onNotice={playNotificationSound} onPublicTasks={setPublicTasks} triggerContent={<ClassroomProp name="taskboard" />} />
 
         </div>
         <div className="classroom-desk desk-room">
@@ -2545,7 +2540,7 @@ export default function Home() {
         ...Object.entries(remoteScreens).filter(([peer]) => peerIdentityIds[peer] !== identityId).map(([peer, media]) => ({ id: `screen:${peer}`, stream: media, muted: remoteScreenMuted })),
       ]} />
       {microphoneError && <p className="room-microphone-error" role="alert">{microphoneError}</p>}
-      <RoomBell triggerHost={bellHost} onShowChat={showBellChat} onInitialLoad={setBellEntry} active={classroomEntry.ready} />
+      <RoomBell triggerHost={bellHost} onShowChat={showBellChat} />
       {profileReady && !joined && <p className="error-message" role="alert">{joinError || "正在进入自习室…"}</p>}
 
       {cloudOpen && <CloudDrive onClose={() => setCloudOpen(false)} onStatusChange={setCloudStatus} onImage={openChatImage} />}
@@ -2574,7 +2569,5 @@ export default function Home() {
         </div>
       )}
     </main>
-    {!classroomEntry.ready && <RoomLoadingScreen cover displayName={displayName} error={classroomEntry.error || collaborationEntry || bellEntry || (!chatHistoryReady ? chatImageError : '')} onRetry={() => window.location.reload()} />}
-    </>
   );
 }
