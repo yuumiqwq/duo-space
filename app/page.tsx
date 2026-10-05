@@ -1,6 +1,7 @@
 "use client";
 
 import { createCameraCapture } from './camera-capture';
+import { createIncomingMediaRecovery } from './incoming-media-recovery';
 import { onMediaForeground } from './media-foreground';
 import { attachVideoPlayback } from './video-playback';
 import { taskRefresh } from "./task-refresh";
@@ -1027,6 +1028,15 @@ export default function Home() {
         callPeer(peerId, media, source);
       },
     });
+    const incomingRecovery = createIncomingMediaRecovery({
+      send: (peerId, source) => {
+        const connection = connections.get(peerId);
+        if (disposed || !connection?.open) return false;
+        try { connection.send({ type: 'media-request', repair: true, source }); return true; }
+        catch { return false; }
+      },
+      reconnect: peerId => { if (!disposed) connectToPeer(peerId); },
+    });
     recoverPublishedMediaRef.current = (source) => mediaRecovery.request(source);
     const connectionTimers = new Set<number>();
     let reconnectStartedAt = 0;
@@ -1166,6 +1176,7 @@ export default function Home() {
       presenceTimer = window.setInterval(() => {
         recoverRoomConnection();
         mediaRecovery.flush();
+        incomingRecovery.flush();
         connections.forEach((connection) => {
           const state = connection.peerConnection?.connectionState;
           if (state === "failed" || state === "closed") connection.close();
@@ -1195,10 +1206,14 @@ export default function Home() {
             if (frames > progress.frames) { progress.frames = frames; progress.changedAt = Date.now(); }
             const failed = ["failed", "closed"].includes(call.peerConnection.connectionState);
             if (failed || Date.now() - progress.changedAt > 20_000) {
-              const connection = connections.get(call.peer);
-              if (connection?.open) {
-                progress.changedAt = Date.now();
-                connection.send({ type: "media-request", repair: true, source: key.startsWith('microphone:') ? 'microphone' : key.startsWith("screen:") ? "screen" : "camera" });
+              progress.changedAt = Date.now();
+              const source = key.startsWith('microphone:') ? 'microphone' : key.startsWith('screen:') ? 'screen' : 'camera';
+              incomingRecovery.request(call.peer, source);
+              if (failed && incomingCalls.get(key) === call) {
+                incomingCalls.delete(key);
+                mediaProgress.delete(call);
+                removeRemoteMedia(call.peer, source);
+                call.close();
               }
             }
           }).catch(() => undefined).finally(() => { progress.checking = false; });
@@ -1256,6 +1271,7 @@ export default function Home() {
 
     const removePeer = (peerId: string) => {
       mediaRecovery.forget(peerId);
+      incomingRecovery.forget(peerId);
       const removalTimer = peerRemovalTimers.get(peerId);
       if (removalTimer !== undefined) window.clearTimeout(removalTimer);
       peerRemovalTimers.delete(peerId);
@@ -1553,7 +1569,6 @@ export default function Home() {
           incomingCalls.set(key, call);
           previous?.close();
           if (previous) mediaProgress.delete(previous);
-          call.answer();
           call.on("stream", (remoteStream) => {
             if (disposed || incomingCalls.get(key) !== call) return;
             const setter = source === "microphone" ? setRemoteMicrophones : source === "camera" ? setRemoteCameras : setRemoteScreens;
@@ -1575,7 +1590,12 @@ export default function Home() {
             if (incomingCalls.get(key) !== call) return;
             incomingCalls.delete(key);
             removeRemoteMedia(peerId, source);
+            call.close();
+            incomingRecovery.request(peerId, source);
           });
+          call.answer();
+          // Incoming media does not guarantee a matching data channel exists.
+          if (!connections.get(peerId)?.open) connectToPeer(peerId);
         };
 
         const attachPeer = (peer: PeerClient) => {
