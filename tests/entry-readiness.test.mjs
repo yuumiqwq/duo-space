@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { withLoadingTimeout } from '../app/loading-timeout.ts';
-import { classroomEntryFonts, classroomEntryImages, prepareClassroomAssets } from '../app/classroom-loading.ts';
+import { classroomEntryFonts, classroomEntryImages, loadClassroomImage, prepareClassroomAssets } from '../app/classroom-loading.ts';
 
 test('entry assets exist and entry remains pending until font loading and image decoding finish', async () => {
   for (const resource of classroomEntryFonts) assert.equal((await readFile('public' + resource.url)).subarray(0,4).toString(), 'wOF2');
@@ -40,4 +40,22 @@ test('a hung font times out and retry uses a fresh request', async () => {
     await loadFontResources(resources, 100); assert.equal(calls,2);
     await assert.rejects(withLoadingTimeout(new Promise(() => {}), 5), /超时/);
   } finally { Object.assign(globalThis, original); }
+});
+
+test('image decode failures can retry and a mounted scene redecodes the retained image', async () => {
+  const original = globalThis.Image;
+  let created = 0, decoded = 0;
+  globalThis.Image = class {
+    naturalWidth = 20;
+    constructor() { created++; }
+    set src(value) { if (value) queueMicrotask(() => this.onload()); }
+    decode() { return ++decoded === 1 ? Promise.reject(new Error('decode failed')) : Promise.resolve(); }
+  };
+  try {
+    await assert.rejects(loadClassroomImage('/decode-test.svg'), /decode failed/);
+    await loadClassroomImage('/decode-test.svg');
+    await loadClassroomImage('/decode-test.svg');
+    assert.equal(created, 2, 'failed images are replaced; successful image objects are retained');
+    assert.equal(decoded, 3, 'mounting can request a fresh decode even after preload');
+  } finally { globalThis.Image = original; }
 });

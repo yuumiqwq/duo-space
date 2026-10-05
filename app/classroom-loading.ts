@@ -16,29 +16,34 @@ export const classroomEntryImages = [
   '/classroom/tablet-on.svg', '/classroom/tablet-off.svg',
   '/classroom/laptop-on.svg', '/classroom/laptop-off.svg',
   '/classroom/mouse-white.svg',
-  '/classroom/chalk-cup-flat.svg', '/classroom/settings-flat.svg',
+  '/classroom/chalk-cup-flat.svg', '/classroom/settings-flat.svg', '/classroom/bell-flat.svg',
   '/classroom/calendar-entry.svg', '/classroom/folder-flat.svg',
   '/classroom/taskboard-flat.svg', '/classroom/projector-on.svg', '/classroom/projector-off.svg', '/classroom/fabric.webp',
+  '/classroom/emergency-exit.svg', '/classroom/pencil-tip.svg', '/classroom/chalk/expand.svg',
 ];
 
-const images = new Map<string, Promise<void>>();
+// Keep decoded images alive until the actual scene has had a chance to paint.
+const images = new Map<string, { image: HTMLImageElement; loaded: Promise<void> }>();
 let preparing: Promise<void> | undefined;
 
-function loadImage(url: string) {
-  let pending = images.get(url);
-  if (!pending) {
+export function loadClassroomImage(url: string): Promise<void> {
+  let entry = images.get(url);
+  if (!entry) {
     const image = new Image();
-    pending = withLoadingTimeout(new Promise<void>((resolve, reject) => {
+    const loaded = withLoadingTimeout(new Promise<void>((resolve, reject) => {
       image.onload = () => {
-        if (!image.naturalWidth) { reject(new Error('教室图片未能加载，请重试。')); return; }
-        void (image.decode ? image.decode() : Promise.resolve()).then(() => resolve(), reject);
+        if (!image.naturalWidth) { reject(new Error(`Classroom image has no pixels: ${url}`)); return; }
+        resolve();
       };
-      image.onerror = () => reject(new Error('教室图片未能加载，请重试。'));
+      image.onerror = () => reject(new Error(`教室图片未能加载: ${url}`));
       image.src = url;
-    })).catch(error => { images.delete(url); image.src = ''; throw error; });
-    images.set(url, pending);
+    })).catch(error => { if (images.get(url)?.image === image) images.delete(url); image.src = ''; throw error; });
+    entry = { image, loaded };
+    images.set(url, entry);
   }
-  return pending;
+  const current = entry;
+  return current.loaded.then(() => withLoadingTimeout(current.image.decode ? current.image.decode() : Promise.resolve()))
+    .catch(error => { if (images.get(url) === current) images.delete(url); throw error; });
 }
 
 // Both login and direct room entry wait on this shared preparation. Never cache a failed attempt.
@@ -47,7 +52,7 @@ export function prepareClassroomAssets(): Promise<void> {
     preparing = withLoadingTimeout(Promise.all([
       loadDeviceFont(CLASSROOM_DEVICE_FONT),
       loadFontResources(classroomEntryFonts),
-      ...classroomEntryImages.map(loadImage),
+      ...classroomEntryImages.map(loadClassroomImage),
     ])).then(() => undefined).catch(error => { preparing = undefined; throw error; });
   }
   return preparing;

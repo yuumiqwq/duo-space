@@ -9,6 +9,8 @@ import { taskRefresh } from "./task-refresh";
 import { AudioPlayer } from "./AudioPlayer";
 import { RemoteRoomAudio } from "./RemoteMicrophone";
 import { prepareClassroomAssets } from './classroom-loading';
+import { loadClassroomPublicTasks } from './classroom-entry';
+import { useClassroomEntry } from './use-classroom-entry';
 import { RoomLoadingScreen } from './RoomLoadingScreen';
 import { createChatSyncRequest } from "./chat-sync-request";
 import { startChatSyncLifecycle } from "./chat-sync-lifecycle";
@@ -286,6 +288,7 @@ export default function Home() {
   }, []);
 
   const classroomProfile = useClassroomProfile(joined, broadcastRoomMessage);
+  const entry = useClassroomEntry(profileReady && joined && classroomProfile.ready && chatHistoryReady);
 
   const updateBoards = useCallback((update: (current: RoomBoard[]) => RoomBoard[]) => {
     const next = update(boardsRef.current).filter(board => !deletedBoardIdsRef.current.has(board.id));
@@ -667,7 +670,7 @@ export default function Home() {
     }
     if (chatAtBottomRef.current) scrollChatToBottom("auto");
     else list.scrollTop = chatSavedScrollTopRef.current;
-  }, [messages, sideView, scrollChatToBottom]);
+  }, [messages, sideView, scrollChatToBottom, classroomProfile.ready]);
 
 
   const taskLoadVersionRef = useRef(0);
@@ -842,9 +845,11 @@ export default function Home() {
             setDisplayName(nickname || identityName || "成员");
           }
         });
-        await Promise.all([profile, prepareClassroomAssets(), refreshDeletedBoards()]);
+        const publicTasks = loadClassroomPublicTasks().then(tasks => { if (!disposed) setPublicTasks(tasks); });
+        await Promise.all([profile, prepareClassroomAssets(), refreshDeletedBoards(), publicTasks]);
         if (!disposed) setJoined(true);
       } catch (error) {
+        console.error('Classroom entry preparation failed', error);
         if (!disposed) setJoinError(error instanceof Error && error.message !== 'profile unavailable' ? error.message : "暂时无法读取身份资料，请重试。");
       } finally {
         if (!disposed) setProfileReady(true);
@@ -2315,7 +2320,8 @@ export default function Home() {
   }
 
   return (
-    <main className="app-shell classroom-scene" id="top" data-device-font={classroomProfile.profile.font}>
+    <>
+    <main ref={entry.root} className="app-shell classroom-scene" id="top" data-device-font={classroomProfile.profile.font} inert={!entry.ready} aria-hidden={!entry.ready || undefined}>
       <section className="workspace">
         <section className="focus-stage panel">
           {roomError && <p className="room-error" role="alert">{roomError}</p>}
@@ -2521,7 +2527,7 @@ export default function Home() {
         <div className="classroom-desk desk-media">
           <button className="object-button" type="button" onClick={createBoard} aria-label="画板"  aria-pressed={!!activeBoard}><ClassroomProp name="chalk-cup" /></button>
           <button className="object-button calendar-entry-button" type="button" aria-label="双人日历" ><ClassroomProp name="calendar-entry" /></button>
-          <RoomCollaboration key={identityId} identityId={identityId} onChanged={loadTasks} onNotice={playNotificationSound} onPublicTasks={setPublicTasks} triggerContent={<ClassroomProp name="taskboard" />} />
+          <RoomCollaboration key={identityId} identityId={identityId} entryReady={entry.ready} onChanged={loadTasks} onNotice={playNotificationSound} onPublicTasks={setPublicTasks} triggerContent={<ClassroomProp name="taskboard" />} />
 
         </div>
         <div className="classroom-desk desk-room">
@@ -2540,7 +2546,7 @@ export default function Home() {
         ...Object.entries(remoteScreens).filter(([peer]) => peerIdentityIds[peer] !== identityId).map(([peer, media]) => ({ id: `screen:${peer}`, stream: media, muted: remoteScreenMuted })),
       ]} />
       {microphoneError && <p className="room-microphone-error" role="alert">{microphoneError}</p>}
-      <RoomBell triggerHost={bellHost} onShowChat={showBellChat} />
+      <RoomBell triggerHost={bellHost} onShowChat={showBellChat} entryReady={entry.ready} />
       {profileReady && !joined && <p className="error-message" role="alert">{joinError || "正在进入自习室…"}</p>}
 
       {cloudOpen && <CloudDrive onClose={() => setCloudOpen(false)} onStatusChange={setCloudStatus} onImage={openChatImage} />}
@@ -2569,5 +2575,7 @@ export default function Home() {
         </div>
       )}
     </main>
+    {!entry.ready && <RoomLoadingScreen overlay displayName={displayName} error={entry.error} onRetry={() => window.location.reload()} />}
+    </>
   );
 }

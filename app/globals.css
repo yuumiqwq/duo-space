@@ -580,6 +580,7 @@ body { overflow: hidden; }
 .room-entry-spinner { display: block; width: 36px; height: 36px; margin: 28px auto 18px; border: 3px solid #d9decd; border-top-color: #527769; border-radius: 50%; animation: room-entry-spin 1s linear infinite; }
 .workflow-sync-spinner { display: inline-block; width: 18px; height: 18px; border: 2px solid #d9decd; border-top-color: #527769; border-radius: 50%; animation: room-entry-spin 1s linear infinite; }
 @keyframes room-entry-spin { to { transform: rotate(360deg); } }
+.room-entry-overlay { position: fixed; inset: 0; z-index: 2000; background: radial-gradient(circle at 50% 0%, #fff 0, var(--theme-soft) 30rem, var(--theme-soft) 100%); }
 .chat-form {
   flex: 0 0 auto;
   grid-template-columns: minmax(0, 1fr);

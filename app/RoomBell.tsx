@@ -9,7 +9,7 @@ import { ClassroomProp } from "./ClassroomScene";
 import { placeBellPanel } from "./bell-position";
 
 type Snapshot = { identityId: string; rings: Ring[]; members: { id: string; name: string }[]; serverNow: number };
-export function RoomBell({ triggerHost, onShowChat }: { triggerHost: HTMLElement | null; onShowChat: () => void }) {
+export function RoomBell({ triggerHost, onShowChat, entryReady = true }: { triggerHost: HTMLElement | null; onShowChat: () => void; entryReady?: boolean }) {
   const [data, setData] = useState<Snapshot | null>(null);
   const [openFor, setOpenFor] = useState<HTMLElement | null>(null);
   const open = !!triggerHost && openFor === triggerHost;
@@ -61,13 +61,14 @@ export function RoomBell({ triggerHost, onShowChat }: { triggerHost: HTMLElement
     return () => { stopped = true; invalidatePending(); clearTimeout(timer); document.removeEventListener("visibilitychange", resume); window.removeEventListener("online", resume); window.removeEventListener("focus", resume); };
   }, [refresh]);
   useEffect(() => {
+    if (!entryReady) return;
     const timer = setTimeout(() => {
       if (notificationLinkHandled.current || !new URLSearchParams(window.location.search).has("ring")) return;
       onShowChat();
       if (triggerHost) { notificationLinkHandled.current = true; setOpenFor(triggerHost); }
     }, 0);
     return () => clearTimeout(timer);
-  }, [triggerHost, onShowChat]);
+  }, [triggerHost, onShowChat, entryReady]);
   useEffect(() => { const timer = setInterval(() => setNow(Date.now() + offset.current), 1000); return () => clearInterval(timer); }, []);
   useEffect(() => {
     if (!open) return;
