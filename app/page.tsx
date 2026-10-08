@@ -14,12 +14,12 @@ import { useClassroomEntry } from './use-classroom-entry';
 import { RoomLoadingScreen } from './RoomLoadingScreen';
 import { createChatSyncRequest } from "./chat-sync-request";
 import { startChatSyncLifecycle } from "./chat-sync-lifecycle";
-import { decodeVapidKey, subscriptionNeedsRenewal } from "./push-subscription";
+import { checkPushSubscription, decodeVapidKey, type PushStatus } from "./push-subscription";
 
 import { FormEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Camera, ChevronLeft, ChevronRight, Volume2, VolumeX, X, Paperclip, File, Download, Undo2, Quote, Copy, Check, PictureInPicture2, MessageCircle, ListTodo } from "lucide-react";
 import { Room, RoomEvent, Track } from "livekit-client";
-import { createMediaRecovery, mediaCallReusable, type MediaSource } from "./media-recovery";
+import { createMediaRecovery, mediaCallReusable, mediaNeedsRepair, type MediaSource } from "./media-recovery";
 import type { DataConnection, MediaConnection, Peer as PeerClient, PeerOptions } from "peerjs";
 import { BoardStroke, BoardText, RoomBoard, Whiteboard } from "./Whiteboard";
 import { INITIAL_BOARD_EPOCH, normalizeBoardStroke, normalizeBoardText, normalizeBoard, sortBoardStrokes, mergeBoard } from "./board-state";
@@ -152,16 +152,16 @@ const mergeChatMessages = (incoming: ChatMessage[], current: ChatMessage[]) => {
 };
 
 
-function MediaVideo({ stream, label, className }: { stream: MediaStream; label: string; className: string }) {
+function MediaVideo({ stream, label, className, screen }: { stream: MediaStream; label: string; className: string; screen: boolean }) {
   const ref = useRef<HTMLVideoElement>(null);
   const playback = useRef<ReturnType<typeof attachVideoPlayback> | null>(null);
   const [blocked, setBlocked] = useState(false);
   useEffect(() => {
     if (!ref.current) return;
-    const controller = attachVideoPlayback(ref.current, stream, { blocked: setBlocked });
+    const controller = attachVideoPlayback(ref.current, stream, { blocked: setBlocked, screen });
     playback.current = controller;
     return () => { controller.dispose(); playback.current = null; };
-  }, [stream]);
+  }, [stream, screen]);
   return <>
     <video className={className} ref={ref} autoPlay muted playsInline disablePictureInPicture={false} aria-label={label} />
     {blocked && <div className="media-window-actions"><button className="remote-audio-button" type="button" onClick={() => playback.current?.resume()}>播放画面</button></div>}
@@ -229,7 +229,8 @@ export default function Home() {
   const activitySavingRef = useRef(false);
   const [memberActivities, setMemberActivities] = useState<Record<string, string>>({});
   const [peerIdentityIds, setPeerIdentityIds] = useState<Record<string, string>>({});
-  const [pushEnabled, setPushEnabled] = useState(false);
+  const [pushStatus, setPushStatus] = useState<PushStatus>("checking");
+  const [pushCheckVersion, setPushCheckVersion] = useState(0);
   const [pushBusy, setPushBusy] = useState(false);
   const [pushTesting, setPushTesting] = useState(false);
   const [pushTestMessage, setPushTestMessage] = useState("");
@@ -479,45 +480,47 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    if (!("serviceWorker" in navigator) || !("PushManager" in window) || !identityId || pushBusy) return;
+    if (!identityId || pushBusy) return;
     let disposed = false;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
     const requests = createChatSyncRequest();
     const initializePush = async () => {
+      clearTimeout(retryTimer);
       if (document.visibilityState !== "visible") { requests.cancel(); return; }
       if (disposed) return;
       const request = requests.begin();
       if (!request) return;
+      setPushStatus("checking");
+      setPushTestMessage("");
+      const unavailable = () => {
+        setPushStatus("unknown");
+        setPushMessage("暂时无法确认后台提醒状态，请检查网络后重试。");
+        retryTimer = setTimeout(() => void initializePush(), 30_000);
+      };
       try {
-        if (!("Notification" in window) || Notification.permission !== "granted") {
-          setPushEnabled(false);
+        if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {
+          setPushStatus("unsupported");
+          setPushMessage("");
+          return;
+        }
+        if (Notification.permission !== "granted") {
+          setPushStatus("disabled");
+          setPushMessage("");
           return;
         }
         pushDeviceIdRef.current = window.localStorage.getItem("11scat-push-device-id") || crypto.randomUUID();
         window.localStorage.setItem("11scat-push-device-id", pushDeviceIdRef.current);
         const registration = await navigator.serviceWorker.register("/sw.js");
-        const subscription = await registration.pushManager.getSubscription();
+        const status = await checkPushSubscription(registration, pushDeviceIdRef.current, request.signal);
         if (disposed || !request.isCurrent()) return;
-        if (!subscription) {
-          setPushEnabled(false);
-          return;
+        if (status === "unknown") {
+          unavailable();
+        } else {
+          setPushStatus(status);
+          setPushMessage(status === "renewal" ? "订阅已失效，请重新开启提醒。" : "");
         }
-        const keyResponse = await fetch("/api/push/public-key", { cache: "no-store", signal: request.signal });
-        const keyData = await keyResponse.json();
-        if (!keyResponse.ok || !keyData.publicKey) throw new Error("推送配置不可用");
-        if (subscriptionNeedsRenewal(subscription, keyData.publicKey)) {
-          if (!disposed && request.isCurrent()) { setPushEnabled(false); setPushMessage("订阅已失效，请重新开启提醒。"); }
-          return;
-        }
-        // Refresh the authenticated server record, not just the local browser flag.
-        const response = await fetch("/api/push/subscriptions", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ subscription: subscription.toJSON(), deviceId: pushDeviceIdRef.current }),
-          signal: request.signal,
-        });
-        if (!response.ok || response.redirected) throw new Error("订阅同步失败");
-        if (!disposed && request.isCurrent()) { setPushEnabled(true); setPushMessage(""); }
       } catch {
-        if (!disposed && request.isLatest()) { setPushEnabled(false); setPushMessage("暂时无法确认后台提醒状态，请检查网络后重新开启提醒。"); }
+        if (!disposed && request.isLatest()) unavailable();
       } finally { request.finish(); }
     };
     void initializePush();
@@ -526,11 +529,12 @@ export default function Home() {
     window.addEventListener("pageshow", initializePush);
     return () => {
       disposed = true; requests.cancel();
+      clearTimeout(retryTimer);
       document.removeEventListener("visibilitychange", initializePush);
       window.removeEventListener("online", initializePush);
       window.removeEventListener("pageshow", initializePush);
     };
-  }, [identityId, pushBusy]);
+  }, [identityId, pushBusy, pushCheckVersion]);
 
   const enablePushNotifications = async () => {
     setPushBusy(true);
@@ -567,7 +571,7 @@ export default function Home() {
         signal: AbortSignal.timeout(10_000),
       });
       if (!response.ok || response.redirected) throw new Error("通知订阅保存失败，请检查登录状态后重试");
-      setPushEnabled(true);
+      setPushStatus("enabled");
       setPushMessage("提醒已开启。");
     } catch (error) {
       setPushMessage(error instanceof Error ? error.message : "开启消息提醒失败");
@@ -587,7 +591,7 @@ export default function Home() {
         if (!response.ok || response.redirected) throw new Error("取消订阅失败");
         if (!await subscription.unsubscribe()) throw new Error("设备取消订阅失败");
       }
-      setPushEnabled(false);
+      setPushStatus("disabled");
       setPushMessage("此设备的消息提醒已关闭。");
     } catch {
       setPushMessage("关闭失败，请在系统通知设置中关闭 11scat。");
@@ -1016,7 +1020,7 @@ export default function Home() {
     const mobilePeerIds = new Set<string>();
     const peerRemovalTimers = new Map<string, number>();
     const pendingPeerIds = new Set<string>();
-    const mediaProgress = new Map<MediaConnection, { frames: number; changedAt: number; checking: boolean }>();
+    const mediaProgress = new Map<MediaConnection, { frames: number; packetsAtFrame: number; changedAt: number; checking: boolean }>();
     const mediaRecovery = createMediaRecovery({
       peers: () => Array.from(connections.keys()),
       canSend: (peerId) => !disposed && Boolean(localPeer?.open && connections.get(peerId)?.open),
@@ -1191,24 +1195,24 @@ export default function Home() {
           }
         });
         incomingCalls.forEach((call, key) => {
-          const progress = mediaProgress.get(call) || { frames: -1, changedAt: Date.now(), checking: false };
+          const progress = mediaProgress.get(call) || { frames: -1, packetsAtFrame: 0, changedAt: Date.now(), checking: false };
           mediaProgress.set(call, progress);
           if (progress.checking || !call.peerConnection) return;
           progress.checking = true;
           void call.peerConnection.getStats().then((stats) => {
             if (disposed || incomingCalls.get(key) !== call) return;
-            let frames = 0;
+            let frames = 0, packets = 0;
             stats.forEach((report) => {
               const kind = report.kind || report.mediaType;
               if (report.type !== 'inbound-rtp') return;
               if (key.startsWith('microphone:') && kind === 'audio') frames += report.packetsReceived || 0;
-              else if (kind === 'video') frames += report.framesDecoded || 0;
+              else if (kind === 'video') { frames += report.framesDecoded || 0; packets += report.packetsReceived || 0; }
             });
-            if (frames > progress.frames) { progress.frames = frames; progress.changedAt = Date.now(); }
+            if (frames > progress.frames) { progress.frames = frames; progress.packetsAtFrame = packets; progress.changedAt = Date.now(); }
             const failed = ["failed", "closed"].includes(call.peerConnection.connectionState);
-            if (failed || Date.now() - progress.changedAt > 20_000) {
+            const source = key.startsWith('microphone:') ? 'microphone' : key.startsWith('screen:') ? 'screen' : 'camera';
+            if (mediaNeedsRepair(source, call.peerConnection.connectionState, Date.now() - progress.changedAt > 20_000, frames, packets - progress.packetsAtFrame)) {
               progress.changedAt = Date.now();
-              const source = key.startsWith('microphone:') ? 'microphone' : key.startsWith('screen:') ? 'screen' : 'camera';
               incomingRecovery.request(call.peer, source);
               if (failed && incomingCalls.get(key) === call) {
                 incomingCalls.delete(key);
@@ -1647,16 +1651,16 @@ export default function Home() {
     };
 
     const resumeMedia = () => {
-      // This page is also a publisher. Remote requests alone repair the wrong
-      // direction when our own screen sender was suspended in the background.
-      mediaRecovery.request("screen");
+      // Reconcile screen calls without tearing down an established capture.
+      // Failed calls and stalled decoding are repaired by the receiver checks.
       mediaRecovery.request("camera");
       // Focus/visibility alone do not indicate a microphone failure. Keep the
       // established call; the receiver requests repair if audio packets stall.
       // Re-request even when the old MediaConnection still reports open.
       connections.forEach((connection) => {
         if (!connection.open) return;
-        connection.send({ type: "media-request", repair: true, source: "screen" });
+        connection.send({ type: "media-request", source: "screen" });
+        if (screenStreamRef.current) callPeer(connection.peer, screenStreamRef.current, "screen");
         connection.send({ type: "media-request", repair: true, source: "camera" });
       });
     };
@@ -2340,6 +2344,7 @@ export default function Home() {
             <div className={projection.open ? "projection-sheet is-open" : "projection-sheet"} aria-hidden={!projection.open}>
               {activeMedia && projection.open && <>
               <MediaVideo
+                screen={activeMedia.kind === "screen"}
                 className={`main-media ${activeMedia.kind}${activeMedia.remote ? " remote" : ""}`}
                 stream={activeMedia.stream}
                 label={activeMedia.label}
@@ -2533,8 +2538,11 @@ export default function Home() {
         <div className="classroom-desk desk-room">
           <button className="object-button cloud-entry-button" type="button" onClick={openCloud} aria-label="云盘" ><ClassroomProp name="folder" /></button>
           <ClassroomSettings profile={classroomProfile.profile} identityId={identityId} onSave={classroomProfile.save} error={classroomProfile.error} triggerContent={<ClassroomProp name="settings" />} notifications={<>
-            <button type="button" disabled={pushBusy || pushTesting} onClick={() => void (pushEnabled ? disablePushNotifications() : enablePushNotifications())}>{pushBusy ? "处理中…" : pushEnabled ? "关闭此设备提醒" : "开启此设备提醒"}</button>
-            <button type="button" disabled={pushBusy || pushTesting || !pushEnabled} onClick={() => void testPushNotifications()}>{pushTesting ? "测试中…" : "发送测试提醒"}</button>
+            <button type="button" disabled={pushBusy || pushTesting || pushStatus === "checking" || pushStatus === "unsupported"} onClick={() => {
+              if (pushStatus === "unknown") { setPushStatus("checking"); setPushCheckVersion(version => version + 1); }
+              else void (pushStatus === "enabled" ? disablePushNotifications() : enablePushNotifications());
+            }}>{pushBusy ? "处理中…" : pushStatus === "checking" ? "检查提醒状态…" : pushStatus === "unknown" ? "重新检查提醒" : pushStatus === "unsupported" ? "当前环境不支持提醒" : pushStatus === "enabled" ? "关闭此设备提醒" : pushStatus === "renewal" ? "重新开启此设备提醒" : "开启此设备提醒"}</button>
+            <button type="button" disabled={pushBusy || pushTesting || pushStatus !== "enabled"} onClick={() => void testPushNotifications()}>{pushTesting ? "测试中…" : "发送测试提醒"}</button>
             {(pushMessage || pushTestMessage) && <p role="status">{pushTestMessage || pushMessage}</p>}
           </>} />
         </div>

@@ -2,6 +2,27 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { onMediaForeground } from '../app/media-foreground.ts';
 import { attachVideoPlayback } from '../app/video-playback.ts';
+import { readFile } from 'node:fs/promises';
+import { runInNewContext } from 'node:vm';
+
+test('foreground reconciliation never requests a forced screen reconnect', async () => {
+  const page = await readFile('app/page.tsx', 'utf8');
+  const start = page.indexOf('    const resumeMedia = () => {');
+  const end = page.indexOf('    const handleVisibilityChange', start);
+  assert.ok(start > 0 && end > start);
+  const repairs = [], messages = [], calls = [];
+  const stream = {};
+  runInNewContext(page.slice(start, end) + '\nresumeMedia();', {
+    mediaRecovery: { request: source => repairs.push(source) },
+    connections: new Map([['peer', { open: true, peer: 'peer', send: message => messages.push(message) }]]),
+    screenStreamRef: { current: stream },
+    callPeer: (...args) => calls.push(args),
+  });
+  assert.deepEqual(repairs, ['camera']);
+  assert.ok(messages.some(message => message.source === 'screen' && !message.repair));
+  assert.ok(!messages.some(message => message.source === 'screen' && message.repair));
+  assert.deepEqual(calls, [['peer', stream, 'screen']]);
+});
 
 function setup(t) {
   t.mock.timers.enable({ apis: ['setTimeout'] });
@@ -66,5 +87,32 @@ test('focus return reattaches a frozen decoder even when paused is false; PiP st
   s.doc.pictureInPictureElement = video;
   s.win.dispatchEvent(new Event('focus')); t.mock.timers.tick(250);
   assert.equal(video.detaches, before + 1);
+  playback.dispose(); s.dispose();
+});
+
+test('healthy screen playback stays attached across focus, track changes and unmute; empty playback recovers', t => {
+  const s = setup(t);
+  class Video extends EventTarget {
+    paused = false; readyState = 4; detaches = 0;
+    set srcObject(value) { if (value === null) this.detaches++; this.source = value; }
+    get srcObject() { return this.source; }
+    play() { this.paused = false; return Promise.resolve(); }
+    pause() { this.paused = true; }
+  }
+  const track = new EventTarget(); track.readyState = 'live'; track.muted = false;
+  const stream = new EventTarget(); stream.getVideoTracks = () => [track];
+  const video = new Video();
+  const playback = attachVideoPlayback(video, stream, { document: s.doc, window: s.win, screen: true, blocked: () => {} });
+  for (const event of ['focus', 'pageshow']) { s.win.dispatchEvent(new Event(event)); t.mock.timers.tick(250); }
+  stream.dispatchEvent(new Event('addtrack'));
+  track.dispatchEvent(new Event('unmute'));
+  assert.equal(video.detaches, 0);
+  video.paused = true;
+  s.win.dispatchEvent(new Event('focus')); t.mock.timers.tick(250);
+  assert.equal(video.paused, false);
+  assert.equal(video.detaches, 0);
+  video.readyState = 0;
+  s.win.dispatchEvent(new Event('focus')); t.mock.timers.tick(250);
+  assert.equal(video.detaches, 1);
   playback.dispose(); s.dispose();
 });

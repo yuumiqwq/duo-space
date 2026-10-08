@@ -1,6 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createMediaRecovery, mediaCallReusable } from '../app/media-recovery.ts';
+import { createMediaRecovery, mediaCallReusable, mediaNeedsRepair } from '../app/media-recovery.ts';
+
+test('static screens do not reconnect periodically; failed transport and stalled decoding still recover', () => {
+  assert.equal(mediaNeedsRepair('screen', 'connected', true, 120, 0), false);
+  assert.equal(mediaNeedsRepair('screen', 'connected', true, 120, 20), true);
+  assert.equal(mediaNeedsRepair('screen', 'connected', true, 0, 0), true);
+  assert.equal(mediaNeedsRepair('screen', 'disconnected', true, 120, 0), true);
+  assert.equal(mediaNeedsRepair('screen', 'failed', false, 120, 0), true);
+  assert.equal(mediaNeedsRepair('camera', 'connected', true, 120, 0), true);
+  assert.equal(mediaNeedsRepair('microphone', 'connected', true, 120, 0), true);
+  assert.equal(mediaNeedsRepair('screen', 'connected', false, 120, 20), false);
+});
 
 function setup() {
   let time = 20_000;

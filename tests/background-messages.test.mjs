@@ -4,7 +4,8 @@ import { readFile } from 'node:fs/promises';
 import { runInNewContext } from 'node:vm';
 import { createChatSyncRequest } from '../app/chat-sync-request.ts';
 import { startChatSyncLifecycle } from '../app/chat-sync-lifecycle.ts';
-import { subscriptionNeedsRenewal } from '../app/push-subscription.ts';
+import { subscriptionNeedsRenewal, checkPushSubscription } from '../app/push-subscription.ts';
+import ts from 'typescript';
 
 test('expired and rotated-key subscriptions must be replaced while unchanged subscriptions are reused', () => {
   const subscription = { expirationTime: null, options: { applicationServerKey: new Uint8Array([1, 2, 3]).buffer } };
@@ -123,15 +124,17 @@ test('notification enumeration failure still displays a push and invalid click d
 
 test('an existing browser subscription is restored on the server, and a rejected restore is not shown as enabled', async () => {
   const page = (await readFile('app/page.tsx', 'utf8')).replace(/\r\n/g, '\n');
-  const start = page.indexOf('  useEffect(() => {\n    if (!("serviceWorker" in navigator)');
+  const start = page.indexOf('  useEffect(() => {\n    if (!identityId || pushBusy) return;');
   const end = page.indexOf('\n  const enablePushNotifications', start);
   assert.ok(start > 0 && end > start);
   const listeners = {}, states = [], saved = [];
-  let cleanup, ok = true;
+  let cleanup, retry, ok = true;
   const context = {
-    createChatSyncRequest, subscriptionNeedsRenewal, identityId: 'alice', pushBusy: false,
+    createChatSyncRequest, identityId: 'alice', pushBusy: false, pushCheckVersion: 0,
+    checkPushSubscription: (registration, deviceId, signal) => checkPushSubscription(registration, deviceId, signal, context.fetch),
+    setTimeout: fn => { retry = fn; return 1; }, clearTimeout: () => { retry = undefined; },
     pushDeviceIdRef: { current: '' },
-    setPushEnabled: value => states.push(value), setPushMessage: () => {},
+    setPushStatus: value => states.push(value), setPushMessage: () => {}, setPushTestMessage: () => {},
     useEffect: effect => { cleanup = effect(); },
     crypto: { randomUUID: () => 'device-1' },
     document: { visibilityState: 'visible', addEventListener: (name, fn) => { listeners[name] = fn; }, removeEventListener: () => {} },
@@ -144,12 +147,12 @@ test('an existing browser subscription is restored on the server, and a rejected
     },
   };
   try {
-    runInNewContext(page.slice(start, end), context);
+    runInNewContext(ts.transpileModule(page.slice(start, end), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(saved.length, 1);
     assert.equal(saved[0].url, '/api/push/subscriptions');
     assert.equal(saved[0].body.deviceId, 'device-1');
-    assert.equal(states.at(-1), true);
+    assert.equal(states.at(-1), 'enabled');
     context.document.visibilityState = 'hidden';
     await listeners.visibilitychange();
     assert.equal(saved.length, 1);
@@ -157,11 +160,16 @@ test('an existing browser subscription is restored on the server, and a rejected
     context.document.visibilityState = 'visible';
     await listeners.visibilitychange();
     assert.equal(saved.length, 2);
-    assert.equal(states.at(-1), false);
+    assert.equal(states.at(-1), 'unknown');
+    assert.equal(typeof retry, 'function');
     ok = true;
+    retry();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(states.at(-1), 'enabled');
+    assert.equal(saved.length, 3);
     context.Notification.permission = 'denied';
     await listeners.visibilitychange();
-    assert.equal(saved.length, 2, 'revoked permission must not refresh a stale subscription');
-    assert.equal(states.at(-1), false);
+    assert.equal(saved.length, 3, 'revoked permission must not refresh a stale subscription');
+    assert.equal(states.at(-1), 'disabled');
   } finally { cleanup?.(); }
 });

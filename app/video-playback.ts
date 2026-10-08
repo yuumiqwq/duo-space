@@ -2,6 +2,7 @@ import { onMediaForeground } from './media-foreground.ts';
 
 export function attachVideoPlayback(video: HTMLVideoElement, stream: MediaStream, options: {
   blocked: (value: boolean) => void;
+  screen?: boolean;
   document?: Document;
   window?: Window;
 }) {
@@ -23,7 +24,8 @@ export function attachVideoPlayback(video: HTMLVideoElement, stream: MediaStream
       if (!disposed && request === attempt && error?.name !== 'AbortError') options.blocked(true);
     });
   };
-  const unmute = () => resume(true);
+  const recover = () => resume(!options.screen || video.readyState < 2);
+  const unmute = recover;
   const syncTracks = () => {
     for (const track of tracks) track.removeEventListener('unmute', unmute);
     tracks.clear();
@@ -31,11 +33,11 @@ export function attachVideoPlayback(video: HTMLVideoElement, stream: MediaStream
       tracks.add(track);
       track.addEventListener('unmute', unmute);
     }
-    resume(true);
+    recover();
   };
   const ready = () => { if (video.paused) resume(); };
   const gesture = () => { if (video.paused || video.readyState < 2) resume(); };
-  const stopForeground = onMediaForeground(doc, win, () => resume(true));
+  const stopForeground = onMediaForeground(doc, win, recover);
   // Set Safari's inline/autoplay requirements before assigning the stream.
   video.muted = true;
   video.playsInline = true;

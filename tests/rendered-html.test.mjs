@@ -23,7 +23,7 @@ test("retains installed PWA push delivery and restores per-device notification c
   assert.match(page, /navigator\.serviceWorker\.register\("\/sw\.js"\)/);
   assert.match(page, /Notification\.requestPermission\(\)/);
   assert.match(page, /testPushNotifications/);
-  assert.match(page, /subscriptionNeedsRenewal/);
+  assert.match(page, /checkPushSubscription/);
   assert.match(serviceWorker, /addEventListener\("push"/);
   assert.match(serviceWorker, /showNotification/);
   assert.match(serviceWorker, /addEventListener\("notificationclick"/);

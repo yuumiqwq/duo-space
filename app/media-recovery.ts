@@ -1,5 +1,14 @@
 export type MediaSource = "camera" | "screen" | "microphone";
 
+export function mediaNeedsRepair(source: MediaSource, connectionState: string, stalled: boolean, frames: number, packetsSinceFrame: number) {
+  if (["failed", "closed"].includes(connectionState)) return true;
+  if (!stalled) return false;
+  // A connected screen can legitimately stop producing frames while static.
+  // Recover if it has never decoded, is disconnected, or receives video packets
+  // without decoding them. Silence alone cannot distinguish static from frozen.
+  return source !== "screen" || connectionState !== "connected" || frames <= 0 || packetsSinceFrame > 0;
+}
+
 // Keep recovery requests until signaling and capture are usable again. A page
 // can become visible before PeerJS reconnects or the OS unmutes screen capture.
 export function createMediaRecovery(options: {
