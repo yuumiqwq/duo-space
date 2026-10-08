@@ -2062,11 +2062,6 @@ export default function Home() {
     if (cameraStreamRef.current) projection.reveal();
   };
 
-  const restartCamera = async () => {
-    stopCamera();
-    await toggleCamera();
-  };
-
   const submitActivity = async (event: FormEvent) => {
     event.preventDefault();
     if (activitySavingRef.current) return;
@@ -2525,7 +2520,6 @@ export default function Home() {
           return <div className="classroom-desk" key={index}><DeviceCard font={classroomProfile.profile.font} kind={index === 0 ? 'tablet' : 'laptop'} name={self ? displayName : member.name} online={!!member.id && ((self && joined) || peers.length > 0)} screen={screenOn} camera={cameraOn} microphone={self ? !!microphoneStream : peers.some(id=>!!remoteMicrophones[id])} self={self} onMicrophone={self ? ()=>void toggleMicrophone() : undefined}
             onScreen={self ? () => stream ? stopShare() : screenPeer ? view(screenPeer + '-screen') : void startShare() : screenPeer ? () => view(screenPeer + '-screen') : undefined}
             onCamera={self ? () => cameraStream ? stopCamera() : cameraPeer ? view(cameraPeer + '-camera') : void toggleCamera() : cameraPeer ? () => view(cameraPeer + '-camera') : undefined}>
-            {self && cameraStream && <button className="remote-audio-button" type="button" onClick={() => void restartCamera()}>重启摄像头</button>}
             {self ? <form className="activity-box" onSubmit={submitActivity}><ActivityInput value={activity} readOnly={activitySaveStatus === '正在保存…'} onChange={value => { setActivity(value); setActivitySaveStatus(''); }} />{activitySaveStatus && <small role="status">{activitySaveStatus}</small>}</form> : <p>{peers.map(id => memberActivities[id]).find(value => value !== undefined) ?? member.activity}</p>}
           </DeviceCard></div>;
         })}
