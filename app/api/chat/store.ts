@@ -1,6 +1,6 @@
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
+import { writeStoreFile } from '../store-file.ts';
 import { fileStoreQueue } from '../store-queue.ts';
 
 export type StoredAttachment = {
@@ -45,25 +45,7 @@ async function readStore(): Promise<ChatStore> {
 }
 
 async function writeStore(store: ChatStore) {
-  await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
-  const temporaryPath = `${storePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
-  await writeFile(temporaryPath, `${JSON.stringify(store)}\n`, { encoding: "utf8", mode: 0o600 });
-  try {
-    for (let attempt = 0; ; attempt++) {
-      try {
-        await rename(temporaryPath, storePath);
-        break;
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        // Windows readers and file scanners can briefly hold the destination.
-        // Keep the old file intact and retry the same atomic replacement.
-        if (process.platform !== "win32" || !["EPERM", "EACCES", "EBUSY"].includes(code || "") || attempt >= 5) throw error;
-        await delay(25 * 2 ** attempt);
-      }
-    }
-  } finally {
-    await unlink(temporaryPath).catch(() => undefined);
-  }
+  await writeStoreFile(storePath, `${JSON.stringify(store)}\n`);
 }
 
 async function mutate<T>(operation: (store: ChatStore) => Promise<T> | T): Promise<T> {

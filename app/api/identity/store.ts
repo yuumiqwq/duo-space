@@ -1,4 +1,6 @@
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { writeStoreFile } from '../store-file.ts';
+import { fileStoreQueue } from '../store-queue.ts';
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { applyClassroomAction, CLASSROOM_DEVICE_FONT, type ClassroomAction, type ClassroomProfile } from '../../classroom-members.ts';
 
@@ -19,7 +21,7 @@ type IdentityStore = {
 const dataDirectory = process.env.DATA_DIR
   || (process.env.NODE_ENV === "production" ? "/data" : path.join(process.cwd(), ".data"));
 const storePath = path.join(/* turbopackIgnore: true */ dataDirectory, "identities.json");
-let writeQueue: Promise<void> = Promise.resolve();
+const writeQueue = fileStoreQueue(storePath);
 
 const emptyStore = (): IdentityStore => ({ version: 1, users: {} });
 
@@ -48,21 +50,16 @@ async function readStore(): Promise<IdentityStore> {
 }
 
 async function writeStore(store: IdentityStore): Promise<void> {
-  await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
-  const temporaryPath = `${storePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
-  try {
-    await writeFile(temporaryPath, `${JSON.stringify(store, null, 2)}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
-    await rename(temporaryPath, storePath);
-  } finally { await rm(temporaryPath, { force: true }).catch(() => undefined); }
+  await writeStoreFile(storePath, `${JSON.stringify(store, null, 2)}\n`);
 }
 
 export async function getUser(identityId: string): Promise<UserRecord | null> {
-  await writeQueue;
+  await writeQueue.settled();
   return (await readStore()).users[identityId] || null;
 }
 
 export async function listRoomMembers() {
-  await writeQueue;
+  await writeQueue.settled();
   return Object.entries((await readStore()).users).map(([id, user]) => ({ id, name: user.nickname || "成员" }));
 }
 
@@ -74,30 +71,26 @@ function classroomProfileFromStore(store: IdentityStore): ClassroomProfile {
 }
 
 export async function getClassroomProfile() {
-  await writeQueue;
+  await writeQueue.settled();
   return classroomProfileFromStore(await readStore());
 }
 
 export function updateClassroomProfile(identityId: string, action: ClassroomAction) {
-  let result: ClassroomProfile;
-  const operation = writeQueue.then(async () => {
+  return writeQueue.run(async () => {
     const store = await readStore();
-    result = applyClassroomAction(classroomProfileFromStore(store), identityId, action);
+    const result = applyClassroomAction(classroomProfileFromStore(store), identityId, action);
     store.classroom = { seats: result.seats };
     await writeStore(store);
+    return result;
   });
-  writeQueue = operation.catch(() => undefined);
-  return operation.then(() => result!);
 }
 
 export function updateUser(identityId: string, update: (current: UserRecord | null) => UserRecord): Promise<UserRecord> {
-  let result: UserRecord;
-  const operation = writeQueue.then(async () => {
+  return writeQueue.run(async () => {
     const store = await readStore();
-    result = update(store.users[identityId] || null);
+    const result = update(store.users[identityId] || null);
     store.users[identityId] = result;
     await writeStore(store);
+    return result;
   });
-  writeQueue = operation.catch(() => undefined);
-  return operation.then(() => result!);
 }

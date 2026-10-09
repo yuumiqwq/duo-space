@@ -8,7 +8,7 @@
 | --- | --- |
 | [当前功能说明](current-functionality.md) | 共同维护网站时查阅功能入口、权限与状态变化，并定位相关代码。 |
 | [功能变更日志](functionality-changelog.md) | 从 2026-09-12 首次完整说明起持续记录后续改动，查找提交依据及旧规则的替代关系。 |
-| [剩余需求执行表](remaining-priority-requirements.md) | 查阅未实现事项，以及需要远端成员或设备配合的验收。 |
+| [剩余需求执行表](remaining-priority-requirements.md) | 查阅尚未实现或暂缓的功能；设备使用问题由实际使用反馈。 |
 | [教室现行美术参照](classroom-art-reference.md) | 制作或修改素材前核对已确认的成品页面、正式素材及相邻物件；包含当前组件的样例截图。 |
 | [原始素材与提示词](classroom-asset-prompts-2026-09-09.md) | 查找生成源图与完整提示词；字体和纹理的许可另见[素材署名](../public/classroom/ATTRIBUTION.md)。 |
 | [部署与回滚](../deploy/README.md) | 维护既有容器部署、持久数据挂载和回滚流程。 |

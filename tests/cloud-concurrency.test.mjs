@@ -15,7 +15,11 @@ async function fixture(t, limit = 100) {
   process.env.DATA_DIR = directory;
   process.env.CLOUD_DRIVE_LIMIT_BYTES = String(limit);
   t.after(() => rm(directory, { recursive: true, force: true }));
-  return { directory, store: await import(`../app/api/cloud/store.ts?fixture=${randomUUID()}`) };
+  // Bundle the full module graph so each fixture gets its own configuration,
+  // including the path/capacity modules imported by the public store entry.
+  const output = path.join(directory, 'cloud.mjs');
+  await build({ entryPoints: ['app/api/cloud/store.ts'], bundle: true, packages: 'external', platform: 'node', format: 'esm', outfile: output, logLevel: 'silent' });
+  return { directory, store: await import(pathToFileURL(output).href), moduleURL: pathToFileURL(output).href };
 }
 const stream = bytes => new ReadableStream({ start(controller) { controller.enqueue(Buffer.from(bytes)); controller.close(); } });
 
@@ -98,8 +102,8 @@ test('unknown-length concurrent uploads and imports share the ninety-percent cei
 });
 
 test('duplicate imports are idempotent at the ceiling and independent module copies coordinate', async t => {
-  const { directory, store } = await fixture(t);
-  const other = await import(`../app/api/cloud/store.ts?second=${randomUUID()}`);
+  const { directory, store, moduleURL } = await fixture(t);
+  const other = await import(`${moduleURL}?second=${randomUUID()}`);
   const source = path.join(directory, 'source.bin'), id = randomUUID();
   await writeFile(source, Buffer.alloc(90, 7));
   const items = await Promise.all(Array.from({ length: 10 }, (_, i) => (i % 2 ? store : other).importChatAttachment(id, source, 'same.bin', 90, 'chat')));

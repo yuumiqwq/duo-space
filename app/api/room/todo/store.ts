@@ -1,4 +1,6 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { writeStoreFile } from '../../store-file.ts';
+import { fileStoreQueue } from '../../store-queue.ts';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { classroomTodoWindow, mergeTodoSnapshot, type TodoTask } from '../../../classroom-todo.ts';
 
@@ -7,22 +9,17 @@ type State = { version: 1; members: Record<string, { day: string; tasks: StoredT
 
 export function createTodoStore(directory: string) {
   const file = path.join(directory, 'classroom-todo.json');
-  let queue: Promise<unknown> = Promise.resolve();
+  const queue = fileStoreQueue(file);
   async function read(): Promise<State> {
     try { const state = JSON.parse(await readFile(file, 'utf8')); if (state.version !== 1 || !state.members) throw new Error('今日 todo 数据格式无效'); return state; }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { version: 1, members: {} }; throw error; }
   }
   function update<T>(action: (state: State) => T | Promise<T>): Promise<T> {
-    const result = queue.then(async () => {
+    return queue.run(async () => {
       const state = await read(), result = await action(state);
-      await mkdir(directory, { recursive: true, mode: 0o700 });
-      const temp = `${file}.${crypto.randomUUID()}.tmp`;
-      await writeFile(temp, JSON.stringify(state), { mode: 0o600 });
-      await rename(temp, file);
+      await writeStoreFile(file, JSON.stringify(state));
       return result;
     });
-    queue = result.catch(() => undefined);
-    return result;
   }
   return {
     reconcile(identity: string, incoming: StoredTodoTask[], now = Date.now(), partial?: { failedProjectIds: string[]; incompleteProjects: boolean; inboxFailed: boolean; readProjectIds: string[] }) {
@@ -46,6 +43,5 @@ export function createTodoStore(directory: string) {
   };
 }
 const directory = process.env.DATA_DIR || (process.env.NODE_ENV === 'production' ? '/data' : path.join(process.cwd(), '.data'));
-const shared = globalThis as typeof globalThis & { classroomTodoStore?: ReturnType<typeof createTodoStore> };
-// Next bundles completion and list routes separately; share their write queue.
-export const todoStore = shared.classroomTodoStore ||= createTodoStore(directory);
+// Instances share the queue by filename; no process-wide singleton is needed.
+export const todoStore = createTodoStore(directory);

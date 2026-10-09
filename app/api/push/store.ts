@@ -1,4 +1,5 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { writeStoreFile } from '../store-file.ts';
+import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import webPush from "web-push";
@@ -50,10 +51,7 @@ async function readStore(): Promise<PushStore> {
 }
 
 async function writeStore(store: PushStore) {
-  await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
-  const temporaryPath = `${storePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
-  await writeFile(temporaryPath, `${JSON.stringify(store)}\n`, { encoding: "utf8", mode: 0o600 });
-  await rename(temporaryPath, storePath);
+  await writeStoreFile(storePath, `${JSON.stringify(store)}\n`);
 }
 
 async function mutate(operation: (store: PushStore) => void | Promise<void>) {

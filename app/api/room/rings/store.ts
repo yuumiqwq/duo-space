@@ -1,4 +1,6 @@
-import { mkdir, readFile, rename, writeFile, rmdir, stat } from "node:fs/promises";
+import { writeStoreFile } from '../../store-file.ts';
+import { fileStoreQueue } from '../../store-queue.ts';
+import { mkdir, readFile, rmdir, stat } from "node:fs/promises";
 import path from "node:path";
 
 export type Ring = {
@@ -10,7 +12,7 @@ export type Ring = {
 };
 const directory = process.env.DATA_DIR || (process.env.NODE_ENV === "production" ? "/data" : path.join(process.cwd(), ".data"));
 const filename = path.join(/* turbopackIgnore: true */ directory, "rings.json");
-let queue: Promise<unknown> = Promise.resolve();
+const queue = fileStoreQueue(filename);
 export class RingError extends Error {
   status: number;
   constructor(message: string, status: number) { super(message); this.status = status; }
@@ -20,7 +22,7 @@ async function read(): Promise<Ring[]> {
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
 }
 function transact<T>(operation: (records: Ring[]) => T): Promise<T> {
-  const next = queue.then(async () => {
+  return queue.run(async () => {
     await mkdir(directory, { recursive: true, mode: 0o700 });
     const lock = `${filename}.lock`;
     for (;;) {
@@ -33,24 +35,19 @@ function transact<T>(operation: (records: Ring[]) => T): Promise<T> {
       }
     }
     try {
-    const records = await read();
-    const result = operation(records);
-    await mkdir(directory, { recursive: true, mode: 0o700 });
-    const temporary = `${filename}.${crypto.randomUUID()}.tmp`;
-    await writeFile(temporary, JSON.stringify(records), { mode: 0o600 });
-    await rename(temporary, filename);
-    return result;
+      const records = await read();
+      const result = operation(records);
+      await writeStoreFile(filename, JSON.stringify(records));
+      return result;
     } finally { await rmdir(lock); }
   });
-  queue = next.catch(() => undefined);
-  return next;
 }
 function current(ring: Ring, now: number): Ring {
   return ring.state === "active" && ring.expiresAt <= now
     ? { ...ring, state: "expired", updatedAt: ring.expiresAt } : ring;
 }
 export async function listRings(identityId: string, now = Date.now()): Promise<Ring[]> {
-  await queue;
+  await queue.settled();
   return (await read()).filter(r => r.senderId === identityId || r.recipientId === identityId)
     .filter(r => r.createdAt >= now - 24 * 60 * 60 * 1000).map(r => current(r, now))
     .sort((a, b) => b.createdAt - a.createdAt);
@@ -90,7 +87,7 @@ export function setRingDelivery(id: string, delivery: Ring["delivery"]) {
 }
 
 export async function claimDueRings(now = Date.now()) {
-  await queue;
+  await queue.settled();
   if (!(await read()).some(ring => ring.repeat && current(ring, now).state === "active" && (ring.attempts || 0) < 40 && (ring.nextAttemptAt || 0) <= now)) return [];
   return transact(records => {
     const due: Ring[] = [];

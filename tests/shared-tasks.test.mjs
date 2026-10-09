@@ -39,10 +39,11 @@ test('cross-member records persist, deduplicate retries and acknowledge only dis
   await mkdir('codex-generated/test-data', { recursive: true });
   process.env.DATA_DIR = await mkdtemp(path.resolve('codex-generated/test-data/shared-'));
   const store = await import('../app/api/ticktick/shared-store.ts');
+  const otherRoute = await import('../app/api/ticktick/shared-store.ts?other-route');
   let calls = 0;
   const external = async () => { calls++; return { taskId: 'task-' + calls, projectId: 'inbox-bob' }; };
   const input = { id: 'one', senderId: 'alice', recipientId: 'bob', senderName: 'Alice', title: '准备习题' };
-  const [a, b] = await Promise.all([store.createSharedTask(input, external), store.createSharedTask(input, external)]);
+  const [a, b] = await Promise.all([store.createSharedTask(input, external), otherRoute.createSharedTask(input, external)]);
   assert.equal(calls, 1); assert.equal(a.taskId, b.taskId);
   assert.equal((await store.unreadSharedTasks('alice')).length, 0);
   const displayed = await store.unreadSharedTasks('bob');

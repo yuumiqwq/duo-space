@@ -1,25 +1,31 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
+import { fileStoreQueue } from '../../store-queue.ts';
+import { writeStoreFile } from '../../store-file.ts';
 
 export class BoardDeletionStore {
-  private queue: Promise<unknown> = Promise.resolve();
-  private directory: string;
-  constructor(directory: string) { this.directory = directory; }
+  private queue: ReturnType<typeof fileStoreQueue>;
+  private file: string;
+  constructor(directory: string) {
+    this.file = path.join(directory, 'deleted-boards.json');
+    this.queue = fileStoreQueue(this.file);
+  }
   async read(): Promise<string[]> {
-    try { return JSON.parse(await readFile(path.join(this.directory, 'deleted-boards.json'), 'utf8')); }
+    await this.queue.settled();
+    return this.readFile();
+  }
+  private async readFile(): Promise<string[]> {
+    try { return JSON.parse(await readFile(this.file, 'utf8')); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
   }
   delete(id: string): Promise<string[]> {
-    const pending = this.queue.then(async () => {
-      const ids = await this.read();
+    return this.queue.run(async () => {
+      const ids = await this.readFile();
       if (ids.includes(id)) return ids;
       ids.push(id);
-      await mkdir(this.directory, { recursive: true });
-      const file = path.join(this.directory, 'deleted-boards.json');
-      await writeFile(file + '.tmp', JSON.stringify(ids)); await rename(file + '.tmp', file);
+      await writeStoreFile(this.file, JSON.stringify(ids));
       return ids;
     });
-    this.queue = pending.catch(() => undefined); return pending;
   }
 }
 

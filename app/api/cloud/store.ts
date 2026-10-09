@@ -2,148 +2,11 @@ import { constants } from "node:fs";
 import { copyFile, link, mkdir, open, readFile, readdir, stat, lstat, rm } from "node:fs/promises";
 import path from "node:path";
 
-// Runtime data is mounted separately and must not be traced into the bundle.
-export const cloudRoot = path.join(/* turbopackIgnore: true */
-  process.env.DATA_DIR || (process.env.NODE_ENV === "production" ? "/data" : path.join(process.cwd(), ".data")),
-  "cloud-drive",
-);
+import { cloudRoot, cloudStagingRoot, sanitizeFileName, resolveCloudPath, ensureCloudFolders } from "./paths.ts";
+import { CloudCapacityError, cloudStatus, reserveCloudCapacity, coordinateCloudWrite, checkCloudCapacity } from "./capacity.ts";
 
-const defaultLimitBytes = 5 * 1024 * 1024 * 1024;
-const configuredLimit = Number(process.env.CLOUD_DRIVE_LIMIT_BYTES);
-export const cloudLimitBytes = Number.isSafeInteger(configuredLimit) && configuredLimit > 0
-  ? configuredLimit
-  : defaultLimitBytes;
-export const cloudWarningBytes = Math.floor(cloudLimitBytes * 0.9);
-
-// Next may load this module through multiple route bundles. Share the queue and
-// reservations across those copies, scoped to the configured data directory.
-type CapacityState = { queue: Promise<unknown>; reservations: Map<symbol, number> };
-const shared = globalThis as typeof globalThis & { __cloudCapacityStates?: Map<string, CapacityState> };
-const states = shared.__cloudCapacityStates ??= new Map();
-const capacity = states.get(path.resolve(cloudRoot)) ?? { queue: Promise.resolve(), reservations: new Map<symbol, number>() };
-states.set(path.resolve(cloudRoot), capacity);
-export const cloudStagingRoot = path.join(path.dirname(cloudRoot), "cloud-drive-staging");
-
-function coordinate<T>(work: () => Promise<T>): Promise<T> {
-  const operation = capacity.queue.then(work);
-  capacity.queue = operation.catch(() => undefined);
-  return operation;
-}
-
-export class CloudCapacityError extends Error {
-  status = 507;
-  constructor(message = "云盘容量已达到 90%，请清理空间后再上传") {
-    super(message);
-  }
-}
-
-export function sanitizeFileName(value: string, fallback = "file") {
-  const cleaned = value
-    .replace(/[\\/:*?"<>|\u0000-\u001f\u007f]/g, "_")
-    .replace(/^\.+$/, "_")
-    .trim()
-    .slice(0, 180);
-  return cleaned || fallback;
-}
-
-export function normalizeCloudPath(value: string | null | undefined) {
-  if (!value) return "";
-  const normalized = value.replace(/\\/g, "/").split("/")
-    .filter(Boolean)
-    .map((part) => sanitizeFileName(part, "_"))
-    .join("/");
-  return normalized.slice(0, 800);
-}
-
-export function resolveCloudPath(relativePath = "") {
-  const normalized = normalizeCloudPath(relativePath);
-  const resolved = path.resolve(cloudRoot, normalized);
-  const rootPrefix = `${path.resolve(cloudRoot)}${path.sep}`;
-  if (resolved !== path.resolve(cloudRoot) && !resolved.startsWith(rootPrefix)) throw new Error("Invalid cloud path");
-  return { normalized, resolved };
-}
-
-export async function ensureCloudFolders() {
-  // Content-specific folders are created when saving there, not when listing the drive.
-  await mkdir(cloudRoot, { recursive: true, mode: 0o700 });
-}
-
-async function directoryUsage(directory: string): Promise<number> {
-  let total = 0;
-  let entries;
-  try { entries = await readdir(/* turbopackIgnore: true */ directory, { withFileTypes: true }); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0; throw error; }
-  for (const entry of entries) {
-    const entryPath = path.join(/* turbopackIgnore: true */ directory, entry.name);
-    if (entry.isDirectory()) total += await directoryUsage(entryPath);
-    else if (entry.isFile()) {
-      try { total += (await stat(/* turbopackIgnore: true */ entryPath)).size; }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    }
-  }
-  return total;
-}
-
-export async function cloudStatus() {
-  await ensureCloudFolders();
-  const usedBytes = await directoryUsage(cloudRoot);
-  return {
-    usedBytes,
-    limitBytes: cloudLimitBytes,
-    warningBytes: cloudWarningBytes,
-    warning: usedBytes >= cloudWarningBytes,
-    percent: Math.min(100, Math.round((usedBytes / cloudLimitBytes) * 1000) / 10),
-  };
-}
-
-async function checkCapacity(additionalBytes: number, ownReservation?: symbol) {
-  const status = await cloudStatus();
-  let reservedBytes = 0;
-  for (const [id, bytes] of capacity.reservations) if (id !== ownReservation) reservedBytes += bytes;
-  if (!Number.isSafeInteger(additionalBytes) || additionalBytes < 0 || status.warning
-    || status.usedBytes + reservedBytes + additionalBytes > cloudWarningBytes) {
-    throw new CloudCapacityError();
-  }
-  return status;
-}
-
-export function assertCloudCapacity(additionalBytes: number) {
-  return coordinate(() => checkCapacity(additionalBytes));
-}
-
-export async function reserveCloudCapacity(initialBytes: number) {
-  const id = Symbol("cloud-write");
-  await coordinate(async () => {
-    await checkCapacity(initialBytes);
-    capacity.reservations.set(id, initialBytes);
-  });
-  return {
-    resize(bytes: number) {
-      return coordinate(async () => {
-        if (!capacity.reservations.has(id)) throw new Error("Cloud reservation is closed");
-        await checkCapacity(bytes, id);
-        capacity.reservations.set(id, bytes);
-      });
-    },
-    commit<T>(bytes: number, publish: () => Promise<T>): Promise<T> {
-      return coordinate(async () => {
-        if (!capacity.reservations.has(id)) throw new Error("Cloud reservation is closed");
-        await checkCapacity(bytes, id);
-        const result = await publish();
-        capacity.reservations.delete(id);
-        return result;
-      });
-    },
-    release() { return coordinate(async () => { capacity.reservations.delete(id); }); },
-  };
-}
-
-// For other cloud writers that already have complete files ready to publish.
-export async function withCloudCapacity<T>(bytes: number, publish: () => Promise<T>): Promise<T> {
-  const reservation = await reserveCloudCapacity(bytes);
-  try { return await reservation.commit(bytes, publish); }
-  finally { await reservation.release(); }
-}
+export { cloudRoot, cloudStagingRoot, sanitizeFileName, normalizeCloudPath, resolveCloudPath, ensureCloudFolders } from "./paths.ts";
+export { cloudLimitBytes, cloudWarningBytes, CloudCapacityError, cloudStatus, assertCloudCapacity, reserveCloudCapacity, withCloudCapacity } from "./capacity.ts";
 
 const importedPrefix = /^__chat_[0-9a-f-]{36}__(.+)$/i;
 
@@ -209,13 +72,13 @@ export async function saveCloudUpload(body: ReadableStream<Uint8Array>, relative
   const maximum = taskAttachment ? 20 * 1024 * 1024 : Infinity;
   if (expectedBytes > maximum) throw new Error("TASK_ATTACHMENT_TOO_LARGE");
   const reservation = await reserveCloudCapacity(expectedBytes);
-  const temporaryPath = path.join(cloudStagingRoot, `${crypto.randomUUID()}.upload`);
+  const temporaryPath = path.join(/* turbopackIgnore: true */ cloudStagingRoot, `${crypto.randomUUID()}.upload`);
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   let size = 0, reserved = expectedBytes;
   try {
     await mkdir(parent.resolved, { recursive: true, mode: 0o700 });
-    await mkdir(cloudStagingRoot, { recursive: true, mode: 0o700 });
+    await mkdir(/* turbopackIgnore: true */ cloudStagingRoot, { recursive: true, mode: 0o700 });
     handle = await open(/* turbopackIgnore: true */ temporaryPath, "wx", 0o600);
     reader = body.getReader();
     while (true) {
@@ -238,7 +101,7 @@ export async function saveCloudUpload(body: ReadableStream<Uint8Array>, relative
   } finally {
     reader?.releaseLock();
     await handle?.close().catch(() => undefined);
-    await rm(temporaryPath, { force: true }).catch(() => undefined);
+    await rm(/* turbopackIgnore: true */ temporaryPath, { force: true }).catch(() => undefined);
     await reservation.release();
   }
 }
@@ -252,7 +115,7 @@ export async function importChatAttachment(id: string, sourcePath: string, name:
   const destination = path.join(/* turbopackIgnore: true */ destinationDirectory, storedName);
   // Check idempotency inside the same queue as capacity and publication. Use
   // the actual source size rather than trusting older attachment metadata.
-  await coordinate(async () => {
+  await coordinateCloudWrite(async () => {
     try {
       const existing = await lstat(/* turbopackIgnore: true */ destination);
       if (!existing.isFile()) throw new Error("Invalid attachment destination");
@@ -262,7 +125,7 @@ export async function importChatAttachment(id: string, sourcePath: string, name:
     }
     const source = await stat(/* turbopackIgnore: true */ sourcePath);
     if (!source.isFile()) throw new Error("Invalid attachment source");
-    await checkCapacity(source.size);
+    await checkCloudCapacity(source.size);
     await linkWithoutReplacement(sourcePath, destination);
   });
   return `${target}/${storedName}`;

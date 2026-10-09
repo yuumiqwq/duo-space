@@ -1,5 +1,6 @@
-import { mkdir, readFile, writeFile, rename, unlink } from "node:fs/promises";
-import { setTimeout as delay } from "node:timers/promises";
+import { readFile } from "node:fs/promises";
+import { writeStoreFile } from '../store-file.ts';
+import { fileStoreQueue } from '../store-queue.ts';
 import path from "node:path";
 
 export type SharedTaskRecord = {
@@ -8,29 +9,13 @@ export type SharedTaskRecord = {
 };
 const directory = process.env.DATA_DIR || (process.env.NODE_ENV === "production" ? "/data" : path.join(process.cwd(), ".data"));
 const file = path.join(directory, "shared-tasks.json");
-let queue: Promise<unknown> = Promise.resolve();
+const queue = fileStoreQueue(file);
 async function read(): Promise<SharedTaskRecord[]> {
   try { return JSON.parse(await readFile(file, "utf8")) as SharedTaskRecord[]; }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
 }
 async function write(records: SharedTaskRecord[]) {
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  const temporary = `${file}.${crypto.randomUUID()}.tmp`;
-  try {
-    await writeFile(temporary, JSON.stringify(records), { mode: 0o600 });
-    for (let attempt = 0; ; attempt++) {
-      try { await rename(temporary, file); break; }
-      catch (error) {
-        if (process.platform !== "win32" || !["EPERM", "EACCES", "EBUSY"].includes((error as NodeJS.ErrnoException).code || "") || attempt >= 5) throw error;
-        await delay(25 * 2 ** attempt);
-      }
-    }
-  } finally { await unlink(temporary).catch(() => undefined); }
-}
-function serialize<T>(operation: () => Promise<T>): Promise<T> {
-  const result = queue.then(operation);
-  queue = result.catch(() => undefined);
-  return result;
+  await writeStoreFile(file, JSON.stringify(records));
 }
 
 export class SharedTaskError extends Error {
@@ -42,7 +27,7 @@ export function createSharedTask(
   request: Pick<SharedTaskRecord, "id" | "senderId" | "recipientId" | "senderName" | "title">,
   create: () => Promise<{ taskId: string; projectId: string }>,
 ) {
-  return serialize(async () => {
+  return queue.run(async () => {
     const records = await read();
     const existing = records.find(record => record.id === request.id);
     if (existing && (existing.senderId !== request.senderId || existing.recipientId !== request.recipientId || existing.title !== request.title)) throw new SharedTaskError("请求标识已被使用，请重新打开添加窗口。", 409);
@@ -68,11 +53,11 @@ export function createSharedTask(
 }
 
 export async function unreadSharedTasks(recipientId: string) {
-  await queue;
+  await queue.settled();
   return (await read()).filter(record => record.recipientId === recipientId && record.state === "confirmed" && !record.readAt);
 }
 export function markSharedTasksRead(recipientId: string, ids: string[]) {
-  return serialize(async () => {
+  return queue.run(async () => {
     const records = await read();
     const selected = new Set(ids);
     for (const record of records) {
