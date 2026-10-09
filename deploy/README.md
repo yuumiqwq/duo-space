@@ -54,6 +54,10 @@ The script refuses to deploy when `/` is at least 85% full. It pulls the exact
 SHA image, tests it on `127.0.0.1:3101`, verifies the `/data` bind mount, replaces
 the production container on `127.0.0.1:3100`, checks both the local and public
 HTTP endpoints, and restores the old image automatically if verification fails.
+Both `/access` and `/api/access/runtime` must respond successfully. The latter
+exercises the server route runtime; a working login page alone is insufficient.
+The Docker build also starts the standalone server with isolated fixture data
+and checks its routes before an image can be published.
 
 After success, only the current and immediately previous application images are
 retained. Cleanup is restricted to stopped containers beginning with known

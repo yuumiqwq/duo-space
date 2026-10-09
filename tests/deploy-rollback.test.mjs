@@ -13,7 +13,7 @@ async function bashExecutable() {
   throw new Error('Git Bash is required for the isolated rollback regression test');
 }
 
-for (const scenario of ['target-start', 'target-health', 'public-health', 'restore-start', 'restore-health', 'candidate-start', 'candidate-health', 'success']) {
+for (const scenario of ['target-start', 'target-health', 'target-runtime', 'public-health', 'restore-start', 'restore-health', 'restore-runtime', 'candidate-start', 'candidate-health', 'candidate-runtime', 'success']) {
   test(`rollback ${scenario} preserves or updates state only after verification`, { timeout: 15000 }, async t => {
     const parent = path.resolve('codex-generated/review-fixes-20261009/server/test-data');
     await mkdir(parent, { recursive: true });
@@ -45,10 +45,17 @@ return 0
 }
 curl() {
 printf 'curl %s\\n' "$*" >> "$SIMULATION_LOG"
-if [[ "$*" == *'3101/access'* ]]; then [[ "$SCENARIO" != candidate-health ]]; return; fi
-if [[ -f "$APP_DIR/restored" ]]; then [[ "$SCENARIO" != restore-health ]]; return; fi
+if [[ "$*" == *'3101/'* ]]; then
+  [[ "$SCENARIO" != candidate-health ]] || return 22
+  [[ "$SCENARIO" != candidate-runtime || "$*" != *'/api/access/runtime'* ]]; return
+fi
+if [[ -f "$APP_DIR/restored" ]]; then
+  [[ "$SCENARIO" != restore-health ]] || return 22
+  [[ "$SCENARIO" != restore-runtime || "$*" != *'/api/access/runtime'* ]]; return
+fi
 if [[ "$*" == *'https://'* ]]; then [[ "$SCENARIO" != public-health ]]; return; fi
-case "$SCENARIO" in target-health|restore-start|restore-health) return 22;; esac
+if [[ "$SCENARIO" == target-runtime && "$*" == *'/api/access/runtime'* ]]; then return 22; fi
+case "$SCENARIO" in target-health|restore-start|restore-health|restore-runtime) return 22;; esac
 return 0
 }
 sleep() { :; }

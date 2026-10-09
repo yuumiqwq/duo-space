@@ -40,7 +40,8 @@ health_check() {
   local url="$1"
   local attempts="${2:-30}"
   for (( attempt=1; attempt<=attempts; attempt++ )); do
-    if curl --fail --silent --show-error --max-time 4 "$url" >/dev/null; then
+    if curl --fail --silent --show-error --max-time 4 "$url" >/dev/null \
+      && curl --fail --silent --show-error --max-time 4 "${url%/access}/api/access/runtime" >/dev/null; then
       return 0
     fi
     sleep 2

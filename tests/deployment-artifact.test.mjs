@@ -16,6 +16,12 @@ test('artifact validation accepts runtime dependencies and rejects leaked genera
   const trace = path.join(build, 'server/route.js.nft.json');
   await writeFile(trace, JSON.stringify({ files: ['../../node_modules/next/package.json'] }));
   assert.equal((await checkBuildArtifact(build)).manifests, 1);
+  const runtime = 'next/dist/compiled/next-server/app-route-turbo.runtime.prod.js';
+  await writeFile(path.join(build, 'server/chunk.js'), `require(${JSON.stringify(runtime)})`);
+  await assert.rejects(checkBuildArtifact(build), /Missing standalone runtime: next\/dist\/compiled/);
+  await mkdir(path.dirname(path.join(build, 'standalone/node_modules', runtime)), { recursive: true });
+  await writeFile(path.join(build, 'standalone/node_modules', runtime), 'runtime');
+  assert.equal((await checkBuildArtifact(build)).manifests, 1);
   await writeFile(trace, JSON.stringify({ files: ['../../codex-generated/fixture.json'] }));
   await assert.rejects(checkBuildArtifact(build), /Non-runtime files.*\n.*fixture.json/);
   await writeFile(trace, JSON.stringify({ files: ['../../node_modules/next/package.json'] }));

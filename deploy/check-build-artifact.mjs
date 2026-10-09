@@ -17,8 +17,13 @@ export async function checkBuildArtifact(buildDirectory = path.resolve('.next'))
   await access(path.join(standalone, 'server.js'));
   await access(path.join(standalone, 'node_modules/next/package.json'));
   const violations = [];
+  const routeRuntimes = new Set();
   let manifests = 0;
   for await (const filename of files(path.join(buildDirectory, 'server'))) {
+    if (filename.endsWith('.js')) {
+      const source = await readFile(filename, 'utf8');
+      for (const match of source.matchAll(/["'](next\/dist\/compiled\/next-server\/[\w.-]+\.js)["']/g)) routeRuntimes.add(match[1]);
+    }
     if (!filename.endsWith('.nft.json')) continue;
     manifests++;
     const trace = JSON.parse(await readFile(filename, 'utf8'));
@@ -28,6 +33,9 @@ export async function checkBuildArtifact(buildDirectory = path.resolve('.next'))
     }
   }
   if (!manifests) throw new Error('No server file-tracing manifests found');
+  for (const runtime of routeRuntimes) {
+    await access(path.join(standalone, 'node_modules', runtime)).catch(() => { throw new Error(`Missing standalone runtime: ${runtime}`); });
+  }
   for await (const filename of files(standalone)) {
     const relative = path.relative(standalone, filename);
     if (excluded.has(firstSegment(relative))) violations.push(`standalone: ${relative}`);

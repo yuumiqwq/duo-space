@@ -25,7 +25,10 @@ case "$PREVIOUS_IMAGE" in 11scat-web:*|ghcr.io/yuumi-11/11scat-web:*|ghcr.io/yuu
 health_check() {
   local url="$1"
   for (( attempt=1; attempt<=30; attempt++ )); do
-    curl --fail --silent --show-error --max-time 4 "$url" >/dev/null && return 0
+    if curl --fail --silent --show-error --max-time 4 "$url" >/dev/null \
+      && curl --fail --silent --show-error --max-time 4 "${url%/access}/api/access/runtime" >/dev/null; then
+      return 0
+    fi
     sleep 2
   done
   return 1
