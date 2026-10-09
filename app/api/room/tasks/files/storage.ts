@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, open, readFile, readdir, rename, unlink } from "node:fs/promises";
 import path from "node:path";
-import { CollaborationError } from "../store.ts";
+import { CollaborationError } from "../domain.ts";
 import { readAttachmentReferences, withAttachmentLock } from '../attachment-coordination.ts';
 
 export const MAX_FILE_BYTES = 20 * 1024 * 1024;

@@ -1,7 +1,8 @@
 import { getUser, listRoomMembers } from "../../identity/store";
 import { decryptToken } from "../../ticktick/crypto";
 import { tickFetch, tickInboxData, resolveTickInbox, TickApiError } from "../../ticktick/client";
-import { CollaborationError, remoteVersion, sameFields, taskFields, verificationIssue, type Gateway, type RemoteTask } from "./store";
+import { CollaborationError, remoteVersion, sameFields, taskFields, verificationIssue, type RemoteTask } from "./domain";
+import type { Gateway } from "./gateway";
 import type { TaskFields } from "../../../collaboration-types";
 import { taskSyncEvidence } from './sync-diagnostics';
 import { allDaySelection } from '../../../task-date-input';

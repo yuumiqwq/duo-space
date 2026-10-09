@@ -1,77 +1,59 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent, type ReactNode } from "react";
-import type { PublicTaskPreview } from "./classroom-view";
+import { Check,CircleAlert,ClipboardList,Ellipsis,Loader2,Plus,RefreshCw,X } from "lucide-react";
+import { useEffect,useRef,useState,type CSSProperties,type PointerEvent,type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { CircleAlert, Check, ClipboardList, Ellipsis, Loader2, Plus, RefreshCw, X } from "lucide-react";
-import type { CollaborationCommand, CollaborationSnapshot, ExecutionCommand, OperationResyncCommand, OperationView, RoomTask, ClaimWorkflow, WorkflowCommand } from "./collaboration-types";
+import type { PublicTaskPreview } from "./classroom-view";
+import type { CollaborationSnapshot,RoomTask } from "./collaboration-types";
+import { collaborationDate,collaborationDateAfter,collaborationDateLabel,collaborationPinColor,splitCollaborationTasks } from "./collaboration-view";
+import { CollaborationRecovery } from "./CollaborationRecovery";
+import { InlineTaskTitle } from "./InlineTaskTitle";
 import { OperationResyncSettings } from './OperationResyncSettings';
 import "./room-collaboration.css";
-import { TickTickDiagnostics } from "./TickTickDiagnostics";
-import { InlineTaskTitle } from "./InlineTaskTitle";
-import { collaborationDate, collaborationDateAfter, collaborationDateLabel, collaborationPinColor, splitCollaborationTasks } from "./collaboration-view";
-import { CollaborationRecovery } from "./CollaborationRecovery";
-import { nextTaskPrompt, type TaskNotice } from "./collaboration-notifications";
+import { taskDescriptionPreview } from "./task-description";
+import { descriptionAttachments } from "./task-description-attachments";
+import { loadTaskStampFonts } from "./task-stamp-fonts";
+import { TaskAttachments } from "./TaskDescription";
 import { TaskNoticeDot } from "./TaskNoticeDot";
 import { TaskNudge } from "./TaskNudge";
 import { TaskRejection } from './TaskRejection';
-import { descriptionAttachments } from "./task-description-attachments";
-import { TaskAttachments } from "./TaskDescription";
-import { taskDescriptionPreview } from "./task-description";
-import { loadTaskStampFonts } from "./task-stamp-fonts";
+import { TickTickDiagnostics } from "./TickTickDiagnostics";
 
 import { ClaimWorkflows } from "./ClaimWorkflows";
-import { applyWorkflowUpdate, removeSnapshotTask, withoutDeletedWorkflowTasks } from './collaboration-snapshot';
-import { loadCollaborationSnapshot, mergeCollaborationSnapshot } from './collaboration-loading';
+import { showCollaborationDialog } from './collaboration-dialog';
 import { inboxClaimant } from './inbox-claim-stamp';
 import { InboxClaimStamp } from './InboxClaimStamp';
-import { refreshMembers, websiteOnlyAction } from "./collaboration-refresh";
-import { readTaskResponse, taskErrorMessage } from './task-request';
-import { WorkflowSyncAlert, WorkflowSyncReport } from './WorkflowSyncReport';
-import { showCollaborationDialog } from './collaboration-dialog';
-import { taskCardNotices, taskboardAttentionCount, workflowAttentionCount, type WorkflowAttention } from './workflow-execution';
+import { taskCardNotices,taskboardAttentionCount,workflowAttentionCount } from './workflow-execution';
+import { WorkflowSyncAlert,WorkflowSyncReport } from './WorkflowSyncReport';
 
-type RequestCommand = WorkflowCommand | ExecutionCommand | OperationResyncCommand | { id: string; action: "legacy-reset" } | CollaborationCommand | { id: string; action: "resume" | "cancel" } | { id: string; action: "recover"; target: { id: string; version: string } };
 const taskKey = (task: RoomTask) => `${task.ownerId || "buffer"}:${task.id}`;
 const taskSource = (task: RoomTask) => ({ ownerId: task.ownerId, taskId: task.id, version: task.version, settingsVersion: task.settingsVersion });
 const priorities = { 0: "无优先级", 1: "低", 3: "中", 5: "高" };
 const operationTime = (value: number) => new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(new Date(value));
 
+import { useCollaborationNotices } from './collaboration/use-collaboration-notices';
+import { useCollaborationSession } from './collaboration/use-collaboration-session';
 export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTasks, triggerContent, previewSnapshot, previewAutoOpen = true, entryReady = true }: { identityId: string; onChanged: (fresh?: boolean) => Promise<boolean>; onNotice?: (id: string) => void; onPublicTasks?: (tasks: PublicTaskPreview[]) => void; triggerContent?: ReactNode; previewSnapshot?: CollaborationSnapshot; previewAutoOpen?: boolean; entryReady?: boolean }) {
   const [stampFontsReady, setStampFontsReady] = useState(false);
   const [open, setOpen] = useState(false);
-  const [snapshot, setSnapshot] = useState<CollaborationSnapshot | null>(previewSnapshot || null);
-  const [taskNotices, setTaskNotices] = useState<TaskNotice[]>([]);
-  const [attention, setAttention] = useState<{ revision: number; workflows: WorkflowAttention[] } | null>(null);
-  const [taskPrompt, setTaskPrompt] = useState<TaskNotice | null>(null);
-  const readIds = useRef(new Set<string>()), sounded = useRef(new Set<string>());
-  const noticeVersion = useRef(0);
-  const badgeWorkflows = attention && attention.revision > (snapshot?.revision ?? -1) ? attention.workflows : snapshot?.workflows || [];
-  const unseenCount = taskboardAttentionCount(badgeWorkflows, taskNotices, identityId);
-  const workflowCount = workflowAttentionCount(badgeWorkflows);
-  const issueNotice = taskNotices.find(item => item.kind === 'sync-error');
-  const [loading, setLoading] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
   const [recoveryOpen, setRecoveryOpen] = useState(false);
   const [workflowOpen, setWorkflowOpen] = useState(false), [workflowId, setWorkflowId] = useState<string | null>(null);
   const [draftId, setDraftId] = useState<string | null>(null);
   const [keyboardDrag, setKeyboardDrag] = useState<{ task: RoomTask; owner: string } | null>(null);
   const [editor, setEditor] = useState<RoomTask | null>(null);
-  const [uncertain, setUncertain] = useState<RequestCommand | null>(null);
   const [hoverOwner, setHoverOwner] = useState<string | null>(null);
   const [ghost, setGhost] = useState<{ x: number; y: number; task: RoomTask; width: number } | null>(null);
   const dialog = useRef<HTMLDialogElement>(null), trigger = useRef<HTMLButtonElement>(null), membersPane = useRef<HTMLDivElement>(null);
-  const locked = useRef(false), fetching = useRef(false), revision = useRef<number | null>(null), generation = useRef(0);
-  const remoteVersions = useRef<Record<string, string> | null>(null);
-  const loadController = useRef<AbortController | null>(null);
   const drag = useRef<{ handle: HTMLElement; pointerId: number; stop: () => void; task: RoomTask; x: number; y: number; moved: boolean; offsetX: number; offsetY: number; width: number } | null>(null);
+  const { taskNotices, taskPrompt, setTaskPrompt, acceptNotices, markRead, markViewed, dismissRejection } = useCollaborationNotices({ onNotice, identityId });
+
+  const { snapshot, attention, loading, busy, error, setError, notice, setNotice, uncertain, locked, load, perform, unavailable } = useCollaborationSession({ previewSnapshot, onPublicTasks, acceptNotices, identityId, open, onChanged, drag, setDraftId, setWorkflowId, setWorkflowOpen });
+  const badgeWorkflows = attention && attention.revision > (snapshot?.revision ?? -1) ? attention.workflows : snapshot?.workflows || [];
+  const unseenCount = taskboardAttentionCount(badgeWorkflows, taskNotices, identityId);
+  const workflowCount = workflowAttentionCount(badgeWorkflows);
+  const issueNotice = taskNotices.find(item => item.kind === 'sync-error');
 
   useEffect(() => () => { drag.current?.stop(); }, []);
-  useEffect(() => { if (snapshot) onPublicTasks?.(snapshot.buffer); }, [snapshot, onPublicTasks]);
-
-  useEffect(() => { if (!notice) return; const timer = setTimeout(() => setNotice(""), 2400); return () => clearTimeout(timer); }, [notice]);
 
   useEffect(() => {
     let active = true;
@@ -80,32 +62,6 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
     void loadTaskStampFonts().then(() => { if (active) setStampFontsReady(true); }).catch(() => undefined);
     return () => { active = false; };
   }, [open]);
-
-  const acceptNotices = useCallback((incoming: TaskNotice[], version = 0) => {
-    if (version < noticeVersion.current) return;
-    noticeVersion.current = version;
-    const unread = incoming.filter(item => !readIds.current.has(item.id));
-    setTaskNotices(unread);
-    if (!document.hidden) {
-      const fresh = unread.filter(item => !sounded.current.has(item.id));
-      for (const item of fresh) sounded.current.add(item.id);
-      if (fresh.length) onNotice?.(fresh.at(-1)!.id);
-      setTaskPrompt(current => nextTaskPrompt(unread, identityId, current));
-    }
-  }, [identityId, onNotice]);
-  const markRead = useCallback(async (ids: string[]) => {
-    const pending = ids.filter(id => !readIds.current.has(id)); if (!pending.length) return;
-    const response = await fetch("/api/room/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "read-notices", ids: pending }), signal: AbortSignal.timeout(15000) });
-    const data = await readTaskResponse(response, '浏览状态未保存');
-    for (const id of pending) readIds.current.add(id);
-    acceptNotices(data.notices || [], data.noticeVersion);
-  }, [acceptNotices]);
-  const markViewed = useCallback((ids: string[]) => { void markRead(ids).catch(() => undefined); }, [markRead]);
-  const dismissRejection = useCallback(async (id: string) => {
-    const response = await fetch('/api/room/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'dismiss-rejection', noticeId: id }), signal: AbortSignal.timeout(15000) });
-    const data = await readTaskResponse(response, '浏览状态未保存');
-    acceptNotices(data.notices || [], data.noticeVersion);
-  }, [acceptNotices]);
   const openIssue = (workflowId?: string) => { setOpen(true); setRecoveryOpen(!workflowId); setEditor(null); setWorkflowId(workflowId || null); setWorkflowOpen(!!workflowId); setError(''); };
   useEffect(() => {
     if (!entryReady) return;
@@ -118,86 +74,6 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
     const timer = setTimeout(() => { setOpen(true); const id = params.get("workflow"); if (id && /^[a-f0-9-]{36}$/i.test(id)) { setWorkflowId(id); setWorkflowOpen(true); } }, 0);
     return () => clearTimeout(timer);
   }, [previewSnapshot, previewAutoOpen, entryReady]);
-
-  const load = useCallback(async (force = false, memberIds?: string[]) => {
-    if (previewSnapshot) return previewSnapshot;
-    if (memberIds?.length === 0) {
-      const id = generation.current;
-      try {
-        return await loadCollaborationSnapshot({ signal: AbortSignal.timeout(8000), memberIds, settled() {}, accept: next => {
-          if (id !== generation.current) return;
-          setSnapshot(current => mergeCollaborationSnapshot(current, next));
-          acceptNotices(next.notices || [], next.noticeVersion);
-          revision.current = Math.max(revision.current ?? 0, next.revision);
-        } });
-      } catch (cause) { if (id === generation.current) setError(taskErrorMessage(cause, '协作区暂时无法读取')); return null; }
-    }
-    if (fetching.current && !force) return null;
-    if (force) loadController.current?.abort();
-    const controller = new AbortController(); loadController.current = controller;
-    fetching.current = true; setLoading(true);
-    const id = ++generation.current;
-    try {
-      const data = await loadCollaborationSnapshot({ signal: controller.signal, memberIds,
-        accept: (next, memberId) => {
-          if (id !== generation.current) return;
-          setSnapshot(current => mergeCollaborationSnapshot(current, next, memberId));
-          if (remoteVersions.current === null) remoteVersions.current = { ...next.remoteVersions };
-          if (memberId) remoteVersions.current[memberId] = next.remoteVersions?.[memberId] || "";
-          else {
-            for (const member of next.members) if (!member.connected) remoteVersions.current[member.id] = next.remoteVersions?.[member.id] || '';
-            for (const member of Object.keys(remoteVersions.current)) if (!next.members.some(item => item.id === member)) delete remoteVersions.current[member];
-          }
-          acceptNotices(next.notices || [], next.noticeVersion);
-          revision.current = Math.max(revision.current ?? 0, next.revision);
-        },
-        settled: () => { if (id === generation.current) { fetching.current = false; setLoading(false); } },
-      });
-      return id === generation.current ? withoutDeletedWorkflowTasks(data) : null;
-    } catch (cause) { if (id === generation.current) setError(taskErrorMessage(cause, '协作区暂时无法读取')); return null; }
-  }, [acceptNotices, previewSnapshot]);
-
-  // Warm each member's tasks when entering the classroom. Opening the board
-  // shares this request; closing it does not discard useful in-flight reads.
-  useEffect(() => {
-    if (!identityId || previewSnapshot) return;
-    const timer = setTimeout(() => { void load(); }, 0);
-    return () => { clearTimeout(timer); generation.current++; fetching.current = false; loadController.current?.abort(); };
-  }, [identityId, load, previewSnapshot]);
-
-  useEffect(() => {
-    if (!identityId || previewSnapshot) return;
-    let stopped = false, polling = false;
-    const poll = async () => {
-      if (stopped || polling || document.hidden || locked.current) return;
-      polling = true;
-      const startedGeneration = generation.current;
-      try {
-        const response = await fetch(open ? "/api/room/tasks?local=1" : "/api/room/tasks?revision=1", { cache: "no-store", signal: AbortSignal.timeout(8000) });
-        if (!response.ok) return;
-        const data = await response.json();
-        if (stopped || locked.current || startedGeneration !== generation.current) return;
-        if (revision.current !== null && data.revision < revision.current) return;
-        acceptNotices(data.notices || [], data.noticeVersion);
-        if (Array.isArray(data.attentionWorkflows)) setAttention(current => current && current.revision > data.revision ? current : { revision: data.revision, workflows: data.attentionWorkflows });
-        if (Array.isArray(data.bufferPreview)) onPublicTasks?.(data.bufferPreview);
-        const versions: Record<string, string> = data.remoteVersions || {};
-        const changed = remoteVersions.current === null ? [] : [...new Set([...Object.keys(versions), ...Object.keys(remoteVersions.current)])].filter(id => (versions[id] || "") !== (remoteVersions.current![id] || ""));
-        if (changed.length && !fetching.current) {
-          void load(false, changed);
-          if (changed.includes(identityId)) void onChanged(true);
-        }
-        if (open && Array.isArray(data.buffer) && Array.isArray(data.members) && Array.isArray(data.workflows)) setSnapshot(current => mergeCollaborationSnapshot(current, data));
-        revision.current = data.revision;
-      } catch { /* Try again on the next poll or focus. */ }
-      finally { polling = false; }
-    };
-    const first = setTimeout(() => void poll(), 0), timer = setInterval(() => void poll(), 5000);
-    const focus = () => void poll();
-    const visible = () => { if (!document.hidden) { void poll(); if (open && !locked.current && !drag.current) void load(); } };
-    window.addEventListener("focus", focus); window.addEventListener("online", focus); document.addEventListener("visibilitychange", visible);
-    return () => { stopped = true; clearTimeout(first); clearInterval(timer); window.removeEventListener("focus", focus); window.removeEventListener("online", focus); document.removeEventListener("visibilitychange", visible); };
-  }, [identityId, open, onChanged, load, acceptNotices, onPublicTasks, previewSnapshot]);
   useEffect(() => {
     if (!open) return;
     const element = dialog.current, button = trigger.current;
@@ -206,83 +82,7 @@ export function RoomCollaboration({ identityId, onChanged, onNotice, onPublicTas
     const first = setTimeout(() => { void load(); }, 0);
     const timer = setInterval(() => { if (!document.hidden && !locked.current && !drag.current) void load(); }, 15000);
     return () => { clearTimeout(first); clearInterval(timer); element?.close(); button?.focus({ preventScroll: true }); };
-  }, [open, load, previewSnapshot]);
-
-  async function perform(command: RequestCommand): Promise<boolean> {
-    if (previewSnapshot) {
-      setSnapshot(current => {
-        if (!current) return current;
-        const next = structuredClone(current);
-        if (command.action === 'arrange-execution') {
-          for (const workflow of next.workflows) if (workflow.claimantId === next.identityId) workflow.executing = command.workflowIds.includes(workflow.id);
-          next.executionVersion = (next.executionVersion || 0) + 1;
-          return next;
-        }
-        const source = "source" in command ? command.source : undefined;
-        const list = source?.ownerId ? next.members.find(member => member.id === source.ownerId)?.tasks : next.buffer;
-        const task = list?.find(item => item.id === source?.taskId);
-        if (task && "dateAfter" in command && command.dateAfter) {
-          const previous = next.members.find(member => member.id === command.dateAfter!.ownerId)?.tasks.find(item => item.id === command.dateAfter!.taskId);
-          if (previous) Object.assign(task, collaborationDateAfter(task, previous));
-        }
-        if (task && command.action === "update") Object.assign(task, command.fields);
-        if (task && ["claim", "move", "complete", "delete"].includes(command.action)) {
-          list!.splice(list!.indexOf(task), 1);
-          if ("destination" in command && command.destination) {
-            task.ownerId = command.destination;
-            next.members.find(member => member.id === command.destination)?.tasks.push(task);
-          }
-        }
-        if (command.action === "create") next.buffer.push({ ...previewSnapshot.buffer[0], ...command.fields, id: command.id, ownerId: null, workflowId: undefined });
-        if (command.action === "update-workflow") {
-          const workflow = next.workflows.find(item => item.id === command.workflowId);
-          if (workflow) { Object.assign(workflow.fields, command.fields); workflow.title = workflow.fields.title; }
-          for (const item of [...next.buffer, ...next.members.flatMap(member => member.tasks)]) if (item.workflowId === command.workflowId) Object.assign(item, command.fields);
-        }
-        return next;
-      });
-      if (command.action === "create") setDraftId(null);
-      return true;
-    }
-    if (locked.current) return false;
-    const affectedMembers = refreshMembers(command, snapshot), localAction = websiteOnlyAction(command.action);
-    if (affectedMembers.length) { generation.current++; fetching.current = false; loadController.current?.abort(); setLoading(false); }
-    locked.current = true; setBusy(true); setError(""); setNotice(""); setUncertain(command);
-    let operation: OperationView | undefined, workflow: ClaimWorkflow | undefined, executionSaved = false;
-    try {
-      const response = await fetch("/api/room/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(command), signal: AbortSignal.timeout(90000) });
-      if (!response.ok && response.status < 500) setUncertain(null);
-      const data = await readTaskResponse(response, '请求结果未确认，请核对并重试');
-      executionSaved = command.action === 'arrange-execution' && data.execution?.id === command.id && Array.isArray(data.workflows);
-      if (command.action !== 'legacy-reset' && !executionSaved && !data.operation?.id && !data.workflow?.id) throw new Error('请求结果未确认，请核对并重试');
-      operation = data.operation; workflow = data.workflow;
-      if (executionSaved) setSnapshot(current => current ? { ...data.workflows.reduce(applyWorkflowUpdate, current), executionVersion: data.execution.version, revision: data.revision } : current);
-      if (workflow) setSnapshot(current => current ? applyWorkflowUpdate(current, workflow!) : current);
-      const deletedSource = command.action === 'delete' ? command.source : undefined;
-      if (operation?.status === 'done' && deletedSource) setSnapshot(current => current ? removeSnapshotTask(current, deletedSource.ownerId, deletedSource.taskId) : current);
-      if (workflow && !["update-workflow", "delete-owner-task", "delete-claimed-task"].includes(command.action)) { setWorkflowId(workflow.id); setWorkflowOpen(true); }
-      setUncertain(null);
-      if (!localAction && (workflow?.error || workflow?.syncError) && !workflow?.editPending && !workflow?.ownerDeletePending) setError(workflow.syncError || workflow.error);
-      else if (operation?.status === "pending") setError(operation.error || "操作尚未完成，请在下方继续处理");
-      else if (localAction || !workflow?.editPending) setNotice(operation?.status === "cancelled" ? "已取消未完成的操作" : "已保存");
-    } catch (cause) { setError(taskErrorMessage(cause, '请求结果未确认，请核对并重试')); }
-    finally {
-      const deletionConfirmed = workflow?.status === 'deleted' || (operation?.status === 'done' && command.action === 'delete');
-      const next = deletionConfirmed ? null : await load(true, affectedMembers);
-      if (deletionConfirmed) void load(true, affectedMembers);
-      workflow = next?.workflows.find(item => item.id === workflow?.id || item.id === command.id || item.events.some(event => event.id === command.id) || (command.action === "retry-workflow" && item.id === command.workflowId && item.version !== command.version)) || workflow;
-      if (workflow) { setUncertain(null); if (!["update-workflow", "delete-owner-task", "delete-claimed-task"].includes(command.action)) { setWorkflowId(workflow.id); setWorkflowOpen(true); } }
-      const known = next?.operations.find(item => item.id === command.id);
-      if (known) { setUncertain(null); operation ||= known; }
-      if (workflow && !workflow.error && !workflow.syncError) setError('');
-      if (operation?.status === "done") { setError(""); setNotice("已保存"); }
-      locked.current = false; setBusy(false);
-      if (affectedMembers.includes(identityId)) void onChanged(true);
-    }
-    if (operation?.status === "done" || operation?.status === "cancelled") setDraftId(current => current === command.id ? null : current);
-    return executionSaved || (workflow ? (localAction && workflow.events.some(event => event.id === command.id)) || workflow.status === 'deleted' || (command.action === 'update-workflow' && workflow.events.some(event => event.id === command.id)) || (!workflow.error && !workflow.syncError) : operation?.status === "done");
-  }
-  const unavailable = busy || !!uncertain;
+  }, [open, load, previewSnapshot, locked]);
   const ownerName = (owner: string | null) => owner === null ? "任务板" : snapshot?.members.find(member => member.id === owner)?.name || "成员";
   const canDrop = (owner: string) => owner !== "" && snapshot?.members.some(member => member.id === owner && member.connected && !member.loading && !member.error);
   const move = async (task: RoomTask, owner: string, previous?: RoomTask) => {

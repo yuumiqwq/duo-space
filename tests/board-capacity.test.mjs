@@ -8,7 +8,7 @@ import { orderClassroomBoards, replaceClassroomBoards } from '../app/classroom-b
 import { appendStrokePoints, boardPointerPoints } from '../app/board-pointer.mjs';
 import { encodeRoomPackets, createPacketReceiver } from '../app/room-packets.ts';
 
-const page = readFileSync('app/page.tsx', 'utf8').replaceAll('\r\n', '\n');
+const page = readFileSync('app/room/use-room-boards.ts', 'utf8').replaceAll('\r\n', '\n');
 function extract(source, start, end, env, result) {
   const first = source.indexOf(start), last = source.indexOf(end, first + start.length);
   assert.ok(first >= 0 && last > first);

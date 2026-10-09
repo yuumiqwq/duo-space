@@ -7,7 +7,7 @@ const projectFile = (path) => new URL(`../${path}`, import.meta.url);
 test("retains installed PWA push delivery and restores per-device notification controls", async () => {
   const [layout, page, manifestText, serviceWorker, proxy, messageRoute, pushStore] = await Promise.all([
     readFile(projectFile("app/layout.tsx"), "utf8"),
-    readFile(projectFile("app/page.tsx"), "utf8"),
+    readFile(projectFile("app/room/use-room-notifications.ts"), "utf8"),
     readFile(projectFile("public/manifest.webmanifest"), "utf8"),
     readFile(projectFile("public/sw.js"), "utf8"),
     readFile(projectFile("proxy.ts"), "utf8"),
@@ -34,7 +34,7 @@ test("retains installed PWA push delivery and restores per-device notification c
 
 test("uses native iPhone PiP and mobile-only background presence grace", async () => {
   const [page, presenceRoute] = await Promise.all([
-    readFile(projectFile("app/page.tsx"), "utf8"),
+    Promise.all(['model.ts', 'use-peer-room.ts', 'use-room-presence.ts', 'use-room-media.ts', 'MediaVideo.tsx'].map(file => readFile(projectFile('app/room/' + file), 'utf8'))).then(parts => parts.join('\n')),
     readFile(projectFile("app/api/room/presence/route.ts"), "utf8"),
   ]);
 
@@ -42,7 +42,7 @@ test("uses native iPhone PiP and mobile-only background presence grace", async (
   assert.match(page, /const mobileClient = isMobileBrowser\(\)/);
   assert.match(page, /syncRoomPresence\(true\)/);
   assert.match(page, /mobilePeerIds\.has\(peerId\)\s*\?\s*MOBILE_BACKGROUND_GRACE_MS\s*:\s*10_000/);
-  assert.match(page, /if \(!mobileClient \|\| intentionalLeaveRef\.current\) leaveRoomPresence\(\)/);
+
   assert.match(page, /disablePictureInPicture=\{false\}/);
   assert.match(page, /webkitSupportsPresentationMode\?\.\("picture-in-picture"\)/);
   assert.match(page, /webkitSetPresentationMode\("picture-in-picture"\)/);

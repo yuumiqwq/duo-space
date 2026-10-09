@@ -12,10 +12,11 @@ import { taskboardAttentionCount, workflowAttentionCount } from '../app/workflow
 
 // Execute the component's actual request callback and effects without adding a
 // browser runtime to the test suite. DOM focus and timers are controlled here.
-const source = ts.createSourceFile('RoomCollaboration.tsx', readFileSync(new URL('../app/RoomCollaboration.tsx', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+const source = ts.createSourceFile('RoomCollaboration.tsx', ['app/RoomCollaboration.tsx', 'app/collaboration/use-collaboration-session.ts'].map(file => readFileSync(file, 'utf8')).join('\n'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 const component = source.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'RoomCollaboration');
-const load = component.body.statements.find(node => ts.isVariableStatement(node) && node.declarationList.declarations.some(item => item.name.getText(source) === 'load'));
-const effects = component.body.statements.filter(node => ts.isExpressionStatement(node) && ts.isCallExpression(node.expression) && node.expression.expression.getText(source) === 'useEffect')
+const statements = [...source.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'useCollaborationSession').body.statements, ...component.body.statements];
+const load = statements.find(node => ts.isVariableStatement(node) && node.declarationList.declarations.some(item => item.name.getText(source) === 'load'));
+const effects = statements.filter(node => ts.isExpressionStatement(node) && ts.isCallExpression(node.expression) && node.expression.expression.getText(source) === 'useEffect')
   .filter(node => { const deps = node.expression.arguments[1]?.elements?.map(item => item.getText(source)) || []; return deps.includes('load') && !deps.includes('onChanged'); });
 assert.equal(effects.length, 2);
 const transpile = text => ts.transpileModule(text, { compilerOptions: { target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.React } }).outputText;
@@ -65,7 +66,7 @@ test('classroom preload survives board close and reopen, shares pending reads, a
 });
 
 test('member column renders preloaded tasks alongside a refresh error instead of hiding the list', () => {
-  const column = component.body.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'column');
+  const column = statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'column');
   const fixture = { React, splitCollaborationTasks, hoverOwner: null, identityId: 'bob', card: task => React.createElement('article', { key: task.id }, task.title) };
   const render = new Function(...Object.keys(fixture), transpile(`${column.getText(source)}\nreturn column;`))(...Object.values(fixture));
   const html = renderToStaticMarkup(render('alice', 'Alice', [{ id: 'cached', title: '上次成功读取的任务' }], '收集箱暂时无法读取'));
@@ -74,8 +75,8 @@ test('member column renders preloaded tasks alongside a refresh error instead of
 });
 
 test('closed taskboard polls update review badges without inbox reloads and stale summaries cannot replace newer state', async () => {
-  const pollEffect = component.body.statements.find(node => ts.isExpressionStatement(node) && ts.isCallExpression(node.expression) && node.expression.expression.getText(source) === 'useEffect' && node.expression.arguments[1]?.elements?.some(item => item.getText(source) === 'onChanged'));
-  const badgeDeclarations = component.body.statements.filter(node => ts.isVariableStatement(node) && node.declarationList.declarations.some(item => ['badgeWorkflows', 'unseenCount', 'workflowCount'].includes(item.name.getText(source))));
+  const pollEffect = statements.find(node => ts.isExpressionStatement(node) && ts.isCallExpression(node.expression) && node.expression.expression.getText(source) === 'useEffect' && node.expression.arguments[1]?.elements?.some(item => item.getText(source) === 'onChanged'));
+  const badgeDeclarations = statements.filter(node => ts.isVariableStatement(node) && node.declarationList.declarations.some(item => ['badgeWorkflows', 'unseenCount', 'workflowCount'].includes(item.name.getText(source))));
   const counts = new Function('attention', 'snapshot', 'taskNotices', 'taskboardAttentionCount', 'workflowAttentionCount', transpile(`const identityId = 'alice';\n${badgeDeclarations.map(node => node.getText(source)).join('\n')}\nreturn { main: unseenCount, workflow: workflowCount };`));
   let attention = null, notices = [], snapshot = { revision: 1, workflows: [] }, interval, first, cleanup;
   const submitted = { id: 'review', status: 'submitted', executing: true, source: { ownerId: null, taskId: 'shared' } };
@@ -86,7 +87,7 @@ test('closed taskboard polls update review badges without inbox reloads and stal
     useEffect: fn => { cleanup = fn(); }, identityId: 'alice', previewSnapshot: undefined, open: false,
     document: { ...events, hidden: false }, window: events, locked: { current: false }, generation: { current: 0 }, revision,
     remoteVersions: { current: { bob: 'unchanged' } }, fetching: { current: false },
-    acceptNotices: incoming => { notices = incoming; }, setAttention: update => { attention = update(attention); },
+    drag: { current: null }, acceptNotices: incoming => { notices = incoming; }, setAttention: update => { attention = update(attention); },
     onPublicTasks() {}, load: () => assert.fail('local review changes do not reload inboxes'), onChanged: () => assert.fail('no external tasks changed'),
     setSnapshot: () => assert.fail('closed polls retain the full snapshot'), mergeCollaborationSnapshot,
     fetch: async url => { requests.push(url); return Response.json(response); },

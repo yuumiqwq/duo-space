@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 
 // Exercise the page's real send, scroll and history handlers with controlled DOM geometry.
-const source = readFileSync('app/page.tsx', 'utf8');
+const source = ['app/room/model.ts', 'app/room/use-room-chat.ts', 'app/page.tsx'].map(file => readFileSync(file, 'utf8')).join('\n');
 const tree = ts.createSourceFile('page.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 const names = ['sendMessage', 'sendVoice', 'handleChatScroll', 'loadOlderChatMessages', 'scrollChatToBottom'];
 const declarations = [], imageLoads = [];

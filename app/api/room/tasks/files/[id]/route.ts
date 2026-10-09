@@ -3,7 +3,7 @@ import path from "node:path";
 import { NextResponse } from "next/server";
 import { currentIdentityId } from "../../../../identity/session";
 import { store, collaborationDirectory } from "../../service";
-import { CollaborationError } from "../../store";
+import { CollaborationError } from "../../domain.ts";
 import { metadata } from "../storage";
 import { imageAttachmentType } from '../../../../../task-attachment-labels';
 

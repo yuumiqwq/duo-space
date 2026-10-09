@@ -6,7 +6,7 @@ import { readFile } from 'node:fs/promises';
 import { runInNewContext } from 'node:vm';
 
 test('foreground reconciliation preserves every source and never requests a forced reconnect', async () => {
-  const page = await readFile('app/page.tsx', 'utf8');
+  const page = await readFile('app/room/use-peer-room.ts', 'utf8');
   const start = page.indexOf('    const resumeMedia = () => {');
   const end = page.indexOf('    const handleVisibilityChange', start);
   assert.ok(start > 0 && end > start);

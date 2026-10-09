@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { currentIdentityId } from "../../../identity/session";
 import { store, collaborationDirectory } from "../service";
-import { CollaborationError } from "../store";
+import { CollaborationError } from "../domain.ts";
 import { uploadFile } from "./storage";
 
 export const runtime = "nodejs";

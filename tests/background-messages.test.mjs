@@ -123,7 +123,7 @@ test('notification enumeration failure still displays a push and invalid click d
 });
 
 test('an existing browser subscription is restored on the server, and a rejected restore is not shown as enabled', async () => {
-  const page = (await readFile('app/page.tsx', 'utf8')).replace(/\r\n/g, '\n');
+  const page = (await readFile('app/room/use-room-notifications.ts', 'utf8')).replace(/\r\n/g, '\n');
   const start = page.indexOf('  useEffect(() => {\n    if (!identityId || pushBusy) return;');
   const end = page.indexOf('\n  const enablePushNotifications', start);
   assert.ok(start > 0 && end > start);

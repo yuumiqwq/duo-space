@@ -8,7 +8,7 @@ import { watchRemoteMediaTracks, whenRemoteMediaReady } from '../app/media-track
 import { createIncomingMediaRecovery } from '../app/incoming-media-recovery.ts';
 import { attachVideoPlayback } from '../app/video-playback.ts';
 
-const page = readFileSync('app/page.tsx', 'utf8').replaceAll('\r\n', '\n');
+const page = readFileSync('app/room/use-peer-room.ts', 'utf8').replaceAll('\r\n', '\n');
 function extract(start, end, env, result) {
   const first = page.indexOf(start), last = page.indexOf(end, first + start.length);
   assert.ok(first >= 0 && last > first);

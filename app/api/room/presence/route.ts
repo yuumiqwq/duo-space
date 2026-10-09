@@ -25,7 +25,7 @@ function activeParticipants(now = Date.now()) {
   for (const [deviceId, participant] of participants) {
     if (now > participant.expiresAt) participants.delete(deviceId);
   }
-  return [...participants.values()].map(({ peerId, deviceId, name, identityId }) => ({ peerId, deviceId, name, identityId }));
+  return [...participants.values()].map(({ peerId, deviceId, name, identityId, expiresAt }) => ({ peerId, deviceId, name, identityId, expiresAt }));
 }
 
 export function GET() {
@@ -43,7 +43,8 @@ export async function POST(request: Request) {
   const name = typeof body.name === "string" ? body.name.trim().slice(0, 24) : "成员";
   const mobile = body.mobile === true;
   const background = body.background === true;
-  if (!peerPattern.test(peerId) || !devicePattern.test(deviceId)) {
+  // The member is present even while the media signaling service reconnects.
+  if ((peerId !== '' && !peerPattern.test(peerId)) || !devicePattern.test(deviceId)) {
     return new NextResponse("Invalid presence", { status: 400 });
   }
 

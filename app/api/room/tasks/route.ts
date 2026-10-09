@@ -1,7 +1,7 @@
 import { after, NextRequest, NextResponse } from "next/server";
 import { currentIdentityId } from "../../identity/session";
 import { getUser } from "../../identity/store";
-import { CollaborationError, collectionOperation, isPersonalCollection } from "./store";
+import { CollaborationError, collectionOperation, isPersonalCollection } from "./domain";
 import { store } from "./service";
 
 export const runtime = "nodejs";
