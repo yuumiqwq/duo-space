@@ -43,20 +43,24 @@ run_container() {
 
 docker image inspect "$PREVIOUS_IMAGE" >/dev/null
 docker rm -f "$CANDIDATE" >/dev/null 2>&1 || true
-run_container "$CANDIDATE" "$PREVIOUS_IMAGE" 3101 no
 trap 'docker rm -f "$CANDIDATE" >/dev/null 2>&1 || true' EXIT
+run_container "$CANDIDATE" "$PREVIOUS_IMAGE" 3101 no
 health_check "http://127.0.0.1:3101/access"
 docker rm -f "$CANDIDATE" >/dev/null
 trap - EXIT
 
 docker stop --time 20 "$CONTAINER" >/dev/null
 docker rm "$CONTAINER" >/dev/null
-run_container "$CONTAINER" "$PREVIOUS_IMAGE" 3100 unless-stopped
-
-if ! health_check "http://127.0.0.1:3100/access" || ! health_check "https://study.11scat.xyz/access"; then
+if ! run_container "$CONTAINER" "$PREVIOUS_IMAGE" 3100 unless-stopped \
+  || ! health_check "http://127.0.0.1:3100/access" \
+  || ! health_check "https://study.11scat.xyz/access"; then
   echo "Rollback target failed verification; restoring $CURRENT_IMAGE" >&2
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-  run_container "$CONTAINER" "$CURRENT_IMAGE" 3100 unless-stopped
+  if ! run_container "$CONTAINER" "$CURRENT_IMAGE" 3100 unless-stopped \
+    || ! health_check "http://127.0.0.1:3100/access"; then
+    echo "Restoring $CURRENT_IMAGE failed; manual recovery is required." >&2
+    exit 5
+  fi
   exit 4
 fi
 

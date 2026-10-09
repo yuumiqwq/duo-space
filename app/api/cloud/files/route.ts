@@ -1,8 +1,6 @@
-import { mkdir, open, rename, rm } from "node:fs/promises";
-import path from "node:path";
 import { NextRequest, NextResponse } from "next/server";
 import { currentIdentityId } from "../../identity/session";
-import { assertCloudCapacity, availableDestination, CloudCapacityError, ensureCloudFolders, resolveCloudPath, sanitizeFileName, deleteCloudItem } from "../store";
+import { CloudCapacityError, saveCloudUpload, deleteCloudItem } from "../store";
 
 export const runtime = "nodejs";
 
@@ -33,38 +31,12 @@ export async function POST(request: NextRequest) {
   if (!request.body) return NextResponse.json({ error: "请选择文件" }, { status: 400 });
   let name = "file";
   try { name = decodeURIComponent(request.headers.get("x-file-name") || "file"); } catch { /* keep fallback */ }
-  name = sanitizeFileName(name);
   const contentLength = Number(request.headers.get("content-length") || 0);
-  try { await assertCloudCapacity(Number.isFinite(contentLength) ? contentLength : 0); } catch (error) {
-    return NextResponse.json({ error: (error as Error).message }, { status: error instanceof CloudCapacityError ? 507 : 500 });
-  }
-  await ensureCloudFolders();
-  const parent = resolveCloudPath(request.nextUrl.searchParams.get("path") || "");
-  const taskAttachment = parent.normalized === "tasks" || parent.normalized.startsWith("tasks/");
-  if (taskAttachment && contentLength > 20 * 1024 * 1024) return NextResponse.json({ error: "单个附件不能超过20 MB" }, { status: 413 });
-  await mkdir(parent.resolved, { recursive: true, mode: 0o700 });
-  const temporaryPath = path.join(parent.resolved, `.${crypto.randomUUID()}.upload`);
-  const handle = await open(temporaryPath, "wx", 0o600);
-  let size = 0;
   try {
-    const reader = request.body.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (!value?.byteLength) continue;
-      size += value.byteLength;
-      if (taskAttachment && size > 20 * 1024 * 1024) throw new Error("TASK_ATTACHMENT_TOO_LARGE");
-      await assertCloudCapacity(size);
-      await handle.write(value);
-    }
-    await handle.close();
-    const destination = await availableDestination(parent.resolved, name);
-    await rename(temporaryPath, destination);
-    const relative = parent.normalized ? `${parent.normalized}/${path.basename(destination)}` : path.basename(destination);
-    return NextResponse.json({ item: { name: path.basename(destination), path: relative, kind: "file", size } }, { status: 201 });
+    const item = await saveCloudUpload(request.body, request.nextUrl.searchParams.get("path") || "", name,
+      Number.isSafeInteger(contentLength) && contentLength >= 0 ? contentLength : 0);
+    return NextResponse.json({ item }, { status: 201 });
   } catch (error) {
-    await handle.close().catch(() => undefined);
-    await rm(temporaryPath, { force: true }).catch(() => undefined);
     const tooLarge = (error as Error).message === "TASK_ATTACHMENT_TOO_LARGE";
     return NextResponse.json({ error: tooLarge ? "单个附件不能超过20 MB" : error instanceof CloudCapacityError ? error.message : "上传失败，请重试" }, { status: tooLarge ? 413 : error instanceof CloudCapacityError ? 507 : 500 });
   }

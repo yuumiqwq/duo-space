@@ -1,6 +1,7 @@
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { fileStoreQueue } from '../store-queue.ts';
 
 export type StoredAttachment = {
   id: string;
@@ -31,7 +32,7 @@ type ChatStore = { version: 1; messages: StoredMessage[] };
 const dataDirectory = process.env.DATA_DIR
   || (process.env.NODE_ENV === "production" ? "/data" : path.join(process.cwd(), ".data"));
 const storePath = path.join(dataDirectory, "chat-messages.json");
-let mutationQueue: Promise<void> = Promise.resolve();
+const mutationQueue = fileStoreQueue(storePath);
 
 async function readStore(): Promise<ChatStore> {
   try {
@@ -66,21 +67,12 @@ async function writeStore(store: ChatStore) {
 }
 
 async function mutate<T>(operation: (store: ChatStore) => Promise<T> | T): Promise<T> {
-  let resolveResult!: (value: T) => void;
-  let rejectResult!: (reason?: unknown) => void;
-  const result = new Promise<T>((resolve, reject) => { resolveResult = resolve; rejectResult = reject; });
-  mutationQueue = mutationQueue.then(async () => {
-    try {
-      const store = await readStore();
-      const value = await operation(store);
-      await writeStore(store);
-      resolveResult(value);
-    } catch (error) {
-      rejectResult(error);
-    }
+  return mutationQueue.run(async () => {
+    const store = await readStore();
+    const value = await operation(store);
+    await writeStore(store);
+    return value;
   });
-  await mutationQueue.catch(() => undefined);
-  return result;
 }
 
 export async function saveMessage(message: StoredMessage, onCreated?: () => void): Promise<StoredMessage> {
@@ -110,7 +102,7 @@ export async function recallMessage(id: string, identityId: string): Promise<boo
 }
 
 export async function listMessageChanges(since: number, limit: number) {
-  await mutationQueue;
+  await mutationQueue.settled();
   const store = await readStore();
   const changes = store.messages
     .filter((message) => message.createdAt > since || (message.recalledAt || 0) > since)
@@ -132,7 +124,7 @@ export async function listMessageChanges(since: number, limit: number) {
 }
 
 export async function listMessages(before: number | null, limit: number) {
-  await mutationQueue;
+  await mutationQueue.settled();
   const store = await readStore();
   const visible = store.messages
     .filter((message) => !message.recalled && (before === null || message.createdAt < before))
@@ -140,11 +132,17 @@ export async function listMessages(before: number | null, limit: number) {
   const start = Math.max(0, visible.length - limit);
   const boundaryTime = visible[start]?.createdAt || 0;
   const messages = visible.filter((message) => message.createdAt >= boundaryTime);
-  return { messages, nextCursor: start > 0 && messages[0] ? String(messages[0].createdAt) : null };
+  const cursor = store.messages.reduce((latest, message) => Math.max(latest, message.createdAt, message.recalledAt || 0), 0);
+  return { messages, nextCursor: start > 0 && messages[0] ? String(messages[0].createdAt) : null, cursor };
 }
 
 export async function sentAudioAttachment(id: string): Promise<StoredAttachment | null> {
-  await mutationQueue;
+  await mutationQueue.settled();
   const store = await readStore();
   return store.messages.find(message => !message.recalled && message.attachment?.id === id && message.attachment.kind === "audio")?.attachment || null;
+}
+
+export async function findMessage(id: string, identityId: string): Promise<StoredMessage | null> {
+  await mutationQueue.settled();
+  return (await readStore()).messages.find(message => message.id === id && message.identityId === identityId) || null;
 }

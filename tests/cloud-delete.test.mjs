@@ -22,7 +22,10 @@ test('cloud deletion removes files and nested folders but protects source attach
   await deleteCloudItem('chat');
   assert.equal((await listCloudFolder('')).items.some(item => item.name === 'chat'), false);
   await deleteCloudItem('test');
-  for (const invalid of ['', '/', '../source.bin', 'chat/../source.bin', 'chat//x', 'C:/test', 'chat\\x', '.hidden']) await assert.rejects(deleteCloudItem(invalid), /INVALID_PATH/);
+  await writeFile(path.join(cloudRoot, '.hidden'), 'visible');
+  assert.equal((await listCloudFolder('')).items.some(item => item.name === '.hidden'), true);
+  await deleteCloudItem('.hidden');
+  for (const invalid of ['', '/', '../source.bin', 'chat/../source.bin', 'chat//x', 'C:/test', 'chat\\x']) await assert.rejects(deleteCloudItem(invalid), /INVALID_PATH/);
   const outside = path.join(process.env.DATA_DIR, 'outside');
   await mkdir(outside); await writeFile(path.join(outside, 'keep.txt'), 'safe');
   await symlink(outside, path.join(cloudRoot, 'escape'), 'junction');

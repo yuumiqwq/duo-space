@@ -5,7 +5,7 @@ import { attachVideoPlayback } from '../app/video-playback.ts';
 import { readFile } from 'node:fs/promises';
 import { runInNewContext } from 'node:vm';
 
-test('foreground reconciliation never requests a forced screen reconnect', async () => {
+test('foreground reconciliation preserves every source and never requests a forced reconnect', async () => {
   const page = await readFile('app/page.tsx', 'utf8');
   const start = page.indexOf('    const resumeMedia = () => {');
   const end = page.indexOf('    const handleVisibilityChange', start);
@@ -16,12 +16,15 @@ test('foreground reconciliation never requests a forced screen reconnect', async
     mediaRecovery: { request: source => repairs.push(source) },
     connections: new Map([['peer', { open: true, peer: 'peer', send: message => messages.push(message) }]]),
     screenStreamRef: { current: stream },
+    cameraStreamRef: { current: stream },
+    microphoneStreamRef: { current: stream },
     callPeer: (...args) => calls.push(args),
   });
-  assert.deepEqual(repairs, ['camera']);
-  assert.ok(messages.some(message => message.source === 'screen' && !message.repair));
-  assert.ok(!messages.some(message => message.source === 'screen' && message.repair));
-  assert.deepEqual(calls, [['peer', stream, 'screen']]);
+  assert.deepEqual(repairs, []);
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].type, 'media-request');
+  assert.ok(!messages[0].repair);
+  assert.deepEqual(calls, [['peer', stream, 'screen'], ['peer', stream, 'camera'], ['peer', stream, 'microphone']]);
 });
 
 function setup(t) {
@@ -68,7 +71,7 @@ test('returning to background or leaving the room cancels pending repairs', t =>
   t.mock.timers.tick(500);
   assert.equal(s.repairs(), 0);
 });
-test('focus return reattaches a frozen decoder even when paused is false; PiP stays attached', t => {
+test('camera focus preserves rendered video; empty playback can reattach and PiP stays attached', t => {
   const s = setup(t);
   class Video extends EventTarget {
     paused = false; readyState = 4; calls = 0; detaches = 0;
@@ -82,6 +85,9 @@ test('focus return reattaches a frozen decoder even when paused is false; PiP st
   const video = new Video();
   const playback = attachVideoPlayback(video, stream, { document: s.doc, window: s.win, blocked: () => {} });
   const before = video.detaches;
+  s.win.dispatchEvent(new Event('focus')); t.mock.timers.tick(250);
+  assert.equal(video.detaches, before);
+  video.readyState = 0;
   s.win.dispatchEvent(new Event('focus')); t.mock.timers.tick(250);
   assert.equal(video.detaches, before + 1);
   s.doc.pictureInPictureElement = video;

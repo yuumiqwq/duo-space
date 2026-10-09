@@ -106,7 +106,7 @@
   min-height: 0; flex: 1; gap: 5px; padding: 14px 6px 14px 0;
   /* Size the rule itself so fractional zoom cannot skip a narrow gradient stop. */
   background-image: linear-gradient(#b74c5066, #b74c5066), repeating-linear-gradient(transparent 0 33px, #a99c7526 33px 34px);
-  background-size: 1px 100%, auto;
+  background-size: 1px 100%, 100% 34px;
   /* Percentage background positions exclude the image width; restore its quarter pixel. */
   background-position: calc(25% + .25px) 0, 0 0;
   background-repeat: no-repeat, repeat;

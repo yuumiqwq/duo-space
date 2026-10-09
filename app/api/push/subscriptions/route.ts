@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { currentIdentityId } from "../../identity/session";
-import { removePushSubscription, savePushSubscription } from "../store";
+import { RejectedPushSubscriptionError, removePushSubscription, savePushSubscription } from "../store";
 import { isSamePushOrigin } from "../origin";
 
 function validEndpoint(value: unknown): value is string {
@@ -25,14 +25,17 @@ export async function POST(request: NextRequest) {
     || !deviceId) {
     return NextResponse.json({ error: "推送订阅无效" }, { status: 400 });
   }
-  await savePushSubscription({
+  try { await savePushSubscription({
     endpoint: subscription.endpoint,
     expirationTime: subscription.expirationTime ?? null,
     keys: { p256dh: subscription.keys.p256dh, auth: subscription.keys.auth },
     identityId,
     deviceId,
     updatedAt: Date.now(),
-  });
+  }); } catch (error) {
+    if (error instanceof RejectedPushSubscriptionError) return NextResponse.json({ error: "推送订阅无效" }, { status: 410, headers: { "Cache-Control": "no-store" } });
+    throw error;
+  }
   return NextResponse.json({ enabled: true });
 }
 

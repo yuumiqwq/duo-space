@@ -12,6 +12,8 @@ import { EXECUTION_LIMIT, executionEligible, executionReserved, isExecuting } fr
 import { descriptionAttachments } from "../../../task-description-attachments.ts";
 import { allDaySelection } from '../../../task-date-input.ts';
 import { comparableSettings, mergeTaskSettings, type SettingsIntent } from '../../../task-settings-merge.ts';
+import { attachmentReferences, withAttachmentLock } from './attachment-coordination.ts';
+import { sameWorkflowOccurrence } from '../../../workflow-task-match.ts';
 
 export type RemoteTask = Partial<TaskFields> & { id: string; projectId: string; status?: number; parentId?: string; [key: string]: unknown };
 export type Gateway = {
@@ -22,6 +24,7 @@ export type Gateway = {
   locate?(owner: string, id: string, projectId?: string, completedAfter?: number): Promise<RemoteTask | null>;
   notify?(notice: TaskNotice): Promise<void>;
   taskAttachments?: { publish(actor: string, before: string, after: string): Promise<void>; remove(files: string[]): Promise<void> };
+  cleanupWorkflowFiles?(): Promise<unknown>;
   create(owner: string, id: string, fields: TaskFields, receipt?: (actualId: string) => Promise<void>, prepared?: { projectId: string; tasks: RemoteTask[] }): Promise<RemoteTask | void>;
   update(owner: string, id: string, fields: TaskFields, version: string, projectId?: string, before?: RemoteTask): Promise<RemoteTask | void>;
   // A missing project/task route is distinct from a positive DELETE response.
@@ -178,17 +181,16 @@ function mergedSettings(intent: SettingsIntent, current: TaskFields, message = '
 
 export class CollaborationStore {
   private queues = new Map<string, Promise<unknown>>();
-  private writes: Promise<unknown> = Promise.resolve();
   private baselines = new WeakMap<State, State>();
   private maintenance?: Promise<void>;
   private maintenanceAfter = 0;
   private pendingMaintenanceAfter = 0;
   private file: string;
   private gateway: Gateway;
-  constructor(directory: string, gateway: Gateway) { this.file = path.join(directory, "room-collaboration.json"); this.gateway = gateway; }
+  constructor(directory: string, gateway: Gateway) { this.file = path.join(/* turbopackIgnore: true */ directory, "room-collaboration.json"); this.gateway = gateway; }
   private async read(): Promise<State> {
     try {
-      const state = JSON.parse(await readFile(this.file, "utf8"));
+      const state = JSON.parse(await readFile(/* turbopackIgnore: true */ this.file, "utf8"));
       if (state.version !== 1 || !state.buffer || !state.operations) throw new Error("协作记录格式异常");
       state.workflows ||= {};
       // An accepted whole-task deletion removes the public card immediately,
@@ -216,11 +218,28 @@ export class CollaborationStore {
     this.baselines.set(state, structuredClone(state)); return state;
   }
   private write(state: State) {
-    const commit = this.writes.then(async () => {
+    return withAttachmentLock(path.dirname(this.file), async () => {
       const before = this.baselines.get(state);
       if (!before) throw new CollaborationError('流程已更新，请刷新后操作');
       const latest = await this.read();
       const merged = mergeStateChanges(before, state, latest);
+      const existingFiles = attachmentReferences(latest).workflowFiles;
+      const nextFiles = attachmentReferences(merged).workflowFiles;
+      for (const id of nextFiles) if (!existingFiles.has(id)) {
+        // A draft may expire while a command reads its metadata. Validate its
+        // continued existence in the same boundary that persists the reference.
+        await readFile(/* turbopackIgnore: true */ path.join(/* turbopackIgnore: true */ path.dirname(this.file), 'workflow-files', `${id}.json`)).catch(() => { throw new CollaborationError('附件不存在，请重新上传', 400); });
+      }
+      for (const id of existingFiles) if (!nextFiles.has(id)) {
+        // Even a superseded durable approval decision has submitted materials.
+        // Retain them before retiring its last reference from the active state.
+        const location = path.join(/* turbopackIgnore: true */ path.dirname(this.file), 'workflow-files', `${id}.json`);
+        const contents = await readFile(/* turbopackIgnore: true */ location, 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+        if (!contents) continue;
+        const metadata = JSON.parse(contents), temporary = location + '.' + randomUUID() + '.tmp';
+        try { await writeFile(temporary, JSON.stringify({ ...metadata, retained: true }), { mode: 0o600 }); await rename(temporary, location); }
+        finally { await unlink(temporary).catch(() => undefined); }
+      }
       merged.revision = latest.revision + Math.max(0, state.revision - before.revision);
       for (const workflow of Object.values(merged.workflows)) {
         const message = workflow.syncError || workflow.error;
@@ -265,7 +284,6 @@ export class CollaborationStore {
       }
       this.baselines.set(state, structuredClone(state));
     });
-    this.writes = commit.catch(() => undefined); return commit;
   }
   // Serialize only commands for the same task/workflow. The short file commit
   // merges disjoint changes; external requests never own that commit queue.
@@ -288,26 +306,28 @@ export class CollaborationStore {
       // Persist accepted task contents before removing files, so interruption
       // leaves a resumable cleanup receipt rather than an old broken task.
       await this.checkpoint(state, op);
-      await this.cleanAttachments(state, op.attachments);
+      await this.cleanAttachments(op.attachments);
     }
     if (op.to === null && state.buffer[op.targetId]?.stagedBy === op.id) delete state.buffer[op.targetId].stagedBy;
     op.status = "done"; op.error = ""; await this.checkpoint(state, op);
   }
   private publicOperation(op: Operation): OperationView { const { id, actorId, title, action, from, to, status, error, createdAt, updatedAt } = op; return { id, actorId, title, action, from, to, status, error, ...(createdAt === undefined ? {} : { createdAt }), updatedAt }; }
-  private async cleanAttachments(state: State, change: AttachmentChange) {
+  private async cleanAttachments(change: AttachmentChange) {
     if (!this.gateway.taskAttachments) return;
     const paths = (content: string) => descriptionAttachments(content).attachments.map(file => file.path);
     const remaining = new Set(paths(change.after));
     const removed = [...new Set(paths(change.before))].filter(file => !remaining.has(file));
     if (!removed.length) return;
-    for (const task of Object.values(state.buffer)) paths(task.fields.content).forEach(file => remaining.add(file));
-    for (const workflow of Object.values(state.workflows).filter(item => item.status !== 'done')) paths((workflow.edit?.fields || workflow.fields).content).forEach(file => remaining.add(file));
-    for (const op of Object.values(state.operations).filter(item => item.status === 'pending')) paths(op.fields.content).forEach(file => remaining.add(file));
     // Shared links remain valid while another current task still uses the file.
     for (const member of (await this.gateway.members()).filter(item => item.connected)) {
       for (const task of (await this.gateway.inbox(member.id)).tasks.filter(item => !item.status)) paths(task.content || '').forEach(file => remaining.add(file));
     }
-    await this.gateway.taskAttachments.remove(removed.filter(file => !remaining.has(file)));
+    await withAttachmentLock(path.dirname(this.file), async () => {
+      // Inbox queries can take arbitrarily long. Recheck durable references
+      // afterwards, while new registrations and publication cannot interleave.
+      for (const file of attachmentReferences(await this.read()).descriptions) remaining.add(file);
+      await this.gateway.taskAttachments!.remove(removed.filter(file => !remaining.has(file)));
+    });
   }
   private async candidates(state: State, op: Operation) {
     if (!op.to) return [];
@@ -366,7 +386,7 @@ export class CollaborationStore {
     const work = (async () => {
       // Already accepted user actions must not sit behind unrelated slow checks.
       const stages = [() => this.recoverPendingWorkflows(), () => this.reconcilePendingUpdates(),
-        ...(!pendingOnly ? [() => this.checkDeletedWorkflows(), () => this.checkWorkflows()] : []), () => this.deliverNotices()];
+        ...(!pendingOnly ? [() => this.checkDeletedWorkflows(), () => this.checkWorkflows()] : []), () => this.deliverNotices(), () => this.gateway.cleanupWorkflowFiles?.()];
       for (const stage of stages) {
         try { await stage(); } catch { console.error('task-maintenance: stage failed'); }
       }
@@ -923,13 +943,12 @@ export class CollaborationStore {
   }
   private async syncWorkflowIntent(state: State, workflow: Workflow, attempt: SyncAttempt) {
     const edit = workflow.edit!, intent = edit.intent!;
-    const tasks: Partial<Record<WorkflowSide, RemoteTask | null>> = {};
     let desired = intent.desired;
     // Reconcile all copies before writing any, so an unrelated edit on either
     // side is retained and competing edits to the same setting are not guessed.
     for (const target of edit.targets!) {
       const side = target.owner === workflow.claimantId && target.id === workflow.targetId ? 'target' : 'source';
-      const task = tasks[side] = await this.linkedTask(state, workflow, side);
+      const task = await this.linkedTask(state, workflow, side);
       if (!task && side === 'source' && !workflow.source.ownerId) continue;
       if (!task) throw new CollaborationError('该任务已被删除');
       if (!target.baseline || (task.status || 0) !== target.baseline.status || (task.parentId || '') !== target.baseline.parentId) throw new CollaborationError('关联任务在同步期间被修改，已暂停覆盖，请核对后重试');
@@ -943,24 +962,30 @@ export class CollaborationStore {
     await this.saveWorkflow(state, workflow);
     for (const target of edit.targets!) {
       const side = target.owner === workflow.claimantId && target.id === workflow.targetId ? 'target' : 'source';
-      const task = tasks[side];
-      if (!task) continue;
+      const task = await this.linkedTask(state, workflow, side);
+      if (!task && side === 'source' && !workflow.source.ownerId) continue;
+      if (!task) throw new CollaborationError('该任务已被删除');
+      if (!target.baseline || (task.status || 0) !== target.baseline.status || (task.parentId || '') !== target.baseline.parentId) throw new CollaborationError('关联任务在同步期间被修改，已暂停覆盖，请核对后重试');
+      // The previous side may have taken long enough for this copy to change.
+      // Re-merge against its current fields, keeping same-group conflicts paused.
+      desired = mergedSettings({ base: intent.base, desired }, mergedSettings(target.intent || intent, taskFields(task)));
+      edit.fields = desired;
+      if (edit.attachments) edit.attachments.after = desired.content;
+      attempt.target = { owner: target.owner, id: target.id, expectedVersion: target.before, observedVersion: remoteVersion(task), differences: fieldDifferences(task, desired), current: taskSyncEvidence(task) };
       if (!sameFields(task, desired)) {
         attempt.stage = 'write-linked-task'; target.before = remoteVersion(task);
         await this.saveWorkflow(state, workflow);
-        tasks[side] = await this.gateway.update(target.owner, target.id, desired, target.before, workflow.projects?.[side], task) || await this.linkedTask(state, workflow, side);
+        const saved = await this.gateway.update(target.owner, target.id, desired, target.before, workflow.projects?.[side], task) || await this.linkedTask(state, workflow, side);
+        if (saved) desired = mergedSettings({ base: intent.base, desired }, taskFields(saved));
       }
       target.done = true;
       await this.saveWorkflow(state, workflow);
     }
-    const target = tasks.target || await this.linkedTask(state, workflow, 'target');
-    if (!target) throw new CollaborationError('该任务已被删除');
     // The provider can retain a concurrent change to an untouched field during
     // its bounded retry. A following pass propagates it to other linked copies.
-    edit.fields = taskFields(target);
+    edit.fields = desired;
     if (mergeTaskSettings(intent.base, intent.desired, edit.fields).conflicts.length || !sameFields(mergedSettings(intent, edit.fields), edit.fields)) throw new CollaborationError('关联任务详情暂未一致，请核对后重试');
     if (edit.attachments) edit.attachments.after = edit.fields.content;
-    return { ...tasks, target };
   }
   private async finishWorkflowEdit(state: State, workflow: Workflow, completing = false) {
     const edit = workflow.edit!;
@@ -977,22 +1002,19 @@ export class CollaborationStore {
           await this.saveWorkflow(state, workflow); return this.publicWorkflow(workflow);
         }
       }
-      const confirmed: Partial<Record<WorkflowSide, RemoteTask | null>> = {};
       if (!edit.targets) {
         const sides = await this.workflowSides(state, workflow);
-        Object.assign(confirmed, sides);
         const target = (owner: string, task: RemoteTask) => ({ owner, id: task.id, before: remoteVersion(task), baseline: { fields: taskFields(task), status: task.status || 0, parentId: task.parentId || '' },
           ...(edit.rebaseTargets && edit.intent ? { intent: { base: taskFields(task), desired: mergeTaskSettings(edit.intent.base, edit.intent.desired, taskFields(task)).fields } } : {}), done: false });
         edit.targets = sides.source ? [target(workflow.reviewerId, sides.source)] : [];
         if (workflow.claimantId !== workflow.reviewerId || workflow.targetId !== edit.targets[0]?.id) edit.targets.push(target(workflow.claimantId, sides.target));
         await this.saveWorkflow(state, workflow);
       }
-      let wrote = false;
-      if (edit.intent) Object.assign(confirmed, await this.syncWorkflowIntent(state, workflow, attempt));
+      if (edit.intent) await this.syncWorkflowIntent(state, workflow, attempt);
       else for (const target of edit.targets) {
         if (target.done) continue;
         const side = target.owner === workflow.reviewerId ? "source" : "target";
-        const task = !wrote && confirmed[side] || await this.linkedTask(state, workflow, side);
+        const task = await this.linkedTask(state, workflow, side);
         if (!task && side === "source") { target.done = true; await this.saveWorkflow(state, workflow); continue; }
         if (!task) { await this.markMissingWorkflowTask(state, workflow); throw new CollaborationError("该任务已被删除"); }
         attempt.stage = 'compare-version';
@@ -1006,17 +1028,14 @@ export class CollaborationStore {
           }
           attempt.stage = 'write-linked-task';
           await this.saveWorkflow(state, workflow);
-          confirmed[side] = await this.gateway.update(target.owner, target.id, edit.fields, target.before, workflow.projects?.[side], task) || await this.linkedTask(state, workflow, side);
-          wrote = true;
+          await this.gateway.update(target.owner, target.id, edit.fields, target.before, workflow.projects?.[side], task);
         }
-        confirmed[side] ||= task;
-        if (workflow.claimantId === workflow.reviewerId && workflow.targetId === target.id) confirmed.target = confirmed[side];
         target.done = true; await this.saveWorkflow(state, workflow);
       }
       attempt.stage = 'verify-linked-tasks';
       const sides = {
-        source: confirmed.source === undefined ? await this.linkedTask(state, workflow, 'source') : confirmed.source,
-        target: confirmed.target || await this.linkedTask(state, workflow, 'target'),
+        source: await this.linkedTask(state, workflow, 'source'),
+        target: await this.linkedTask(state, workflow, 'target'),
       };
       if (!sides.target) throw new CollaborationError('该任务已被删除');
       if ((sides.source && !sameFields(sides.source, edit.fields)) || !sameFields(sides.target, edit.fields)) throw new CollaborationError("关联任务详情暂未一致，请核对后重试");
@@ -1036,7 +1055,7 @@ export class CollaborationStore {
       // but preserve acknowledged/sent completion markers, including repeating tasks.
       if (workflow.status === "approving") workflow.submitted = { source: sides.source ? remoteVersion(sides.source) : "", target: remoteVersion(sides.target) };
       attempt.stage = 'clean-attachments';
-      if (edit.attachments) { await this.saveWorkflow(state, workflow); await this.cleanAttachments(state, edit.attachments); }
+      if (edit.attachments) { await this.saveWorkflow(state, workflow); await this.cleanAttachments(edit.attachments); }
       delete workflow.edit; workflow.error = "";
     } catch (error) {
       workflow.error = error instanceof Error ? error.message : "任务详情尚未同步完成，请重试";
@@ -1121,7 +1140,7 @@ export class CollaborationStore {
         result.projectId = task.projectId; result.current = taskSyncEvidence(task);
         // Preserve subsequent recurring occurrences even though the website
         // archive is final. Failure on one account does not skip the other.
-        if (workflow.fields.repeatFlag && (taskFields(task).startDate !== workflow.fields.startDate || taskFields(task).dueDate !== workflow.fields.dueDate)) { result.outcome = 'later-occurrence'; continue; }
+        if (!sameWorkflowOccurrence(workflow.fields, task)) { result.outcome = 'later-occurrence'; continue; }
         if (!remove) { result.outcome = 'present'; continue; }
         stage = 'delete';
         if (await this.gateway.remove(owner, task.id, task.projectId) === 'missing') { result.outcome = 'delete-failed'; result.error = '删除接口返回 404，未收到删除成功确认'; }
@@ -1302,7 +1321,7 @@ export class CollaborationStore {
       const files: WorkflowFile[] = [];
       for (const id of [...new Set(command.attachments || [])]) {
         if (typeof id !== "string" || !/^[a-f0-9-]{36}$/i.test(id)) throw new CollaborationError("附件无效", 400);
-        const metadata = JSON.parse(await readFile(path.join(path.dirname(this.file), "workflow-files", `${id}.json`), "utf8").catch(() => { throw new CollaborationError("附件不存在，请重新上传", 400); }));
+        const metadata = JSON.parse(await readFile(/* turbopackIgnore: true */ path.join(/* turbopackIgnore: true */ path.dirname(this.file), "workflow-files", `${id}.json`), "utf8").catch(() => { throw new CollaborationError("附件不存在，请重新上传", 400); }));
         if (metadata.workflowId !== workflow.id || metadata.actorId !== actor) throw new CollaborationError("附件不属于此流程或当前账号", 403);
         files.push({ id, name: metadata.name, size: metadata.size, url: `/api/room/tasks/files/${id}` });
       }

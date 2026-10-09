@@ -34,6 +34,7 @@ export async function checkPushSubscription(
       body: JSON.stringify({ subscription: subscription.toJSON(), deviceId }), signal,
     });
     signal.throwIfAborted();
+    if (response.status === 410 && !response.redirected) return "renewal";
     return response.ok && !response.redirected ? "enabled" : "unknown";
   } catch {
     signal.throwIfAborted();

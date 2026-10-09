@@ -1,4 +1,5 @@
 import type { ClaimWorkflow, CollaborationSnapshot } from './collaboration-types';
+import { workflowMatchesTask } from './workflow-task-match.ts';
 
 export function removeSnapshotTask(snapshot: CollaborationSnapshot, ownerId: string | null, taskId: string): CollaborationSnapshot {
   return ownerId === null
@@ -13,10 +14,10 @@ export function applyWorkflowUpdate(snapshot: CollaborationSnapshot, workflow: C
     next = { ...next, buffer: next.buffer.filter(task => task.workflowId !== workflow.id) };
   }
   if (workflow.status !== 'deleted') return next;
-  next = removeSnapshotTask(next, workflow.source.ownerId, workflow.source.taskId);
-  next = removeSnapshotTask(next, workflow.claimantId, workflow.targetId);
-  if (workflow.reviewerTaskId) next = removeSnapshotTask(next, workflow.reviewerId, workflow.reviewerTaskId);
-  return { ...next, buffer: next.buffer.filter(task => task.workflowId !== workflow.id) };
+  return { ...next,
+    buffer: next.buffer.filter(task => !workflowMatchesTask(workflow, null, task) && task.workflowId !== workflow.id),
+    members: next.members.map(member => ({ ...member, tasks: member.tasks.filter(task => !workflowMatchesTask(workflow, member.id, task)) })),
+  };
 }
 
 export function withoutDeletedWorkflowTasks(snapshot: CollaborationSnapshot): CollaborationSnapshot {

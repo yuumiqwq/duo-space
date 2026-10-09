@@ -15,7 +15,10 @@ export function NewMemberTasks({ identityId, onChanged }: { identityId: string; 
   const closingRef = useRef(false);
   const seenIdsRef = useRef("");
   const loadVersion = useRef(0);
+  const loading = useRef(false);
   const load = useCallback(async () => {
+    if (loading.current) return;
+    loading.current = true;
     const version = ++loadVersion.current;
     try {
       const response = await fetch("/api/ticktick/shared", { cache: "no-store", signal: AbortSignal.timeout(10_000) });
@@ -26,6 +29,7 @@ export function NewMemberTasks({ identityId, onChanged }: { identityId: string; 
       const ids = data.tasks.map((task: NewTask) => task.id).sort().join(",");
       if (ids !== seenIdsRef.current) { seenIdsRef.current = ids; void onChanged(); }
     } catch { /* Poll again on focus or the next interval. */ }
+    finally { loading.current = false; }
   }, [onChanged]);
   useEffect(() => {
     if (!identityId) return;

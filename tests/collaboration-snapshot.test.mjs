@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {applyWorkflowUpdate,removeSnapshotTask,withoutDeletedWorkflowTasks} from '../app/collaboration-snapshot.ts';
+import { mergeCollaborationSnapshot } from '../app/collaboration-loading.ts';
 test('confirmed deletion immediately removes only related cards and preserves archived history',()=>{
   const workflow={id:'w',status:'working',source:{ownerId:null,taskId:'public'},claimantId:'bob',reviewerId:'alice',targetId:'target',reviewerTaskId:'reviewer',events:[{id:'history'}]};
   const snapshot={buffer:[{id:'public',workflowId:'w'},{id:'other'}],members:[{id:'alice',tasks:[{id:'reviewer'},{id:'other'}]},{id:'bob',tasks:[{id:'target'},{id:'other'}]}],workflows:[workflow]};
@@ -28,4 +29,28 @@ test('accepted whole-task deletion hides public cards while retaining unconfirme
     const legacy = { ...pending, events: [...workflow.events, { id: 'deletion', type }] };
     assert.deepEqual(withoutDeletedWorkflowTasks({ ...snapshot, workflows: [legacy] }).buffer, snapshot.buffer);
   }
+});
+
+test('deleted recurring archives hide only their own occurrence across full, partial and command snapshots', () => {
+  const fields = { repeatFlag: 'RRULE:FREQ=DAILY', startDate: '2026-10-08T00:00:00+08:00', dueDate: '2026-10-08T00:00:00+08:00' };
+  const workflow = { id: 'archive', status: 'deleted', fields, source: { ownerId: 'alice', taskId: 'source' }, claimantId: 'bob', reviewerId: 'alice', targetId: 'target', reviewerTaskId: 'reviewer', events: [{ id: 'materials', files: [{ id: 'submitted' }] }] };
+  const old = (id, ownerId) => ({ ...fields, id, ownerId, startDate: '2026-10-07T16:00:00Z', dueDate: '2026-10-07T16:00:00Z' });
+  const later = (id, ownerId, workflowId) => ({ ...fields, id, ownerId, workflowId, startDate: '2026-10-09T00:00:00+08:00', dueDate: '2026-10-09T00:00:00+08:00' });
+  for (const workflowId of [undefined, 'new-workflow']) {
+    const snapshot = { identityId: 'alice', revision: 5, buffer: [], workflows: [workflow], members: [
+      { id: 'alice', connected: true, tasks: [later('source', 'alice', workflowId), old('reviewer', 'alice')] },
+      { id: 'bob', connected: true, tasks: [later('target', 'bob', workflowId)] },
+    ] };
+    const check = result => {
+      assert.deepEqual(result.members.map(member => member.tasks.map(task => task.id)), [['source'], ['target']]);
+      assert.deepEqual(result.workflows[0].events, workflow.events);
+    };
+    check(withoutDeletedWorkflowTasks(snapshot));
+    check(mergeCollaborationSnapshot(null, snapshot));
+    check(mergeCollaborationSnapshot(snapshot, { ...snapshot, members: [snapshot.members[0]] }, 'alice'));
+    check(applyWorkflowUpdate({ ...snapshot, workflows: [] }, workflow));
+  }
+  const differentAssociation = { identityId: 'alice', revision: 6, buffer: [], workflows: [workflow], members: [{ id: 'alice', tasks: [{ ...old('source', 'alice'), workflowId: 'new-workflow' }] }] };
+  assert.equal(withoutDeletedWorkflowTasks(differentAssociation).members[0].tasks.length, 1, 'another explicit workflow association wins over the archived ID');
+  assert.equal(withoutDeletedWorkflowTasks({ ...differentAssociation, members: [{ id: 'alice', tasks: [old('source', 'alice')] }] }).members[0].tasks.length, 0, 'an old response still cannot restore the deleted occurrence');
 });

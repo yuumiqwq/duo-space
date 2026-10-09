@@ -57,3 +57,10 @@ test('cancelled checks cannot publish a misleading disabled or enabled result', 
   const request = async () => { controller.abort(); throw controller.signal.reason; };
   await assert.rejects(checkPushSubscription(registration, 'device', controller.signal, request), { name: 'AbortError' });
 });
+
+test('a known provider-rejected endpoint requires explicit renewal without changing the local subscription', async () => {
+  const { registration, signal } = fixture();
+  const request = async url => url.endsWith('public-key') ? Response.json({ publicKey: key }) : Response.json({ error: '推送订阅无效' }, { status: 410 });
+  assert.equal(await checkPushSubscription(registration, 'device', signal, request), 'renewal');
+  assert.ok(await registration.pushManager.getSubscription(), 'checking must preserve the local subscription for explicit user repair');
+});

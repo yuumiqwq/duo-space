@@ -19,12 +19,12 @@ export function attachVideoPlayback(video: HTMLVideoElement, stream: MediaStream
     }
     const request = ++attempt;
     void video.play().then(() => {
-      if (!disposed && request === attempt) options.blocked(false);
+      if (!disposed && request === attempt) options.blocked(video.paused);
     }, error => {
-      if (!disposed && request === attempt && error?.name !== 'AbortError') options.blocked(true);
+      if (!disposed && request === attempt && (error?.name !== 'AbortError' || video.paused)) options.blocked(true);
     });
   };
-  const recover = () => resume(!options.screen || video.readyState < 2);
+  const recover = () => resume(video.readyState < 2);
   const unmute = recover;
   const syncTracks = () => {
     for (const track of tracks) track.removeEventListener('unmute', unmute);
@@ -36,6 +36,12 @@ export function attachVideoPlayback(video: HTMLVideoElement, stream: MediaStream
     recover();
   };
   const ready = () => { if (video.paused) resume(); };
+  const paused = () => {
+    if (disposed || video.srcObject !== stream || !video.paused) return;
+    options.blocked(true);
+    resume();
+  };
+  const playing = () => { if (!disposed && !video.paused) options.blocked(false); };
   const gesture = () => { if (video.paused || video.readyState < 2) resume(); };
   const stopForeground = onMediaForeground(doc, win, recover);
   // Set Safari's inline/autoplay requirements before assigning the stream.
@@ -45,17 +51,21 @@ export function attachVideoPlayback(video: HTMLVideoElement, stream: MediaStream
   video.srcObject = stream;
   video.addEventListener('loadedmetadata', ready);
   video.addEventListener('canplay', ready);
+  video.addEventListener('pause', paused);
+  video.addEventListener('playing', playing);
   stream.addEventListener('addtrack', syncTracks);
   stream.addEventListener('removetrack', syncTracks);
   doc.addEventListener('pointerup', gesture);
   doc.addEventListener('keydown', gesture);
   syncTracks();
   return {
-    resume: () => resume(true),
+    resume: recover,
     dispose() {
       disposed = true; ++attempt;
       video.removeEventListener('loadedmetadata', ready);
       video.removeEventListener('canplay', ready);
+      video.removeEventListener('pause', paused);
+      video.removeEventListener('playing', playing);
       stream.removeEventListener('addtrack', syncTracks);
       stream.removeEventListener('removetrack', syncTracks);
       stopForeground();

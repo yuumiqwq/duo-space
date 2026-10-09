@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { applyClassroomAction, CLASSROOM_DEVICE_FONT, type ClassroomAction, type ClassroomProfile } from '../../classroom-members.ts';
 
@@ -18,16 +18,29 @@ type IdentityStore = {
 
 const dataDirectory = process.env.DATA_DIR
   || (process.env.NODE_ENV === "production" ? "/data" : path.join(process.cwd(), ".data"));
-const storePath = path.join(dataDirectory, "identities.json");
+const storePath = path.join(/* turbopackIgnore: true */ dataDirectory, "identities.json");
 let writeQueue: Promise<void> = Promise.resolve();
 
 const emptyStore = (): IdentityStore => ({ version: 1, users: {} });
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isCompatibleStore(value: unknown): value is IdentityStore {
+  if (!isRecord(value) || value.version !== 1 || !isRecord(value.users)) return false;
+  if (!Object.values(value.users).every(user => isRecord(user)
+    && ["nickname", "activity", "todoNote", "ticktickToken", "updatedAt"].every(key => user[key] === undefined || typeof user[key] === "string"))) return false;
+  // Historical v1 files may omit timestamps and retain retired classroom fields.
+  return value.classroom === undefined || (isRecord(value.classroom) && Array.isArray(value.classroom.seats)
+    && value.classroom.seats.every(seat => typeof seat === "string"));
+}
+
 async function readStore(): Promise<IdentityStore> {
   try {
-    const parsed = JSON.parse(await readFile(storePath, "utf8")) as Partial<IdentityStore>;
-    if (parsed.version !== 1 || !parsed.users || typeof parsed.users !== "object") return emptyStore();
-    return { version: 1, users: parsed.users, classroom: parsed.classroom };
+    const parsed: unknown = JSON.parse(await readFile(storePath, "utf8"));
+    if (!isCompatibleStore(parsed)) throw new Error("Unsupported identity store format");
+    return parsed;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyStore();
     throw error;
@@ -36,9 +49,11 @@ async function readStore(): Promise<IdentityStore> {
 
 async function writeStore(store: IdentityStore): Promise<void> {
   await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
-  const temporaryPath = `${storePath}.${process.pid}.${Date.now()}.tmp`;
-  await writeFile(temporaryPath, `${JSON.stringify(store, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  await rename(temporaryPath, storePath);
+  const temporaryPath = `${storePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  try {
+    await writeFile(temporaryPath, `${JSON.stringify(store, null, 2)}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    await rename(temporaryPath, storePath);
+  } finally { await rm(temporaryPath, { force: true }).catch(() => undefined); }
 }
 
 export async function getUser(identityId: string): Promise<UserRecord | null> {

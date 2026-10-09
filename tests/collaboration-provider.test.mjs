@@ -27,6 +27,31 @@ async function providerFixture(run) {
   }
 }
 
+test('an explicitly supplied task baseline cannot bypass a fresh provider read or a same-group conflict', async () => {
+  for (const scenario of ['independent', 'conflict', 'completed', 'reparented', 'missing']) await providerFixture(async gateway => {
+    const before = { id: 'fresh-write', projectId: 'saved-list', etag: 'old', ...taskFields({ title: 'task', content: 'old note' }) };
+    let current = { ...before, content: 'new note', etag: 'latest' }, writes = 0, reads = 0;
+    if (scenario === 'conflict') current.priority = 1;
+    if (scenario === 'completed') current.status = 2;
+    if (scenario === 'reparented') current.parentId = 'new-parent';
+    globalThis.fetch = async (url, init) => {
+      const route = new URL(url).pathname.replace('/open/v1', '');
+      if (route === '/project/saved-list/task/fresh-write') { reads++; return scenario === 'missing' ? new Response(null, { status: 404 }) : Response.json(current); }
+      assert.equal(route, '/task/fresh-write');
+      writes++;
+      const payload = JSON.parse(init.body);
+      assert.equal(payload.content, 'new note'); assert.equal(payload.etag, 'latest');
+      current = { ...payload, etag: 'saved' };
+      return Response.json(current);
+    };
+    const action = gateway.update('alice', before.id, taskFields({ ...before, priority: 5 }), remoteVersion(before), before.projectId, before);
+    if (scenario === 'independent') {
+      const saved = await action;
+      assert.equal(saved.content, 'new note'); assert.equal(saved.priority, 5); assert.equal(writes, 1); assert.equal(reads, 2);
+    } else { await assert.rejects(action); assert.equal(writes, 0); assert.equal(reads, 1); }
+  });
+});
+
 test('single-day edits send Dida dates together on the first write and still reject a missing date', async () => {
   await providerFixture(async gateway => {
     let task = { id: 'single-date', projectId: 'saved-list', ...taskFields({ title: '日期核对' }), etag: 'initial' };
@@ -178,13 +203,13 @@ test('write diagnostics distinguish rejected HTTP writes from successful respons
       assert.equal(trace.stage, 'write'); assert.equal(JSON.parse(trace.requestFailure).status, 400);
       assert.equal(trace.readBack, undefined); assert.ok(!error.diagnostic.includes('private')); return true;
     });
-    assert.equal(reads, 0, 'reuse the version-checked snapshot from main');
+    assert.equal(reads, 1, 'a supplied baseline still requires a fresh read immediately before the write');
     fail = false;
     await assert.rejects(gateway.update('alice', task.id, fields, remoteVersion(task), task.projectId, task), error => {
       const trace = JSON.parse(error.diagnostic);
       assert.equal(trace.stage, 'read-back'); assert.equal(trace.response.priority, 5); assert.equal(trace.readBack.priority, 0); return true;
     });
-    assert.equal(writes, 2); assert.equal(reads, 2, 'an inconsistent readback is checked again without repeating the write');
+    assert.equal(writes, 2); assert.equal(reads, 4, 'each attempt reads before writing, and an inconsistent readback is checked again without repeating the write');
   });
 });
 
@@ -214,7 +239,7 @@ test('task updates absorb transient failures and delayed readback without repeat
       if (route === '/task/completed') return Response.json([]);
       if (route === '/project/saved-list/task/recover-update') {
         reads++;
-        return Response.json(scenario === 'delayed-readback' && reads === 1 ? before : task);
+        return Response.json(scenario === 'delayed-readback' && reads === 2 ? before : task);
       }
       throw new Error(`Unexpected request: ${route}`);
     };

@@ -33,6 +33,7 @@ function fixture({ top = 200, height = 1000, clientHeight = 400 } = {}) {
   const response = new Promise(resolve => { respond = resolve; });
   const env = {
     useCallback: fn => fn, messageListRef: ref(list), chatAtBottomRef: ref(height - clientHeight - top <= 1),
+    recalledChatIdsRef: ref(new Set()),
     chatSavedScrollTopRef: ref(top), chatImageViewerOpenRef: ref(false), pendingHistoryScrollRef: ref(null),
     outgoingChatRef: ref(new Map()), identityIdRef: ref('alice'), displayNameRef: ref('Alice'), displayName: 'Alice',
     chatQuote: null, chatDraft: 'new message', chatImage: null, chatHistoryLoading: false, chatHistoryCursor: 'older', sideView: 'chat',

@@ -7,6 +7,7 @@ import { BOARD_COLOR, CHALK_COLORS, CHALK_FONT, createBoardPainter, visibleBoard
 import { BOARD_TEXT_PADDING_X, BOARD_TEXT_PADDING_Y, BOARD_TEXT_LINE_HEIGHT, fitBoardText } from './board-text-layout.mjs';
 import { boardPointerPoints, appendStrokePoints } from './board-pointer.mjs';
 import { strokeContainsPoint } from './board-stroke-path.mjs';
+import { assertBoardCapacity, BOARD_CAPACITY_NOTICE, MAX_BOARD_TEXT_LENGTH } from './board-limits';
 
 export type BoardPoint = { x: number; y: number };
 export type BoardStroke = { id: string; color: string; width: number; points: BoardPoint[]; createdAt: number; revision: string; tool?: "pen" | "erase"; material?: "chalk-v1"; path?: "smooth-v1" };
@@ -34,10 +35,10 @@ export function Whiteboard({ board, fullscreen, onToggleFullscreen, onDelete, on
   fullscreen: boolean;
   onToggleFullscreen: () => Promise<void>;
   onDelete: () => void | Promise<void>;
-  onAddStroke: (stroke: BoardStroke, epoch: string) => void;
+  onAddStroke: (stroke: BoardStroke, epoch: string, publish?: boolean) => boolean | void;
   onDeleteStroke: (strokeId: string, epoch: string) => void;
   onClear: () => void;
-  onUpsertText: (text: BoardText, epoch: string) => void;
+  onUpsertText: (text: BoardText, epoch: string) => boolean | void;
   onDeleteText: (textId: string, epoch: string) => void;
   onSaved: (message: string, error?: boolean) => void;
   onExport?: (blob: Blob) => Promise<void>;
@@ -148,6 +149,12 @@ export function Whiteboard({ board, fullscreen, onToggleFullscreen, onDelete, on
     onDeleteStroke(hit.id, board.epoch);
   };
 
+  const acceptStroke = (stroke: BoardStroke, publish = true) => {
+    try { assertBoardCapacity({ ...board, strokes: [...board.strokes.filter(item => item.id !== stroke.id), stroke] }); }
+    catch { onSaved(BOARD_CAPACITY_NOTICE); return false; }
+    return onAddStroke(stroke, board.epoch, publish) !== false;
+  };
+
   const beginStroke = (event: React.PointerEvent<HTMLCanvasElement>) => {
     if (dismissedPointer.current === event.pointerId) { dismissedPointer.current = null; return; }
     if (event.button !== 0 && event.pointerType === "mouse") return;
@@ -160,8 +167,7 @@ export function Whiteboard({ board, fullscreen, onToggleFullscreen, onDelete, on
       const height = Math.ceil(fontSize * (BOARD_TEXT_LINE_HEIGHT + 2 * BOARD_TEXT_PADDING_Y));
       const text: BoardText = { id: crypto.randomUUID(), text: "", x: Math.min(point.x, BOARD_WIDTH - width), y: Math.min(point.y, BOARD_HEIGHT - height), width, height, color, fontSize, confirmed: false, updatedAt: Date.now(), revision: makeBoardRevision(), material: "chalk-v1", autoWidth: true };
       const ctx = textCanvasRef.current?.getContext('2d');
-      setEditingTextId(text.id);
-      onUpsertText(ctx ? fitBoardText(ctx, text) : text, board.epoch);
+      if (onUpsertText(ctx ? fitBoardText(ctx, text) : text, board.epoch) !== false) setEditingTextId(text.id);
       return;
     }
     activePointerRef.current = event.pointerId;
@@ -169,11 +175,11 @@ export function Whiteboard({ board, fullscreen, onToggleFullscreen, onDelete, on
     erasedDuringGestureRef.current.clear();
     if (tool === "erase-stroke") { eraseWholeStroke(point); return; }
     const stroke: BoardStroke = { id: crypto.randomUUID(), color, width: tool === "erase-area" ? Math.max(24, width * 4) : width, points: [point], createdAt: Date.now(), revision: makeBoardRevision(), material: "chalk-v1", path: "smooth-v1", tool: tool === "erase-area" ? "erase" : "pen" };
+    if (!acceptStroke(stroke)) return;
     draftRef.current = stroke;
     draftEpochRef.current = board.epoch;
     setDraftEpoch(board.epoch);
     setDraft(stroke);
-    onAddStroke(stroke, board.epoch);
     lastStrokeBroadcastRef.current = event.timeStamp;
   };
 
@@ -191,10 +197,11 @@ export function Whiteboard({ board, fullscreen, onToggleFullscreen, onDelete, on
     const points = appendStrokePoints(current.points, samples);
     if (points === current.points) return;
     const next = { ...current, points, revision: makeBoardRevision() };
+    const publish = event.timeStamp - lastStrokeBroadcastRef.current >= 32;
+    if (!acceptStroke(next, publish)) return;
     draftRef.current = next;
     setDraft(next);
-    if (event.timeStamp - lastStrokeBroadcastRef.current >= 32) {
-      onAddStroke(next, board.epoch);
+    if (publish) {
       lastStrokeBroadcastRef.current = event.timeStamp;
     }
   };
@@ -211,7 +218,9 @@ export function Whiteboard({ board, fullscreen, onToggleFullscreen, onDelete, on
       const points = appendStrokePoints(finished.points, boardPointerPoints(event.nativeEvent, event.currentTarget.getBoundingClientRect()), true);
       if (points !== finished.points) finished = { ...finished, points, revision: makeBoardRevision() };
     }
-    if (draftEpochRef.current === board.epoch && !board.deletedStrokeIds.includes(finished.id)) onAddStroke(finished, draftEpochRef.current);
+    if (draftEpochRef.current === board.epoch && !board.deletedStrokeIds.includes(finished.id)) {
+      if (!acceptStroke(finished) && draftRef.current) onAddStroke(draftRef.current, draftEpochRef.current);
+    }
     draftRef.current = null;
     setDraft(null);
   };
@@ -319,7 +328,7 @@ export function Whiteboard({ board, fullscreen, onToggleFullscreen, onDelete, on
                 <button className="board-text-drag" type="button" aria-label="拖动文本框"  onPointerDown={(event) => beginTextDrag(event, text)} onPointerMove={(event) => moveText(event, text)} onPointerUp={finishTextDrag} onPointerCancel={finishTextDrag}><span aria-hidden="true" /></button>
                 <button className="board-text-delete" type="button" aria-label="删除文本框"  onClick={() => onDeleteText(text.id, board.epoch)}><ChalkToolIcon name="close" /></button>
                 {(['n','s','e','w','ne','nw','se','sw'] as ResizeHandle[]).map(handle => <button key={handle} className={`text-resize-handle handle-${handle}`} type="button" aria-label={`${handle.length === 2 ? '缩放文字' : '调整文本边界'} ${handle}`} onPointerDown={event => beginResize(event, text, handle)} onPointerMove={moveResize} onPointerUp={finishResize} onPointerCancel={finishResize} />)}
-                <textarea style={textStyle} value={text.text} autoFocus={editingTextId === text.id} aria-label="画板文本" onChange={(event) => updateText(text, { text: event.target.value })} onKeyDown={(event) => { if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return; event.preventDefault(); updateText(text, { confirmed: true }); setEditingTextId(""); }} />
+                <textarea style={textStyle} value={text.text} maxLength={MAX_BOARD_TEXT_LENGTH} autoFocus={editingTextId === text.id} aria-label="画板文本" onChange={(event) => updateText(text, { text: event.target.value })} onKeyDown={(event) => { if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return; event.preventDefault(); updateText(text, { confirmed: true }); setEditingTextId(""); }} />
               </> : <button className="board-text-content" style={textStyle} type="button" onClick={() => { if (tool === "text") { setEditingTextId(text.id); updateText(text, { confirmed: false }); } }}>{text.text}</button>}
             </div>;
           })}

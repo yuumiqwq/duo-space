@@ -44,6 +44,41 @@ test('workflow copies keep unrelated Dida edits through an interrupted sync and 
   assert.ok(!w.events.at(-1).comment.includes('external note'));
 });
 
+test('each workflow side is reread after the previous write and keeps independent changes until convergence', async () => {
+  for (const scenario of ['independent', 'conflict', 'completed', 'reparented']) {
+    const f = await fixture(), task = await personal(f); let w = await claim(f, task);
+    const update = f.gateway.update, target = f.accounts.bob.get(w.targetId);
+    let injected = false, targetWrites = 0;
+    f.gateway.update = async (owner, id, fields, version, project, before) => {
+      if (owner === 'bob') {
+        targetWrites++;
+        assert.equal(remoteVersion(target), version, 'second write uses a newly observed version');
+        assert.equal(before.content, target.content);
+      }
+      await update(owner, id, fields, version, project, before);
+      if (owner === 'alice' && !injected) {
+        injected = true; target.content = 'note added during first write'; target.etag = 'new';
+        if (scenario === 'conflict') target.priority = 1;
+        if (scenario === 'completed') target.status = 2;
+        if (scenario === 'reparented') target.parentId = 'new-parent';
+      }
+    };
+    w = await act(f, w, 'alice', 'update-workflow', { fields: { priority: 5 }, baseFields: w.fields, settingsVersion: w.settingsVersion });
+    assert.equal(target.content, 'note added during first write');
+    if (scenario === 'independent') {
+      assert.equal(targetWrites, 1); assert.equal(target.priority, 5);
+      assert.ok(w.editPending, 'the first side still needs the new note before reporting success');
+      f.store = new CollaborationStore(f.dir, f.gateway);
+      w = await act(f, w, 'alice', 'retry-workflow');
+      assert.equal(w.error, ''); assert.equal(w.editPending, false);
+      assert.equal(f.accounts.alice.get(task.id).content, target.content);
+      assert.equal(w.events.filter(event => event.type === 'updated').length, 1);
+    } else {
+      assert.equal(targetWrites, 0); assert.match(w.error, /同步期间被修改/); assert.ok(w.editPending);
+    }
+  }
+});
+
 test('workflow browser baselines tolerate an independent website edit but reject a lifecycle change', async () => {
   const f = await fixture(); let w = await claim(f, await f.create('task'));
   const base = structuredClone(w);
@@ -1943,6 +1978,25 @@ async function legacy(f, task, targetId, extra = {}) {
   const state = { version: 1, revision: 0, buffer: {}, operations: { [id]: { id, actorId: 'bob', action: 'move', title: task.title, from: 'alice', to: 'bob', source: source(task), targetId, fields: taskFields(task), status: 'pending', phase: 'prepared', error: '', updatedAt: Date.now(), ...extra } } };
   await writeFile(file, JSON.stringify(state)); return id;
 }
+test('legacy reset persists removal of fieldless retired moves without losing task attachment references', async () => {
+  const f = await fixture(), task = await f.create('current task');
+  const file = path.join(f.dir, 'room-collaboration.json'), state = JSON.parse(await readFile(file, 'utf8'));
+  const link = '[附件：keep.txt](https://study.11scat.xyz/task-attachment?path=tasks%2Fexisting%2Ffile%2Fkeep.txt)';
+  state.operations.obsolete = { action: 'move', status: 'pending' };
+  state.operations.retained = { id: 'retained', action: 'update', status: 'pending', fields: taskFields({ title: 'current edit', content: link }) };
+  state.legacyCleanup = [{ title: 'old warning' }]; state.legacyReset = true;
+  await writeFile(file, JSON.stringify(state));
+  const { attachmentReferences } = await import('../app/api/room/tasks/attachment-coordination.ts');
+  assert.ok(attachmentReferences(state).descriptions.has('tasks/existing/file/keep.txt'));
+  assert.equal((await f.store.resetLegacy('alice')).removed, 1);
+  const migrated = JSON.parse(await readFile(file, 'utf8'));
+  assert.equal(migrated.operations.obsolete, undefined);
+  assert.equal(migrated.legacyCleanup, undefined);
+  assert.deepEqual(migrated.operations.retained, state.operations.retained);
+  assert.equal(migrated.buffer[task.id].fields.title, 'current task');
+  assert.ok(attachmentReferences(migrated).descriptions.has('tasks/existing/file/keep.txt'));
+});
+
 test('legacy reset deletes transfer records idempotently while preserving inbox tasks', async () => {
   const f = await fixture(), task = await personal(f); f.accounts.bob.set('known', { ...taskFields(task), id: 'known', projectId: 'inbox-bob' }); await legacy(f, task, 'known');
   assert.deepEqual((await f.store.resetLegacy('alice')).issues, []); assert.equal(f.accounts.alice.size, 1); assert.equal(f.accounts.bob.size, 1);

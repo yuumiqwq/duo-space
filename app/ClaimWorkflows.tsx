@@ -21,8 +21,8 @@ import { WorkflowAttachments } from './WorkflowAttachments';
 import { WorkflowResyncSettings } from './WorkflowResyncSettings';
 import { WorkflowDeletionRetry } from './WorkflowDeletionRetry';
 import { WorkflowCardSummary } from './WorkflowCardSummary';
+import { activeTaskWorkflow } from './workflow-task-match';
 
-export const workflowStatus: Record<ClaimWorkflow["status"], string> = { creating: "已认领", working: "已认领", submitted: "待审批", rejected: "已认领", approving: "待审批", done: "已完成", deleted: "已删除" };
 const eventLabels = workflowEventLabels;
 export function ClaimWorkflows({ snapshot, initialId, task, busy, error, perform, onClose, retryUncertain, notices = [], onRead }: { notices?: TaskNotice[]; onRead?: (ids: string[]) => void; snapshot: CollaborationSnapshot; task?: RoomTask; initialId: string | null; busy: boolean; error: string; perform: (command: WorkflowCommand | CollaborationCommand | ExecutionCommand) => Promise<boolean>; onClose: () => void; retryUncertain?: () => void }) {
   const dialog = useRef<HTMLDialogElement>(null);
@@ -39,7 +39,7 @@ export function ClaimWorkflows({ snapshot, initialId, task, busy, error, perform
     return () => window.clearInterval(timer);
   }, [uncertain, busy]);
   useEffect(() => { const element = dialog.current, previous = document.activeElement; showCollaborationDialog(element); return () => { element?.close(); if (previous instanceof HTMLElement && previous.isConnected) previous.focus(); }; }, []);
-  const workflow = snapshot.workflows.find(item => item.id === selected || (taskSelected && task && (item.id === task.workflowId || (item.source.ownerId === task.ownerId && item.source.taskId === task.id) || (item.claimantId === task.ownerId && item.targetId === task.id))));
+  const workflow = selected ? snapshot.workflows.find(item => item.id === selected) : taskSelected && task ? activeTaskWorkflow(snapshot.workflows, task) : undefined;
   const unclaimed = taskSelected && !workflow ? task : undefined;
   const back = () => { setSelected(null); setTaskSelected(false); };
   const name = (id: string) => snapshot.members.find(member => member.id === id)?.name || "成员";

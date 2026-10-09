@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, stat, utimes, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
@@ -111,4 +111,75 @@ test('replacing a failed save still publishes its retained staged attachment', a
   w = await f.store.workflowCommand('alice', { id: randomUUID(), workflowId: w.id, version: w.version, action: 'update-workflow', fields: { title: '保留附件再次保存' } });
   assert.equal(w.error, ''); assert.ok(!w.editPending); assert.ok(await stat(a.location));
   assert.equal(f.accounts.bob.get(w.targetId).content, a.content);
+});
+
+test('cleanup rechecks a reference registered while an inbox read was suspended', { timeout: 5000 }, async () => {
+  const f = await fixture(), a = await f.stage(), task = await f.create(a.content);
+  let reached, release;
+  const entered = new Promise(resolve => { reached = resolve; }), gate = new Promise(resolve => { release = resolve; });
+  const inbox = f.gateway.inbox;
+  f.gateway.inbox = async owner => { if (owner === 'alice') { reached(); await gate; } return inbox(owner); };
+  const removing = f.edit(task, '');
+  await entered;
+  try {
+    const added = await f.store.execute('bob', { id: randomUUID(), action: 'create', fields: { title: 'Concurrent reference', content: a.content } });
+    assert.equal(added.status, 'done');
+  } finally { release(); }
+  assert.equal((await removing).status, 'done');
+  assert.equal(await readFile(a.location, 'utf8'), '附件正文');
+  assert.equal((await f.store.snapshot('alice', null)).buffer.find(item => item.title === 'Concurrent reference').content, a.content);
+});
+
+test('reference registration cannot pass the final deletion boundary with a successful broken link', { timeout: 5000 }, async () => {
+  const f = await fixture(), a = await f.stage(), task = await f.create(a.content);
+  let reached, release;
+  const entered = new Promise(resolve => { reached = resolve; }), gate = new Promise(resolve => { release = resolve; });
+  const remove = f.attachments.remove.bind(f.attachments);
+  f.attachments.remove = async files => { if (files.includes(a.path)) { reached(); await gate; } await remove(files); };
+  const removing = f.edit(task, '');
+  await entered;
+  let completed = false;
+  const adding = f.store.execute('bob', { id: randomUUID(), action: 'create', fields: { title: 'Too late', content: a.content } }).then(value => { completed = true; return value; });
+  await new Promise(resolve => setTimeout(resolve, 25));
+  try { assert.equal(completed, false, 'commit waits while deletion owns the reference boundary'); }
+  finally { release(); }
+  assert.equal((await removing).status, 'done');
+  const result = await adding;
+  assert.equal(result.status, 'pending'); assert.match(result.error, /暂存已失效/);
+  assert.ok(!(await f.store.snapshot('alice', null)).buffer.some(item => item.title === 'Too late'));
+  await assert.rejects(stat(a.location), { code: 'ENOENT' });
+});
+
+test('a referenced expired description draft survives cleanup without silently extending its publish deadline', async () => {
+  const f = await fixture(), a = await f.stage();
+  const location = path.join(f.dir, 'task-attachment-drafts', `${a.path.split('/')[2]}.json`);
+  const metadata = JSON.parse(await readFile(location, 'utf8'));
+  const publish = f.attachments.publish.bind(f.attachments);
+  f.attachments.publish = async () => { throw new Error('publication interrupted'); };
+  const op = await f.store.execute('alice', { id: randomUUID(), action: 'create', fields: { title: 'Resumable', content: a.content } });
+  assert.equal(op.status, 'pending');
+  await writeFile(location, JSON.stringify({ ...metadata, createdAt: Date.now() - 25 * 3600000 }));
+  await f.stage('new.txt');
+  assert.ok(await stat(location));
+  f.attachments.publish = publish;
+  const resumed = await f.store.resume('alice', op.id);
+  assert.equal(resumed.status, 'pending'); assert.match(resumed.error, /暂存已失效/);
+  assert.ok(await stat(location));
+  assert.equal(await readFile(location.replace(/\.json$/, '.bin'), 'utf8'), '附件正文');
+});
+
+test('description cleanup still removes old unreferenced orphan binaries while preserving referenced IDs', async () => {
+  const f = await fixture(), kept = randomUUID(), removed = randomUUID();
+  const directory = path.join(f.dir, 'task-attachment-drafts');
+  await mkdir(directory, { recursive: true });
+  for (const id of [kept, removed]) {
+    const location = path.join(directory, `${id}.bin`);
+    await writeFile(location, 'interrupted upload');
+    const old = new Date(Date.now() - 25 * 3600000); await utimes(location, old, old);
+  }
+  const state = { version: 1, revision: 0, buffer: {}, workflows: {}, operations: { pending: { status: 'pending', fields: { content: attachmentMarkdown('https://study.11scat.xyz', 'old.txt', `tasks/task/${kept}/old.txt`) } } } };
+  await writeFile(path.join(f.dir, 'room-collaboration.json'), JSON.stringify(state));
+  await f.stage();
+  assert.ok(await stat(path.join(directory, `${kept}.bin`)));
+  await assert.rejects(stat(path.join(directory, `${removed}.bin`)), { code: 'ENOENT' });
 });

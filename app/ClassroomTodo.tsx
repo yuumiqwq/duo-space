@@ -26,7 +26,7 @@ function TodoNote({ name, value, onSave }: { name: string; value: string; onSave
     void Promise.resolve().then(() => onSave(draft)).then(() => setEditing(false)).catch(() => setError('小记保存失败，请重新按 Enter 保存')).finally(() => setSaving(false));
   }}>
     <input aria-label={`${name}的自由小记`} value={editing ? draft : value} readOnly={!onSave || saving} maxLength={24}
-      onFocus={() => { setDraft(value); setEditing(true); }}
+      onFocus={() => { if (onSave) { setDraft(value); setEditing(true); } }}
       onCompositionStart={event => { composing.current = true; before.current = event.currentTarget.value; }}
       onCompositionEnd={event => { composing.current = false; const input = event.currentTarget; const next = input.scrollWidth <= input.clientWidth + 1 ? input.value : before.current; input.value = next; setDraft(next); }}
       onChange={event => { const input = event.currentTarget; if (composing.current || input.scrollWidth <= input.clientWidth + 1 || input.value.length < draft.length) setDraft(input.value); else input.value = draft; }}

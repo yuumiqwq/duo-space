@@ -7,9 +7,10 @@ import type { Ring } from "./api/room/rings/store";
 import "./room-bell.css";
 import { ClassroomProp } from "./ClassroomScene";
 import { placeBellPanel } from "./bell-position";
+import { reconcilePendingRings } from "./ring-reconciliation";
 
 type Snapshot = { identityId: string; rings: Ring[]; members: { id: string; name: string }[]; serverNow: number };
-export function RoomBell({ triggerHost, onShowChat, entryReady = true }: { triggerHost: HTMLElement | null; onShowChat: () => void; entryReady?: boolean }) {
+export function RoomBell({ triggerHost, onShowChat, onNotice, entryReady = true }: { triggerHost: HTMLElement | null; onShowChat: () => void; onNotice?: (id: string) => void; entryReady?: boolean }) {
   const [data, setData] = useState<Snapshot | null>(null);
   const [openFor, setOpenFor] = useState<HTMLElement | null>(null);
   const open = !!triggerHost && openFor === triggerHost;
@@ -36,18 +37,26 @@ export function RoomBell({ triggerHost, onShowChat, entryReady = true }: { trigg
       const next: Snapshot = await response.json();
       if (id !== sequence.current) return;
       offset.current = next.serverNow - Date.now();
+      reconcilePendingRings(pending.current, next.rings);
       setNow(next.serverNow);
       setData(next);
       setOffline(false);
       // Close already-ended browser notifications on any connected device.
-      if ("serviceWorker" in navigator) {
+      if ("serviceWorker" in navigator) try {
         const registration = await navigator.serviceWorker.getRegistration();
         const notifications = await registration?.getNotifications();
         const active = new Set(next.rings.filter(r => r.state === "active").map(r => r.id));
         notifications?.forEach(n => { if (n.data?.ringId && !active.has(n.data.ringId)) n.close(); });
-      }
+      } catch { /* Notification cleanup does not invalidate the room snapshot. */ }
+      return next;
     } catch { if (id === sequence.current) setOffline(true); }
   }, []);
+  useEffect(() => {
+    if (!entryReady || !data || document.hidden) return;
+    for (const ring of data.rings) {
+      if (ring.recipientId === data.identityId && ring.state === "active" && ring.expiresAt > data.serverNow) onNotice?.(`ring:${ring.id}`);
+    }
+  }, [data, entryReady, onNotice]);
   useEffect(() => {
     let stopped = false;
     let timer: ReturnType<typeof setTimeout>;
@@ -104,13 +113,22 @@ export function RoomBell({ triggerHost, onShowChat, entryReady = true }: { trigg
     if (locked.current) return;
     locked.current = true; setBusy(ring?.id || recipientId); setError(""); sequence.current++;
     try {
+      if (!ring && pending.current[recipientId]) {
+        const pendingId = pending.current[recipientId];
+        const snapshot = await refresh();
+        const confirmed = snapshot?.rings.find(item => item.id === pendingId);
+        if (confirmed?.state === "active" && confirmed.expiresAt > snapshot!.serverNow) return;
+      }
       const id = ring?.id || (pending.current[recipientId] ||= crypto.randomUUID());
       const response = await fetch("/api/room/rings", { method: ring ? "PATCH" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(ring ? { id, action } : { id, recipientId }), signal: AbortSignal.timeout(10000) });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "操作失败，请重试");
       delete pending.current[recipientId];
       await refresh();
-    } catch (cause) { setError(cause instanceof Error && cause.name !== "TimeoutError" ? cause.message : "结果尚未确认，请重试；不会重复摇铃"); }
+    } catch (cause) {
+      setError(cause instanceof Error && cause.name !== "TimeoutError" ? cause.message : "结果尚未确认，请重试；不会重复摇铃");
+      await refresh();
+    }
     finally { locked.current = false; setBusy(""); }
   }
   const live = (r: Ring) => r.state === "active" && r.expiresAt > now;

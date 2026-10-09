@@ -9,7 +9,7 @@ export type Ring = {
   repeat?: boolean; attempts?: number; nextAttemptAt?: number;
 };
 const directory = process.env.DATA_DIR || (process.env.NODE_ENV === "production" ? "/data" : path.join(process.cwd(), ".data"));
-const filename = path.join(directory, "rings.json");
+const filename = path.join(/* turbopackIgnore: true */ directory, "rings.json");
 let queue: Promise<unknown> = Promise.resolve();
 export class RingError extends Error {
   status: number;

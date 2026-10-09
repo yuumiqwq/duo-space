@@ -6,9 +6,8 @@ import { FolderArtwork } from "./FolderArtwork";
 import { clipboardFiles, cloudDropPath, cloudFileSize, cloudFileUrl, cloudRequest, deleteCloudItems, nextFolderName, uploadCloudFiles, type CloudItem, type CloudStatus } from "./cloud-drive-actions";
 import "./cloud-drive.css";
 
-export function CloudDrive({ onClose, onStatusChange, onImage }: {
+export function CloudDrive({ onClose, onImage }: {
   onClose: () => void;
-  onStatusChange: (status: CloudStatus) => void;
   onImage: (image: { url: string; name: string }) => void;
 }) {
   const [path, setPath] = useState("");
@@ -39,12 +38,12 @@ export function CloudDrive({ onClose, onStatusChange, onImage }: {
       const result = await cloudRequest(`/api/cloud?path=${encodeURIComponent(nextPath)}`, { cache: "no-store" });
       if (!Array.isArray(result?.items) || !result.status) throw new Error("云盘加载失败");
       if (id !== sequence.current) return;
-      setPath(result.path); setItems(result.items); setStatus(result.status); onStatusChange(result.status);
+      setPath(result.path); setItems(result.items); setStatus(result.status);
       const visible = new Set((result.items as CloudItem[]).map(item => item.path));
       setSelected(current => new Set([...current].filter(itemPath => visible.has(itemPath))));
     } catch (cause) { if (id === sequence.current) setError(cause instanceof Error ? cause.message : "云盘加载失败"); }
     finally { if (id === sequence.current) { loadingRef.current = false; setLoading(false); } }
-  }, [onStatusChange]);
+  }, []);
 
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;

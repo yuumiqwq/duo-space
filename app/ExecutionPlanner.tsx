@@ -14,28 +14,32 @@ export function ExecutionPlanner({ snapshot, notices = [], name, busy, uncertain
   const [draft, setDraft] = useState(() => ({ ids: executionIds(snapshot.workflows, snapshot.identityId), version: snapshot.executionVersion || 0 }));
   const [limitWarning, setLimitWarning] = useState(0);
   const disabled = busy || uncertain;
+  const available = snapshot.workflows.filter(workflow => workflow.claimantId === snapshot.identityId && (executionEligible(workflow) || executionReserved(workflow)));
+  const stale = draft.version !== (snapshot.executionVersion || 0)
+    || draft.ids.some(id => !available.some(workflow => workflow.id === id))
+    || available.some(workflow => executionReserved(workflow) && !draft.ids.includes(workflow.id));
   useEffect(() => { const element = dialog.current, previous = document.activeElement; showCollaborationDialog(element); return () => { element?.close(); if (previous instanceof HTMLElement && previous.isConnected) previous.focus(); }; }, []);
   useEffect(() => { if (!limitWarning) return; const timer = setTimeout(() => setLimitWarning(0), 2200); return () => clearTimeout(timer); }, [limitWarning]);
   function toggle(id: string) {
     const workflow = snapshot.workflows.find(item => item.id === id);
-    if (disabled || saving.current || !workflow || workflow.claimantId !== snapshot.identityId || !executionEligible(workflow)) return;
+    if (disabled || stale || saving.current || !workflow || workflow.claimantId !== snapshot.identityId || !executionEligible(workflow)) return;
     const ids = toggleExecution(draft.ids, id);
     if (ids === draft.ids) { setLimitWarning(current => current + 1); return; }
     setDraft({ ...draft, ids });
   }
   async function save() {
-    if (disabled || saving.current) return;
+    if (disabled || stale || saving.current) return;
     saving.current = true;
     try {
       if (await perform({ id: crypto.randomUUID(), action: 'arrange-execution', version: draft.version, workflowIds: draft.ids })) onClose();
     } finally { saving.current = false; }
   }
   return <dialog ref={dialog} className="coop-workflows" aria-label="安排执行" onCancel={event => { event.preventDefault(); event.stopPropagation(); if (!busy && !saving.current) onClose(); }} onKeyDown={event => event.stopPropagation()}>
-    <header><div className="coop-workflow-title-actions"><h3><ClipboardCheck size={20} />安排执行</h3><button type="button" className="coop-nudge" disabled={disabled} onClick={() => void save()}>保存</button></div><button type="button" className="coop-icon" aria-label="关闭安排执行" disabled={busy} onClick={() => { if (!saving.current) onClose(); }}><X size={20} /></button></header>
+    <header><div className="coop-workflow-title-actions"><h3><ClipboardCheck size={20} />安排执行</h3>{stale && <button type="button" className="coop-nudge" disabled={disabled} onClick={() => { if (!saving.current) { setDraft({ ids: executionIds(snapshot.workflows, snapshot.identityId), version: snapshot.executionVersion || 0 }); setLimitWarning(0); } }}>重新安排</button>}<button type="button" className="coop-nudge" disabled={disabled || stale} onClick={() => void save()}>保存</button></div><button type="button" className="coop-icon" aria-label="关闭安排执行" disabled={busy} onClick={() => { if (!saving.current) onClose(); }}><X size={20} /></button></header>
     <div className="coop-workflow-list">
       {executionGroups(snapshot.workflows, snapshot.identityId).map(group => <section className="coop-workflow-group" key={group.title} aria-label={group.title}>
         <h4>{group.title}<span>{group.workflows.length}</span></h4>
-        {group.workflows.map(item => <button type="button" className={`coop-workflow-card priority-${item.fields.priority}`} key={item.id} role="checkbox" aria-checked={draft.ids.includes(item.id)} disabled={disabled || !executionEligible(item)} onClick={() => toggle(item.id)}>
+        {group.workflows.map(item => <button type="button" className={`coop-workflow-card priority-${item.fields.priority}`} key={item.id} role="checkbox" aria-checked={draft.ids.includes(item.id)} disabled={disabled || stale || !executionEligible(item)} onClick={() => toggle(item.id)}>
           <WorkflowCardSummary item={item} name={name} noticeIds={notices.filter(notice => notice.workflowId === item.id).map(notice => notice.id)} />
           <span className="coop-workflow-actions">{executionReserved(item) && <span className={`coop-workflow-status ${item.status}`}>待审批</span>}<span className="coop-complete coop-execution-checkbox" aria-hidden="true">{draft.ids.includes(item.id) && <Check size={16} />}</span></span>
         </button>)}

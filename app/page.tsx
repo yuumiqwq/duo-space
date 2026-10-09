@@ -13,16 +13,19 @@ import { loadClassroomPublicTasks } from './classroom-entry';
 import { useClassroomEntry } from './use-classroom-entry';
 import { RoomLoadingScreen } from './RoomLoadingScreen';
 import { createChatSyncRequest } from "./chat-sync-request";
+import { confirmChatDelivery } from "./chat-delivery";
 import { startChatSyncLifecycle } from "./chat-sync-lifecycle";
 import { checkPushSubscription, decodeVapidKey, type PushStatus } from "./push-subscription";
 
 import { FormEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Camera, ChevronLeft, ChevronRight, Volume2, VolumeX, X, Paperclip, File, Download, Undo2, Quote, Copy, Check, PictureInPicture2, MessageCircle, ListTodo } from "lucide-react";
 import { Room, RoomEvent, Track } from "livekit-client";
-import { createMediaRecovery, mediaCallReusable, mediaNeedsRepair, type MediaSource } from "./media-recovery";
+import { createMediaRecovery, mediaCallReusable, mediaNeedsRepair, watchMediaNegotiation, type MediaSource } from "./media-recovery";
+import { watchRemoteMediaTracks, whenRemoteMediaReady } from './media-tracks';
 import type { DataConnection, MediaConnection, Peer as PeerClient, PeerOptions } from "peerjs";
 import { BoardStroke, BoardText, RoomBoard, Whiteboard } from "./Whiteboard";
-import { INITIAL_BOARD_EPOCH, normalizeBoardStroke, normalizeBoardText, normalizeBoard, sortBoardStrokes, mergeBoard } from "./board-state";
+import { INITIAL_BOARD_EPOCH, normalizeBoardStroke, normalizeBoardText, normalizeBoard, mergeBoard, upsertBoardStroke, upsertBoardText as applyBoardText } from "./board-state";
+import { assertBoardCapacity, BoardCapacityError, BOARD_CAPACITY_NOTICE } from './board-limits';
 import { encodeRoomPackets, createPacketReceiver } from "./room-packets";
 import { VoiceRecorder } from "./VoiceRecorder";
 import { CloudSaveButton, type CloudSaveState } from "./CloudSaveButton";
@@ -32,7 +35,6 @@ import { RoomCollaboration } from "./RoomCollaboration";
 import { TickTickDiagnostics } from "./TickTickDiagnostics";
 import { RoomBell } from "./RoomBell";
 import { CloudDrive } from "./CloudDrive";
-import type { CloudStatus } from "./cloud-drive-actions";
 import { useMainFullscreen } from "./use-main-fullscreen";
 import "./main-fullscreen.css";
 import "./classroom.css";
@@ -145,9 +147,9 @@ const normalizeIncomingMessage = (value: unknown, currentIdentityId: string): Ch
   };
 };
 
-const mergeChatMessages = (incoming: ChatMessage[], current: ChatMessage[]) => {
+const mergeChatMessages = (incoming: ChatMessage[], current: ChatMessage[], recalled?: ReadonlySet<string>) => {
   const byId = new Map<string, ChatMessage>();
-  [...current, ...incoming].forEach((message) => byId.set(message.id, message));
+  [...current, ...incoming].forEach((message) => { if (!recalled?.has(message.id)) byId.set(message.id, message); });
   return [...byId.values()].sort((left, right) => (left.createdAt || 0) - (right.createdAt || 0) || left.id.localeCompare(right.id));
 };
 
@@ -198,7 +200,6 @@ export default function Home() {
   const [remoteCameras, setRemoteCameras] = useState<Record<string, MediaStream>>({});
   const [remoteScreens, setRemoteScreens] = useState<Record<string, MediaStream>>({});
   const [activeMediaId, setActiveMediaId] = useState("");
-  const [, setRoomStatus] = useState<"connecting" | "ready" | "error">("connecting");
   const [roomError, setRoomError] = useState("");
   const [syncOpen, setSyncOpen] = useState(false);
   const [connected, setConnected] = useState(false);
@@ -211,7 +212,6 @@ export default function Home() {
   const [chatImagePreview, setChatImagePreview] = useState("");
   const [viewedChatImage, setViewedChatImage] = useState<ViewedChatImage | null>(null);
   const [chatImageError, setChatImageError] = useState("");
-  const [, setChatSending] = useState(false);
   const [chatUploadProgress, setChatUploadProgress] = useState<number | null>(null);
   const [chatHistoryLoading, setChatHistoryLoading] = useState(false);
   const [chatHistoryCursor, setChatHistoryCursor] = useState<string | null>(null);
@@ -236,7 +236,6 @@ export default function Home() {
   const [pushTestMessage, setPushTestMessage] = useState("");
   const [pushMessage, setPushMessage] = useState("");
   const [cloudOpen, setCloudOpen] = useState(false);
-  const [, setCloudStatus] = useState<CloudStatus | null>(null);
   const [chatCloudUploads, setChatCloudUploads] = useState<Record<string, CloudSaveState>>({});
   const { boards, setBoards, activeBoardId, setActiveBoardId, createAndSelect } = useClassroomBoards();
   const [boardNotice, setBoardNotice] = useState("");
@@ -273,6 +272,8 @@ export default function Home() {
   const intentionalLeaveRef = useRef(false);
   const notifiedMessageIdsRef = useRef(new Set<string>());
   const chatSyncCursorRef = useRef(0);
+  const chatHistoryInitializedRef = useRef(false);
+  const recalledChatIdsRef = useRef(new Set<string>());
   const chatSyncRequestRef = useRef(createChatSyncRequest());
   const outgoingChatRef = useRef(new Map<string, OutgoingChat>());
   const sendingChatIdsRef = useRef(new Set<string>());
@@ -292,9 +293,20 @@ export default function Home() {
   const entry = useClassroomEntry(profileReady && joined && classroomProfile.ready && chatHistoryReady);
 
   const updateBoards = useCallback((update: (current: RoomBoard[]) => RoomBoard[]) => {
-    const next = update(boardsRef.current).filter(board => !deletedBoardIdsRef.current.has(board.id));
-    boardsRef.current = next;
-    setBoards(next);
+    try {
+      const next = update(boardsRef.current).filter(board => !deletedBoardIdsRef.current.has(board.id));
+      next.forEach(assertBoardCapacity);
+      if (boardsRef.current.some(board => !deletedBoardIdsRef.current.has(board.id) && !next.some(item => item.id === board.id))) {
+        setBoardNotice("最多保留 12 张画板，可点击画板右上角删除不用的画板");
+      }
+      boardsRef.current = next;
+      setBoards(next);
+      return true;
+    } catch (error) {
+      if (!(error instanceof BoardCapacityError)) throw error;
+      setBoardNotice(BOARD_CAPACITY_NOTICE);
+      return false;
+    }
   }, [setBoards]);
 
   const refreshDeletedBoards = useCallback(async () => {
@@ -323,27 +335,33 @@ export default function Home() {
       if (Array.isArray(message.deletedBoardIds)) message.deletedBoardIds.forEach((id) => { if (typeof id === "string") deletedBoardIdsRef.current.add(id); });
       const incoming = message.boards.flatMap((item) => {
         const board = normalizeBoard(item);
+        if (!board) setBoardNotice(BOARD_CAPACITY_NOTICE);
         return board ? [board] : [];
-      }).slice(0, 12);
+      });
       updateBoards((current) => {
         const merged = new Map(current.filter((board) => !deletedBoardIdsRef.current.has(board.id)).map((board) => [board.id, board]));
         incoming.forEach((board) => {
           if (deletedBoardIdsRef.current.has(board.id)) return;
           const existing = merged.get(board.id);
-          merged.set(board.id, existing ? mergeBoard(existing, board) : board);
+          try { merged.set(board.id, existing ? mergeBoard(existing, board) : board); }
+          catch (error) {
+            if (!(error instanceof BoardCapacityError)) throw error;
+            setBoardNotice(BOARD_CAPACITY_NOTICE);
+          }
         });
-        const next = [...merged.values()].sort((left, right) => left.createdAt - right.createdAt).slice(0, 12);
+        const next = orderClassroomBoards([...merged.values()]).slice(0, 12);
         return next;
       });
       return true;
     }
     if (message.type === "board-create" || message.type === "board-upsert") {
       const board = normalizeBoard(message.board);
-      if (!board || deletedBoardIdsRef.current.has(board.id)) return true;
+      if (!board) { setBoardNotice(BOARD_CAPACITY_NOTICE); return true; }
+      if (deletedBoardIdsRef.current.has(board.id)) return true;
       updateBoards((current) => {
         const next = current.some((item) => item.id === board.id)
           ? current.map((item) => item.id === board.id ? mergeBoard(item, board) : item)
-          : [...current, board].slice(0, 12);
+          : orderClassroomBoards([...current, board]).slice(0, 12);
         return next;
       });
       return true;
@@ -360,13 +378,10 @@ export default function Home() {
       }
       if (message.type === "board-stroke-add") {
         const stroke = normalizeBoardStroke(message.stroke);
-        if (!stroke) return true;
+        if (!stroke) { setBoardNotice(BOARD_CAPACITY_NOTICE); return true; }
         updateBoards((current) => {
           const next = current.map((board) => {
-            if (board.id !== message.boardId || board.epoch !== message.epoch || board.deletedStrokeIds.includes(stroke.id)) return board;
-            const previous = board.strokes.find((item) => item.id === stroke.id);
-            if (previous && previous.revision >= stroke.revision) return board;
-            return { ...board, strokes: sortBoardStrokes(previous ? board.strokes.map((item) => item.id === stroke.id ? stroke : item) : [...board.strokes, stroke]) };
+            return board.id === message.boardId ? upsertBoardStroke(board, stroke, message.epoch as string) ?? board : board;
           });
           return next;
         });
@@ -383,13 +398,10 @@ export default function Home() {
       }
       if (message.type === "board-text-upsert") {
         const text = normalizeBoardText(message.text);
-        if (!text) return true;
+        if (!text) { setBoardNotice(BOARD_CAPACITY_NOTICE); return true; }
         updateBoards((current) => {
           const next = current.map((board) => {
-            if (board.id !== message.boardId || board.epoch !== message.epoch || board.deletedTextIds.includes(text.id)) return board;
-            const previous = board.texts.find((item) => item.id === text.id);
-            if (previous && previous.revision >= text.revision) return board;
-            return { ...board, texts: previous ? board.texts.map((item) => item.id === text.id ? text : item) : [...board.texts, text].slice(-200) };
+            return board.id === message.boardId ? applyBoardText(board, text, message.epoch as string) ?? board : board;
           });
           return next;
         });
@@ -721,6 +733,19 @@ export default function Home() {
     const request = chatSyncRequestRef.current.begin(restart);
     if (!request) return;
     try {
+      if (!chatHistoryInitializedRef.current) {
+        const response = await fetch('/api/chat/messages?limit=30', { cache: 'no-store', signal: request.signal });
+        if (!response.ok) throw new Error('无法加载聊天记录');
+        const data = await response.json();
+        if (!request.isCurrent()) return;
+        const incoming = Array.isArray(data.messages) ? data.messages.map((item: unknown) => normalizeIncomingMessage(item, identityIdRef.current)).filter((item: ChatMessage | null): item is ChatMessage => Boolean(item)) : [];
+        chatSyncCursorRef.current = typeof data.cursor === 'number' ? data.cursor : incoming.reduce((latest: number, message: ChatMessage) => Math.max(latest, message.createdAt || 0), 0);
+        incoming.forEach((message: ChatMessage) => { if (message.own) outgoingChatRef.current.delete(message.id); });
+        setMessages(current => mergeChatMessages(incoming, current, recalledChatIdsRef.current));
+        setChatHistoryCursor(typeof data.nextCursor === 'string' ? data.nextCursor : null);
+        chatHistoryInitializedRef.current = true;
+        return;
+      }
       let cursor = chatSyncCursorRef.current;
       for (let page = 0; page < 4; page += 1) {
         const since = page === 0 ? Math.max(0, cursor - 1000) : cursor;
@@ -734,14 +759,16 @@ export default function Home() {
         const recalledIds = new Set(Array.isArray(data.recalledIds)
           ? data.recalledIds.filter((id): id is string => typeof id === "string")
           : []);
+        recalledIds.forEach(id => { recalledChatIdsRef.current.add(id); outgoingChatRef.current.delete(id); });
+        incoming.forEach(message => { if (message.own) outgoingChatRef.current.delete(message.id); });
         if (incoming.length || recalledIds.size) {
           setMessages((current) => {
             const remaining = recalledIds.size ? current.filter((message) => !recalledIds.has(message.id)) : current;
             const existingIds = new Set(remaining.map((message) => message.id));
             incoming.forEach((message) => {
-              if (!message.own && !existingIds.has(message.id)) playNotificationSound(message.id);
+              if (!message.own && !existingIds.has(message.id) && !recalledChatIdsRef.current.has(message.id)) playNotificationSound(message.id);
             });
-            return mergeChatMessages(incoming, remaining);
+            return mergeChatMessages(incoming, remaining, recalledChatIdsRef.current);
           });
           setChatQuote((current) => current && recalledIds.has(current.id) ? null : current);
         }
@@ -761,7 +788,7 @@ export default function Home() {
     if (chatHistoryLoading || !chatHistoryCursor) return;
     setChatHistoryLoading(true);
     try {
-      const response = await fetch(`/api/chat/messages?limit=30&before=${encodeURIComponent(chatHistoryCursor)}`, { cache: "no-store" });
+      const response = await fetch(`/api/chat/messages?limit=30&before=${encodeURIComponent(chatHistoryCursor)}`, { cache: "no-store", signal: AbortSignal.timeout(10_000) });
       if (!response.ok) throw new Error("无法加载更早消息");
       const data = await response.json() as { messages?: unknown; nextCursor?: unknown };
       const incoming = Array.isArray(data.messages)
@@ -771,7 +798,7 @@ export default function Home() {
       // request was pending cannot consume the history position adjustment.
       const list = messageListRef.current;
       if (list) pendingHistoryScrollRef.current = { height: list.scrollHeight, top: list.scrollTop };
-      setMessages((current) => mergeChatMessages(incoming, current));
+      setMessages((current) => mergeChatMessages(incoming, current, recalledChatIdsRef.current));
       setChatHistoryCursor(typeof data.nextCursor === "string" ? data.nextCursor : null);
     } catch (error) {
       pendingHistoryScrollRef.current = null;
@@ -802,14 +829,17 @@ export default function Home() {
       try {
         const response = await fetch("/api/chat/messages?limit=30", { cache: "no-store", signal: AbortSignal.timeout(10_000) });
         if (!response.ok) throw new Error("无法加载聊天记录");
-        const data = await response.json() as { messages?: unknown; nextCursor?: unknown };
+        const data = await response.json() as { messages?: unknown; nextCursor?: unknown; cursor?: unknown };
         if (disposed) return;
         const incoming = Array.isArray(data.messages)
           ? data.messages.map((item) => normalizeIncomingMessage(item, identityIdRef.current)).filter((item): item is ChatMessage => Boolean(item))
           : [];
         chatSyncCursorRef.current = incoming.reduce((latest, message) => Math.max(latest, message.createdAt || 0), chatSyncCursorRef.current);
-        setMessages((current) => mergeChatMessages(incoming, current));
+        if (typeof data.cursor === 'number' && Number.isFinite(data.cursor)) chatSyncCursorRef.current = Math.max(chatSyncCursorRef.current, data.cursor);
+        incoming.forEach(message => { if (message.own) outgoingChatRef.current.delete(message.id); });
+        setMessages((current) => mergeChatMessages(incoming, current, recalledChatIdsRef.current));
         setChatHistoryCursor(typeof data.nextCursor === "string" ? data.nextCursor : null);
+        chatHistoryInitializedRef.current = true;
       } catch (error) {
         if (!disposed) setChatImageError(error instanceof Error ? error.message : "无法加载聊天记录");
       } finally {
@@ -958,6 +988,8 @@ export default function Home() {
         if (message.type === 'classroom-settings-changed') { window.dispatchEvent(new Event('classroom-settings-changed')); return; }
         if (receiveBoardMessage(message)) return;
         if (message.type === "chat-recall" && typeof message.id === "string") {
+          recalledChatIdsRef.current.add(message.id);
+          outgoingChatRef.current.delete(message.id);
           setMessages((current) => current.filter((item) => item.id !== message.id));
           return;
         }
@@ -975,14 +1007,15 @@ export default function Home() {
         }
         if (message.type !== "chat") return;
         const normalized = normalizeIncomingMessage(message, identityIdRef.current);
-        if (!normalized) return;
+        if (!normalized || recalledChatIdsRef.current.has(normalized.id)) return;
         const incomingMessage: ChatMessage = { ...normalized, sender: participant?.name?.trim() || normalized.sender || participant?.identity || "成员" };
-        playNotificationSound(incomingMessage.id);
-        setMessages((current) => current.some((item) => item.id === incomingMessage.id) ? current : [...current, incomingMessage]);
+        if (incomingMessage.own) outgoingChatRef.current.delete(incomingMessage.id);
+        else playNotificationSound(incomingMessage.id);
+        setMessages((current) => mergeChatMessages([incomingMessage], current, recalledChatIdsRef.current));
       } catch { /* ignore invalid room messages */ }
     });
     room.on(RoomEvent.Disconnected, () => {
-      if (!disposed) { setRoomStatus("error"); setRoomError("实时房间连接已断开，请刷新后重试。"); }
+      if (!disposed) { setRoomError("实时房间连接已断开，请刷新后重试。"); }
     });
     const connect = async () => {
       try {
@@ -998,11 +1031,10 @@ export default function Home() {
         await room.connect(url, token);
         if (disposed) return;
         void room.localParticipant.publishData(new TextEncoder().encode(JSON.stringify({ type: "activity", activity: activityRef.current })), { reliable: true }).catch(() => undefined);
-        setRoomStatus("ready");
         setRoomError("");
         refreshMembers();
       } catch {
-        if (!disposed) { setRoomStatus("error"); setRoomError("实时服务尚未完成配置，请稍后刷新重试。"); }
+        if (!disposed) { setRoomError("实时服务尚未完成配置，请稍后刷新重试。"); }
       }
     };
     void connect();
@@ -1025,24 +1057,22 @@ export default function Home() {
       peers: () => Array.from(connections.keys()),
       canSend: (peerId) => !disposed && Boolean(localPeer?.open && connections.get(peerId)?.open),
       stream: (source) => source === "microphone" ? microphoneStreamRef.current : source === "screen" ? screenStreamRef.current : cameraStreamRef.current,
-      restart: (peerId, media, source) => {
-        const key = `${source}:${peerId}`;
-        const old = outgoingCalls.get(key);
-        outgoingCalls.delete(key);
-        old?.close();
-        callPeer(peerId, media, source);
-      },
+      version: (peerId, source) => outgoingCalls.get(`${source}:${peerId}`),
+      restart: (peerId, media, source) => callPeer(peerId, media, source, 0, true),
     });
     const incomingRecovery = createIncomingMediaRecovery({
-      send: (peerId, source) => {
+      send: (peerId, source, callId) => {
         const connection = connections.get(peerId);
         if (disposed || !connection?.open) return false;
-        try { connection.send({ type: 'media-request', repair: true, source }); return true; }
+        try { connection.send({ type: 'media-request', repair: true, source, callId }); return true; }
         catch { return false; }
       },
       reconnect: peerId => { if (!disposed) connectToPeer(peerId); },
     });
-    recoverPublishedMediaRef.current = (source) => mediaRecovery.request(source);
+    recoverPublishedMediaRef.current = (source) => {
+      const media = source === "microphone" ? microphoneStreamRef.current : source === "screen" ? screenStreamRef.current : cameraStreamRef.current;
+      if (media) connections.forEach(connection => callPeer(connection.peer, media, source));
+    };
     const connectionTimers = new Set<number>();
     let reconnectStartedAt = 0;
     let localDeviceId = "";
@@ -1068,7 +1098,6 @@ export default function Home() {
     const recoverRoomConnection = () => {
       if (disposed) return;
       if (!navigator.onLine) {
-        setRoomStatus("connecting");
         setRoomError("网络已断开，恢复后会自动重新连接。");
         return;
       }
@@ -1098,7 +1127,6 @@ export default function Home() {
         reconnectStartedAt = 0;
         clearRecoveryMessageTimer();
         reconnectAttempts = 0;
-        setRoomStatus("ready");
         setRoomError("");
         const hostId = hostPeerIdRef.current;
         if (hostId && hostId !== peer.id && !connections.get(hostId)?.open) connectToPeer(hostId);
@@ -1111,7 +1139,6 @@ export default function Home() {
         recoveryMessageTimer = window.setTimeout(() => {
           recoveryMessageTimer = null;
           if (disposed || localPeer?.open) return;
-          setRoomStatus("connecting");
           setRoomError(navigator.onLine ? "房间连接正在自动恢复，请稍候。" : "网络已断开，恢复后会自动重新连接。");
         }, 10_000);
       }
@@ -1208,12 +1235,19 @@ export default function Home() {
               if (key.startsWith('microphone:') && kind === 'audio') frames += report.packetsReceived || 0;
               else if (kind === 'video') { frames += report.framesDecoded || 0; packets += report.packetsReceived || 0; }
             });
-            if (frames > progress.frames) { progress.frames = frames; progress.packetsAtFrame = packets; progress.changedAt = Date.now(); }
             const failed = ["failed", "closed"].includes(call.peerConnection.connectionState);
             const source = key.startsWith('microphone:') ? 'microphone' : key.startsWith('screen:') ? 'screen' : 'camera';
+            if (frames > progress.frames) {
+              progress.frames = frames; progress.packetsAtFrame = packets; progress.changedAt = Date.now();
+              if (frames > 0) {
+                incomingRecovery.cancel(call.peer, source);
+                const connection = connections.get(call.peer);
+                if (connection?.open) connection.send({ type: 'media-request', healthy: true, source, callId: call.connectionId });
+              }
+            }
             if (mediaNeedsRepair(source, call.peerConnection.connectionState, Date.now() - progress.changedAt > 20_000, frames, packets - progress.packetsAtFrame)) {
               progress.changedAt = Date.now();
-              incomingRecovery.request(call.peer, source);
+              incomingRecovery.request(call.peer, source, call.connectionId);
               if (failed && incomingCalls.get(key) === call) {
                 incomingCalls.delete(key);
                 mediaProgress.delete(call);
@@ -1285,11 +1319,9 @@ export default function Home() {
       mobilePeerIds.delete(peerId);
       pendingPeerIds.delete(peerId);
       closePeerCalls(peerId);
-      setRoomStatus("ready");
       setRoomError("");
       window.setTimeout(() => {
         if (!disposed && localPeer?.open && connections.size === 0) {
-          setRoomStatus("ready");
           setRoomError("");
         }
       }, 300);
@@ -1328,31 +1360,38 @@ export default function Home() {
       }, mobilePeerIds.has(peerId) ? MOBILE_BACKGROUND_GRACE_MS : 10_000));
     };
 
-    const callPeer = (peerId: string, media: MediaStream, source: MediaSource, attempt = 0) => {
-      if (!localPeer?.open || !connections.get(peerId)?.open) return;
+    const callPeer = (peerId: string, media: MediaStream, source: MediaSource, attempt = 0, repair = false) => {
+      if (disposed || !localPeer?.open || !connections.get(peerId)?.open) return;
       const key = `${source}:${peerId}`;
       const existing = outgoingCalls.get(key);
       if (!(source === "microphone" ? media.getAudioTracks() : media.getVideoTracks()).some((track) => track.readyState === "live")) return;
-      if (mediaCallReusable(existing)) return;
-      existing?.close();
+      if (mediaCallReusable(existing) && (!repair || !existing?.open || ['new', 'connecting'].includes(existing.peerConnection?.connectionState || 'new'))) return;
 
       const call = localPeer.call(peerId, media, { metadata: { source, name: displayNameRef.current, identityId: identityIdRef.current } });
       outgoingCalls.set(key, call);
+      let stopWatching = () => {};
       const retry = () => {
         if (disposed || outgoingCalls.get(key) !== call) return;
         outgoingCalls.delete(key);
         call.close();
         const currentStream = source === "microphone" ? microphoneStreamRef.current : source === "camera" ? cameraStreamRef.current : screenStreamRef.current;
         if (!currentStream || currentStream !== media || attempt >= 3) return;
-        window.setTimeout(() => callPeer(peerId, currentStream, source, attempt + 1), 900 * (attempt + 1));
+        window.setTimeout(() => {
+          const latestStream = source === "microphone" ? microphoneStreamRef.current : source === "camera" ? cameraStreamRef.current : screenStreamRef.current;
+          if (!disposed && latestStream === currentStream) callPeer(peerId, currentStream, source, attempt + 1);
+        }, 900 * (attempt + 1));
       };
-      window.setTimeout(() => {
-        if (outgoingCalls.get(key) === call && !call.open) retry();
-      }, 7000);
       call.on("close", () => {
+        stopWatching();
+        existing?.close();
         if (outgoingCalls.get(key) === call) outgoingCalls.delete(key);
       });
       call.on("error", retry);
+      stopWatching = watchMediaNegotiation(call.peerConnection, retry, () => {
+        if (outgoingCalls.get(key) !== call) return;
+        existing?.close();
+        mediaRecovery.cancel(source, peerId);
+      });
     };
 
     callPeerRef.current = callPeer;
@@ -1451,6 +1490,8 @@ export default function Home() {
         if (message.type === 'classroom-settings-changed') { window.dispatchEvent(new Event('classroom-settings-changed')); return; }
         if (receiveBoardMessage(message)) return;
         if (message.type === "chat-recall" && typeof message.id === "string") {
+          recalledChatIdsRef.current.add(message.id);
+          outgoingChatRef.current.delete(message.id);
           setMessages((current) => current.filter((item) => item.id !== message.id));
           return;
         }
@@ -1472,8 +1513,14 @@ export default function Home() {
           return;
         }
         if (message.type === "media-request") {
-          const request = payload as { repair?: boolean; source?: string };
+          const request = payload as { repair?: boolean; healthy?: boolean; source?: string; callId?: string };
+          if (request.healthy === true && (request.source === "screen" || request.source === "camera" || request.source === "microphone")) {
+            if (outgoingCalls.get(`${request.source}:${peerId}`)?.connectionId === request.callId) mediaRecovery.cancel(request.source, peerId);
+            return;
+          }
           if (request.repair === true && (request.source === "screen" || request.source === "camera" || request.source === "microphone")) {
+            const current = outgoingCalls.get(`${request.source}:${peerId}`);
+            if (request.callId && current && current.connectionId !== request.callId) return;
             mediaRecovery.request(request.source, peerId);
             return;
           }
@@ -1491,13 +1538,14 @@ export default function Home() {
         }
         if (message.type === "chat") {
           const normalized = normalizeIncomingMessage(message, identityIdRef.current);
-          if (!normalized) return;
+          if (!normalized || recalledChatIdsRef.current.has(normalized.id)) return;
           const incomingMessage: ChatMessage = {
             ...normalized,
             sender: normalized.sender || memberNamesRef.current[peerId] || "成员",
           };
-          playNotificationSound(incomingMessage.id);
-          setMessages((current) => current.some((item) => item.id === incomingMessage.id) ? current : [...current, incomingMessage]);
+          if (incomingMessage.own) outgoingChatRef.current.delete(incomingMessage.id);
+          else playNotificationSound(incomingMessage.id);
+          setMessages((current) => mergeChatMessages([incomingMessage], current, recalledChatIdsRef.current));
           return;
         }
         if (message.type !== "peer-list" || !Array.isArray(message.ids)) return;
@@ -1572,31 +1620,44 @@ export default function Home() {
           const key = `${source}:${peerId}`;
           const previous = incomingCalls.get(key);
           incomingCalls.set(key, call);
-          previous?.close();
           if (previous) mediaProgress.delete(previous);
+          let stopTracking = () => {};
+          let stopPreparing = () => {};
           call.on("stream", (remoteStream) => {
             if (disposed || incomingCalls.get(key) !== call) return;
             const setter = source === "microphone" ? setRemoteMicrophones : source === "camera" ? setRemoteCameras : setRemoteScreens;
-            setter((current) => ({ ...current, [peerId]: remoteStream }));
-            setRoomError("");
-            if (source === "screen") setActiveMediaId(`${peerId}-screen`);
-            remoteStream.getTracks()[0]?.addEventListener("ended", () => {
+            stopTracking();
+            stopTracking = watchRemoteMediaTracks(remoteStream, source, () => {
               if (incomingCalls.get(key) === call) removeRemoteMedia(peerId, source);
+            });
+            stopPreparing();
+            stopPreparing = whenRemoteMediaReady(remoteStream, source, () => {
+              if (disposed || incomingCalls.get(key) !== call) return;
+              setter((current) => ({ ...current, [peerId]: remoteStream }));
+              setRoomError("");
+              if (source === "screen") setActiveMediaId(`${peerId}-screen`);
+              incomingRecovery.cancel(peerId, source);
+              previous?.close();
             });
           });
           call.on("close", () => {
+            stopTracking();
+            stopPreparing();
+            previous?.close();
             mediaProgress.delete(call);
             if (incomingCalls.get(key) !== call) return;
             incomingCalls.delete(key);
             removeRemoteMedia(peerId, source);
           });
           call.on("error", () => {
+            stopTracking();
+            stopPreparing();
             mediaProgress.delete(call);
             if (incomingCalls.get(key) !== call) return;
             incomingCalls.delete(key);
             removeRemoteMedia(peerId, source);
             call.close();
-            incomingRecovery.request(peerId, source);
+            incomingRecovery.request(peerId, source, call.connectionId);
           });
           call.answer();
           // Incoming media does not guarantee a matching data channel exists.
@@ -1614,7 +1675,6 @@ export default function Home() {
             selfPeerIdRef.current = id;
             hostPeerIdRef.current = id;
             if (window.location.search) window.history.replaceState(null, "", window.location.pathname);
-            setRoomStatus("ready");
             setRoomError("");
             startPresenceHeartbeat();
           });
@@ -1636,14 +1696,12 @@ export default function Home() {
               scheduleRoomRecovery();
               return;
             }
-            setRoomStatus("error");
             setRoomError("实时房间连接失败，请检查代理网络后刷新页面。");
           });
         };
 
         attachPeer(new Peer(peerOptions));
       } catch {
-        setRoomStatus("error");
         setRoomError("实时房间组件加载失败，请刷新页面重试。");
       } finally {
         initializingRoom = false;
@@ -1651,17 +1709,14 @@ export default function Home() {
     };
 
     const resumeMedia = () => {
-      // Reconcile screen calls without tearing down an established capture.
+      // Reconcile all sources without tearing down an established capture.
       // Failed calls and stalled decoding are repaired by the receiver checks.
-      mediaRecovery.request("camera");
-      // Focus/visibility alone do not indicate a microphone failure. Keep the
-      // established call; the receiver requests repair if audio packets stall.
-      // Re-request even when the old MediaConnection still reports open.
       connections.forEach((connection) => {
         if (!connection.open) return;
-        connection.send({ type: "media-request", source: "screen" });
+        connection.send({ type: "media-request" });
         if (screenStreamRef.current) callPeer(connection.peer, screenStreamRef.current, "screen");
-        connection.send({ type: "media-request", repair: true, source: "camera" });
+        if (cameraStreamRef.current) callPeer(connection.peer, cameraStreamRef.current, "camera");
+        if (microphoneStreamRef.current) callPeer(connection.peer, microphoneStreamRef.current, "microphone");
       });
     };
     const handleVisibilityChange = () => {
@@ -1906,9 +1961,6 @@ export default function Home() {
       const result = await response.json().catch(() => null) as { error?: unknown } | null;
       if (!response.ok) throw new Error(typeof result?.error === "string" ? result.error : "上传到云盘失败");
       setChatCloudUploads((current) => ({ ...current, [attachment.id]: "done" }));
-      const statusResponse = await fetch("/api/cloud", { cache: "no-store" });
-      const statusResult = await statusResponse.json().catch(() => null) as { status?: CloudStatus } | null;
-      if (statusResult?.status) setCloudStatus(statusResult.status);
     } catch (error) {
       setChatCloudUploads((current) => ({ ...current, [attachment.id]: "failed" }));
       setChatImageError(error instanceof Error ? error.message : "上传到云盘失败");
@@ -1938,15 +1990,17 @@ export default function Home() {
     } catch { setBoardNotice('画板删除暂未完成，请检查网络后重试。'); }
   };
 
-  const addBoardStroke = (boardId: string, stroke: BoardStroke, epoch: string) => {
-    const next = boardsRef.current.map((board) => {
-      if (board.id !== boardId || board.epoch !== epoch || board.deletedStrokeIds.includes(stroke.id)) return board;
-      const previous = board.strokes.find((item) => item.id === stroke.id);
-      if (previous && previous.revision >= stroke.revision) return board;
-      return { ...board, strokes: sortBoardStrokes(previous ? board.strokes.map((item) => item.id === stroke.id ? stroke : item) : [...board.strokes, stroke]) };
-    });
-    boardsRef.current = next; setBoards(next);
-    broadcastRoomMessage({ type: "board-stroke-add", boardId, stroke, epoch });
+  const addBoardStroke = (boardId: string, stroke: BoardStroke, epoch: string, publish = true) => {
+    let accepted = false;
+    const applied = updateBoards(current => current.map(board => {
+      if (board.id !== boardId) return board;
+      const next = upsertBoardStroke(board, stroke, epoch);
+      accepted = next !== null;
+      return next ?? board;
+    }));
+    if (!applied || !accepted) { setBoardNotice(BOARD_CAPACITY_NOTICE); return false; }
+    if (publish) broadcastRoomMessage({ type: "board-stroke-add", boardId, stroke, epoch });
+    return true;
   };
 
   const deleteBoardStroke = (boardId: string, strokeId: string, epoch: string) => {
@@ -1966,14 +2020,16 @@ export default function Home() {
   };
 
   const upsertBoardText = (boardId: string, text: BoardText, epoch: string) => {
-    const next = boardsRef.current.map((board) => {
-      if (board.id !== boardId || board.epoch !== epoch || board.deletedTextIds.includes(text.id)) return board;
-      const previous = board.texts.find((item) => item.id === text.id);
-      if (previous && previous.revision >= text.revision) return board;
-      return { ...board, texts: previous ? board.texts.map((item) => item.id === text.id ? text : item) : [...board.texts, text].slice(-200) };
-    });
-    boardsRef.current = next; setBoards(next);
+    let accepted = false;
+    const applied = updateBoards(current => current.map(board => {
+      if (board.id !== boardId) return board;
+      const next = applyBoardText(board, text, epoch);
+      accepted = next !== null;
+      return next ?? board;
+    }));
+    if (!applied || !accepted) { setBoardNotice(BOARD_CAPACITY_NOTICE); return false; }
     broadcastRoomMessage({ type: "board-text-upsert", boardId, text, epoch });
+    return true;
   };
 
   const deleteBoardText = (boardId: string, textId: string, epoch: string) => {
@@ -1983,17 +2039,6 @@ export default function Home() {
     boardsRef.current = next; setBoards(next);
     broadcastRoomMessage({ type: "board-text-delete", boardId, textId, epoch });
   };
-
-  useEffect(() => {
-    if (!joined) return;
-    let disposed = false;
-    void fetch("/api/cloud", { cache: "no-store" }).then(async (response) => {
-      if (!response.ok || disposed) return;
-      const result = await response.json() as { status?: CloudStatus };
-      if (!disposed && result.status) setCloudStatus(result.status);
-    }).catch(() => undefined);
-    return () => { disposed = true; };
-  }, [joined]);
 
   useEffect(() => {
     microphoneStreamRef.current = microphoneStream;
@@ -2166,11 +2211,13 @@ export default function Home() {
   const recallMessage = async (message: ChatMessage) => {
     if (!message.own) return;
     setMessageMenuId("");
-    const response = await fetch(`/api/chat/messages/${encodeURIComponent(message.id)}`, { method: "DELETE" });
-    if (!response.ok) {
+    const response = await fetch(`/api/chat/messages/${encodeURIComponent(message.id)}`, { method: "DELETE", signal: AbortSignal.timeout(10_000) }).catch(() => null);
+    if (!response?.ok) {
       setChatImageError("撤回失败，请重试");
       return;
     }
+    recalledChatIdsRef.current.add(message.id);
+    outgoingChatRef.current.delete(message.id);
     setMessages((current) => current.filter((item) => item.id !== message.id));
     if (chatQuote?.id === message.id) setChatQuote(null);
     void roomRef.current?.localParticipant.publishData(
@@ -2203,20 +2250,21 @@ export default function Home() {
     const { id } = item.message;
     if (sendingChatIdsRef.current.has(id)) return;
     sendingChatIdsRef.current.add(id);
-    setChatSending(true);
     setMessages((current) => current.map((message) => message.id === id ? { ...message, delivery: "sending", error: undefined } : message));
     try {
       if (!item.attachment && item.file) item.attachment = await uploadChatFile(item.file);
-      const response = await fetch("/api/chat/messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-device-id": pushDeviceIdRef.current },
-        signal: AbortSignal.timeout(20_000),
-        body: JSON.stringify({ id, body: item.message.body, attachment: item.attachment, replyTo: item.message.replyTo }),
+      const result = await confirmChatDelivery({ id, body: item.message.body, attachment: item.attachment, replyTo: item.message.replyTo }, pushDeviceIdRef.current, {
+        confirmed: () => !outgoingChatRef.current.has(id),
       });
-      const result = await response.json().catch(() => null) as { message?: unknown; error?: unknown } | null;
+      if (!result) return;
+      if (result.recalled) {
+        recalledChatIdsRef.current.add(id); outgoingChatRef.current.delete(id);
+        setMessages(current => current.filter(message => message.id !== id));
+        return;
+      }
       const message = normalizeIncomingMessage(result?.message, identityIdRef.current);
-      if (!response.ok || !message) throw new Error(typeof result?.error === "string" ? result.error : "发送未确认，请重试");
-      setMessages((current) => mergeChatMessages([message], current));
+      if (!message) throw new Error("发送未确认，请重试");
+      setMessages((current) => mergeChatMessages([message], current, recalledChatIdsRef.current));
       outgoingChatRef.current.delete(id);
       // Delivery is already durable. A disconnected peer must not turn success into failure.
       void roomRef.current?.localParticipant.publishData(new TextEncoder().encode(JSON.stringify({ ...message, type: "chat" })), { reliable: true }).catch(() => undefined);
@@ -2228,7 +2276,6 @@ export default function Home() {
       setMessages((current) => current.map((message) => message.id === id && message.delivery ? { ...message, delivery: "failed", error: reason } : message));
     } finally {
       sendingChatIdsRef.current.delete(id);
-      setChatSending(sendingChatIdsRef.current.size > 0);
       if (!sendingChatIdsRef.current.size) setChatUploadProgress(null);
     }
   };
@@ -2329,7 +2376,7 @@ export default function Home() {
             {!projection.open && <BlackboardSurface index={boardIndex} count={orderedBoards.length + 1} onStep={stepBoard} drawing={!!activeBoard}>
             {!activeBoard && <button className={`main-fullscreen-button${projection.open ? '' : ' is-chalk'}`} type="button" onClick={() => void toggleFullscreen()} aria-label={fullscreen ? "退出主窗口全屏" : "主窗口全屏"} aria-keyshortcuts="f" ><ClassroomFullscreenIcon fullscreen={fullscreen} chalk={!projection.open} /></button>}
             {fullscreenError && <p className="main-fullscreen-error" role="alert">{fullscreenError}</p>}
-            {activeBoard ? <Whiteboard key={activeBoard.id} board={activeBoard} onDelete={() => deleteBoard(activeBoard.id)} fullscreen={fullscreen} onToggleFullscreen={toggleFullscreen} onAddStroke={(stroke, epoch) => addBoardStroke(activeBoard.id, stroke, epoch)} onDeleteStroke={(strokeId, epoch) => deleteBoardStroke(activeBoard.id, strokeId, epoch)} onClear={() => clearBoard(activeBoard.id)} onUpsertText={(text, epoch) => upsertBoardText(activeBoard.id, text, epoch)} onDeleteText={(textId, epoch) => deleteBoardText(activeBoard.id, textId, epoch)} onSaved={(message, error) => {
+            {activeBoard ? <Whiteboard key={activeBoard.id} board={activeBoard} onDelete={() => deleteBoard(activeBoard.id)} fullscreen={fullscreen} onToggleFullscreen={toggleFullscreen} onAddStroke={(stroke, epoch, publish) => addBoardStroke(activeBoard.id, stroke, epoch, publish)} onDeleteStroke={(strokeId, epoch) => deleteBoardStroke(activeBoard.id, strokeId, epoch)} onClear={() => clearBoard(activeBoard.id)} onUpsertText={(text, epoch) => upsertBoardText(activeBoard.id, text, epoch)} onDeleteText={(textId, epoch) => deleteBoardText(activeBoard.id, textId, epoch)} onSaved={(message, error) => {
               setBoardNotice(error ? "" : message);
               setShareError(error ? message : "");
               if (!error) window.setTimeout(() => setBoardNotice((current) => current === message ? "" : current), 3500);
@@ -2548,10 +2595,10 @@ export default function Home() {
         ...Object.entries(remoteScreens).filter(([peer]) => peerIdentityIds[peer] !== identityId).map(([peer, media]) => ({ id: `screen:${peer}`, stream: media, muted: remoteScreenMuted })),
       ]} />
       {microphoneError && <p className="room-microphone-error" role="alert">{microphoneError}</p>}
-      <RoomBell triggerHost={bellHost} onShowChat={showBellChat} entryReady={entry.ready} />
+      <RoomBell triggerHost={bellHost} onShowChat={showBellChat} onNotice={playNotificationSound} entryReady={entry.ready} />
       {profileReady && !joined && <p className="error-message" role="alert">{joinError || "正在进入自习室…"}</p>}
 
-      {cloudOpen && <CloudDrive onClose={() => setCloudOpen(false)} onStatusChange={setCloudStatus} onImage={openChatImage} />}
+      {cloudOpen && <CloudDrive onClose={() => setCloudOpen(false)} onImage={openChatImage} />}
 
       {viewedChatImage && <ChatImageViewer image={viewedChatImage} onClose={closeChatImage} />}
 

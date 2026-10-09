@@ -177,12 +177,18 @@ export const gateway: Gateway = {
   async update(owner, id, fields, version, projectId, before) {
     const trace: Record<string, unknown> = { stage: 'read-before-write', requested: taskSyncEvidence(fields), expectedVersion: version };
     try {
-      const existing = before || await gateway.get(owner, id, projectId);
+      const existing = await gateway.get(owner, id, projectId);
       trace.before = taskSyncEvidence(existing);
       if (!existing) throw new CollaborationError("任务不存在");
       if (existing.id !== id || (projectId && existing.projectId !== projectId)) throw new CollaborationError('任务编号无效', 400);
-      if (remoteVersion(existing) !== version) throw new CollaborationError("任务刚被修改，请刷新后重新编辑");
-      const intent = { base: taskFields(existing), desired: fields };
+      if (before && remoteVersion(before) !== version) throw new CollaborationError('任务刚被修改，请刷新后重新编辑');
+      const intent = { base: taskFields(before || existing), desired: fields };
+      if (remoteVersion(existing) !== version) {
+        if (!before || (existing.status || 0) !== (before.status || 0) || (existing.parentId || '') !== (before.parentId || '')) throw new CollaborationError('任务刚被修改，请刷新后重新编辑');
+        const merged = mergeTaskSettings(intent.base, intent.desired, taskFields(existing));
+        if (merged.conflicts.length) throw new CollaborationError('任务刚被修改，请刷新后重新编辑');
+        fields = merged.fields;
+      }
       // An uncertain update is re-read before one bounded retry. Never repeat
       // creation/deletion here, or overwrite later edits to the same task.
       let current = existing, response;
