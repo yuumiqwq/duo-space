@@ -7,7 +7,8 @@ export type RoomTask = TaskFields & { id: string; ownerId: string | null; versio
 export type CollaborationMember = { id: string; name: string; connected: boolean; loading?: boolean; error?: string; diagnostic?: string; tasks: RoomTask[] };
 export type OperationView = { id: string; actorId: string; title: string; action: string; from: string | null; to: string | null; status: "pending" | "done" | "cancelled"; error: string; createdAt?: number; updatedAt: number };
 export type WorkflowFile = { id: string; name: string; size: number; url: string };
-export type WorkflowEvent = { id: string; actorId: string; type: string; at: number; comment: string; files: WorkflowFile[]; signature?: string; replyTo?: string };
+export type WorkflowSettingChange = { field: keyof TaskFields; label: string; before: string; after: string };
+export type WorkflowEvent = { id: string; actorId: string; type: string; at: number; comment: string; files: WorkflowFile[]; signature?: string; replyTo?: string; settingChanges?: WorkflowSettingChange[] };
 export type WorkflowSyncIssue = { id: string; at: number; message: string; recipientId: string };
 export type ClaimWorkflow = {
   id: string; title: string; source: TaskSource; reviewerId: string; claimantId: string;

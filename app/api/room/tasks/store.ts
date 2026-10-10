@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { remoteTaskSignatures } from '../../../collaboration-refresh.ts';
-import { workflowSettingChanges } from '../../../workflow-setting-changes.ts';
+import { workflowSettingChangeEntries, workflowSettingChanges } from '../../../workflow-setting-changes.ts';
 import { collaborationDate, collaborationDateAfter } from '../../../collaboration-view.ts';
 import { clearLegacyRecords } from '../../../legacy-record-cleanup.ts';
 import { activeTaskNotice, initializeTaskNotices, receivesTaskNotice, silentWorkflowEvent, unreadTaskNotices } from '../../../collaboration-notifications.ts';
@@ -489,7 +489,7 @@ export class CollaborationStore {
   private publicWorkflow(workflow: Workflow): ClaimWorkflow {
     const { id, title, source, reviewerId, claimantId, targetId, reviewerTaskId, fields, status, version, createdAt, updatedAt, error, events, syncIssue } = workflow;
     const currentFields = workflow.edit?.fields || fields;
-    return { id, title, source, reviewerId, claimantId, targetId, reviewerTaskId, fields: currentFields, settingsVersion: fingerprint({ fields: comparableFields(currentFields), status }), status, version, createdAt, updatedAt, error, syncIssue, executing: !!workflow.executing, editPending: !!workflow.edit, deletionPending: !!workflow.deletionDiagnostic?.pending, ownerDeletePending: !!workflow.ownerDeletion, taskAnomaly: workflow.taskAnomaly, syncError: workflow.syncError, reopenPending: workflow.reopenPending, needsSubmission: workflow.needsSubmission, events: events.map(({ id, actorId, type, at, comment, files, replyTo }) => ({ id, actorId, type, at, comment, files, replyTo })) };
+    return { id, title, source, reviewerId, claimantId, targetId, reviewerTaskId, fields: currentFields, settingsVersion: fingerprint({ fields: comparableFields(currentFields), status }), status, version, createdAt, updatedAt, error, syncIssue, executing: !!workflow.executing, editPending: !!workflow.edit, deletionPending: !!workflow.deletionDiagnostic?.pending, ownerDeletePending: !!workflow.ownerDeletion, taskAnomaly: workflow.taskAnomaly, syncError: workflow.syncError, reopenPending: workflow.reopenPending, needsSubmission: workflow.needsSubmission, events: events.map(({ id, actorId, type, at, comment, files, replyTo, settingChanges }) => ({ id, actorId, type, at, comment, files, replyTo, ...(settingChanges ? { settingChanges } : {}) })) };
   }
   private async saveWorkflow(state: State, workflow: Workflow) {
     workflow.executing ??= false;
@@ -623,7 +623,7 @@ export class CollaborationStore {
       if (!sameFields(fields, current.fields)) {
         const editId = randomUUID();
         workflow.edit = { id: editId, fields, summary: workflowSettingChanges(current.fields, fields) };
-        workflow.events.push({ id: editId, actorId: actor, type: "updated", at: now, comment: workflow.edit.summary!, files: [] });
+        workflow.events.push({ id: editId, actorId: actor, type: "updated", at: now, comment: workflow.edit.summary!, settingChanges: workflowSettingChangeEntries(current.fields, fields), files: [] });
       }
       workflow.projects = { target: targetInbox.projectId, ...(current.remote ? { source: current.remote.projectId } : {}) };
       this.completedAfter(state, workflow);
@@ -926,7 +926,7 @@ export class CollaborationStore {
         const before = [workflow.fields.content, workflow.edit?.attachments?.before || '', workflow.edit?.fields.content || ''].join('\n');
         const intent = { base: workflow.edit?.intent?.base || workflow.fields, desired: fields };
         workflow.edit = { id: command.id, fields, intent, rebaseTargets: !!workflow.edit && workflow.error.includes('同步期间被修改'), attachments: { actor, before, publishBefore: workflow.fields.content, after: fields.content }, summary: workflowSettingChanges(previousFields, fields), diagnostics: workflow.edit?.diagnostics };
-        workflow.events.push({ id: command.id, signature, actorId: actor, type: "updated", at: Date.now(), comment: workflow.edit.summary!, files: [] });
+        workflow.events.push({ id: command.id, signature, actorId: actor, type: "updated", at: Date.now(), comment: workflow.edit.summary!, settingChanges: workflowSettingChangeEntries(previousFields, fields), files: [] });
         workflow.error = "";
         await this.saveWorkflow(state, workflow);
         return this.finishWorkflowEdit(state, workflow);

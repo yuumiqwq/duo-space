@@ -154,6 +154,19 @@
 .coop-workflow-events li > div { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; }
 .coop-workflow-events time { color: var(--muted); font-size: 11px; }
 .coop-workflow-events p { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.7; margin: 8px 0; }
+.workflow-setting-changes { container: workflow-changes / inline-size; display: grid; gap: 16px; margin-top: 12px; }
+.workflow-setting-change { min-width: 0; }
+.workflow-setting-label { display: block; margin-bottom: 7px; color: var(--muted); font-size: 12px; font-weight: 600; }
+.workflow-setting-comparison { display: grid; grid-template-columns: minmax(0, 1fr) 20px minmax(0, 1fr); align-items: start; gap: 8px; }
+.coop-workflow-events .workflow-setting-value { box-sizing: border-box; min-width: 0; margin: 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--soft); color: var(--ink); }
+.coop-workflow-events .workflow-setting-value.is-after { background: var(--panel); }
+.workflow-setting-arrow { align-self: center; justify-self: center; color: var(--muted); font-size: 20px; line-height: 1; }
+.workflow-setting-comparison.is-stacked { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+.workflow-setting-comparison.is-stacked .workflow-setting-arrow { transform: rotate(90deg); }
+@container workflow-changes (max-width: 380px) {
+  .workflow-setting-comparison { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+  .workflow-setting-arrow { transform: rotate(90deg); }
+}
 .coop-workflow-events a { display: flex; align-items: center; gap: 5px; color: var(--theme-accent-dark); overflow-wrap: anywhere; margin: 6px 0; }
 .coop-workflow-compose { margin-top: 16px; padding: 14px; border: 1px dashed var(--line); border-radius: 11px; background: var(--soft); }
 .coop-workflow-compose label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 7px; }

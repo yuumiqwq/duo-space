@@ -113,7 +113,7 @@ test('workflow detail offers settings to every member and direct completion only
   workflow.events.push({ id: 'new-edit', actorId: 'alice', type: 'updated', at: 1700000000001, comment: '优先级：无 → 高', files: [] });
   workflow.error = '写入失败示例'; workflow.syncIssue = { id: 'error', message: workflow.error, at: 1, recipientId: 'alice' };
   const separated = render('alice', 'working', true), timeline = separated.match(/<ol class="coop-workflow-events">[\s\S]*?<\/ol>/)[0];
-  assert.ok(timeline.includes('优先级：无 → 高'));
+  assert.match(timeline, /aria-label="优先级修改前">无<\/p>[\s\S]*?aria-hidden="true">→<\/span>[\s\S]*?aria-label="优先级修改后">高<\/p>/);
   for (const text of ['详情修改已替代', '此修改由后续详情设置替代', '旧记录未保存具体修改内容', '写入失败示例']) assert.ok(!timeline.includes(text));
   assert.ok(separated.indexOf('写入失败示例') > separated.indexOf('</ol>'));
   delete workflow.error; delete workflow.syncIssue;
@@ -126,7 +126,16 @@ test('workflow detail offers settings to every member and direct completion only
   assert.ok(!attachmentHtml.includes('[附件：报告.pdf]'), 'raw Markdown is not shown in the description');
   assert.ok(!attachmentHtml.includes('target="_blank"'), 'task attachment clicks stay in the current page');
   workflow.events.push({ id: 'old-attachment-change', actorId: 'alice', type: 'updated', at: 1700000000000, comment: `说明：无 → ${workflow.fields.content}`, files: [] });
-  assert.ok(render('alice').includes('说明：无 → 前文 [报告.pdf] 后文'));
+  assert.match(render('alice'), /aria-label="说明修改前">无<\/p>[\s\S]*?aria-label="说明修改后">前文 \[报告.pdf\] 后文<\/p>/);
+  const multiline = '原段落 → 下一段\n\n优先级：这行属于说明';
+  workflow.events.push({ id: 'structured-change', actorId: 'alice', type: 'updated', at: 1700000000000, comment: '这条摘要不作为卡片内容', files: [], settingChanges: [
+    { field: 'content', label: '说明', before: multiline, after: '新说明\n第二行 <script>' },
+    { field: 'priority', label: '优先级', before: '无', after: '高' },
+  ] });
+  const cards = render('alice');
+  assert.ok(cards.includes(multiline), 'paragraphs and arrows stay inside their original card');
+  assert.ok(cards.includes('新说明\n第二行 &lt;script&gt;'), 'card values are escaped text');
+  assert.ok(!cards.includes('这条摘要不作为卡片内容'));
   workflow.fields.content = '[附件：hash.png](https://study.11scat.xyz/task-attachment?path=tasks%2Fa%2Fphoto.png)';
   workflow.events.push({ id: 'image-review', type: 'approve', actorId: 'alice', at: 1700000000000, comment: '[图1.png] [证明.pdf]', files: [{ id: 'image', name: 'hash.png', url: '/api/room/tasks/files/image' }, { id: 'document', name: '证明.pdf', url: '/api/room/tasks/files/document' }] });
   const images = render('alice', 'submitted', false, 'Unexpected end of JSON input');

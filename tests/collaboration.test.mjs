@@ -1835,6 +1835,28 @@ test('edit history survives failures, restart and retry while diagnostics retain
   assert.equal(pushed.filter(item => item.kind === 'sync-error').length, 1, 'resolved before delivery must not send a stale push');
 });
 
+test('setting cards retain exact before and after text across pending saves, restart and synchronization', async () => {
+  const before = '原段落 → 后半句\n\n第二段', first = '第一次修改\n优先级：这行仍属于说明', second = '最终说明\n下一步 → 完成';
+  const f = await fixture(), task = await personal(f, { content: before });
+  let w = await claim(f, task);
+  const update = f.gateway.update;
+  f.gateway.update = async () => { throw new CollaborationError('temporary write failure'); };
+  w = await act(f, w, 'alice', 'update-workflow', { fields: { content: first } });
+  w = await act(f, w, 'bob', 'update-workflow', { fields: { content: second, priority: 5 } });
+  const history = structuredClone(w.events.filter(event => event.type === 'updated'));
+  assert.deepEqual(history.map(event => event.settingChanges.find(change => change.field === 'content')), [
+    { field: 'content', label: '说明', before, after: first },
+    { field: 'content', label: '说明', before: first, after: second },
+  ]);
+  assert.deepEqual(history[1].settingChanges.find(change => change.field === 'priority'), { field: 'priority', label: '优先级', before: '无', after: '高' });
+  f.store = new CollaborationStore(f.dir, f.gateway);
+  assert.deepEqual((await f.store.snapshot('alice', null)).workflows.find(item => item.id === w.id).events.filter(event => event.type === 'updated'), history);
+  f.gateway.update = update;
+  w = await act(f, w, 'alice', 'retry-workflow');
+  assert.equal(w.editPending, false);
+  assert.deepEqual(w.events.filter(event => event.type === 'updated'), history);
+});
+
 test('targeted diagnostics are member-only local reads and recover only the matching stored edit summary', async () => {
   const f = await fixture(), task = await personal(f); let w = await claim(f, task);
   f.gateway.update = async () => { throw new Error('offline'); };
